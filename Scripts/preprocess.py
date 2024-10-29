@@ -160,8 +160,6 @@ def preprocess_col_data(df: pd.DataFrame) -> pd.DataFrame:
     df['polarity_numeric'] = df['polarity'].map(polarity_mapping)
     return df.drop(['polarity'], axis=1)
 
-
-```python
 def balance_classes(df: pd.DataFrame) -> pd.DataFrame:
     """Balance classes using stratified resampling for text data"""
     print("Starting class balancing...")
