@@ -1,3 +1,4 @@
+
 import string
 import random
 import warnings
@@ -5,7 +6,7 @@ import pandas as pd
 import numpy as np
 from collections import Counter
 import os
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Union
 import xml.etree.ElementTree as ET
 
 import torch
@@ -16,8 +17,6 @@ from transformers import (
     logging
 )
 from sklearn.utils import resample
-from imblearn.combine import SMOTETomek
-from imblearn.under_sampling import TomekLinks
 import nlpaug.augmenter.word as naw
 
 # Configure warnings and logging
@@ -28,42 +27,52 @@ class ModernAugmenter:
     """Modern data augmentation with multiple strategies"""
     def __init__(self, model_name: str = 'roberta-base', device: str = None):
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForMaskedLM.from_pretrained(model_name).to(self.device)
+        print(f"Using device: {self.device}")
         
-        # Initialize contextual augmenter
-        self.aug_contextual = naw.ContextualWordEmbsAug(
-            model_path=model_name,
-            action="substitute",
-            device=self.device
-        )
-        
-        # Initialize back translation augmenter
-        self.aug_back_translation = naw.BackTranslationAug(
-            from_model_name='Helsinki-NLP/opus-mt-en-de',
-            to_model_name='Helsinki-NLP/opus-mt-de-en',
-            device=self.device
-        )
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.model = AutoModelForMaskedLM.from_pretrained(model_name).to(self.device)
+            
+            # Initialize contextual augmenter
+            self.aug_contextual = naw.ContextualWordEmbsAug(
+                model_path=model_name,
+                action="substitute",
+                device=self.device
+            )
+            
+        except Exception as e:
+            print(f"Error initializing augmenter: {e}")
+            raise
     
     def get_contextual_synonyms(self, word: str, context: str, top_k: int = 5) -> List[str]:
         """Generate contextually appropriate synonyms"""
-        masked_text = context.replace(word, self.tokenizer.mask_token)
-        inputs = self.tokenizer(masked_text, return_tensors='pt').to(self.device)
-        
-        with torch.no_grad():
-            outputs = self.model(**inputs).logits
+        try:
+            masked_text = context.replace(word, self.tokenizer.mask_token)
+            inputs = self.tokenizer(
+                masked_text, 
+                return_tensors='pt',
+                truncation=True,
+                max_length=512
+            ).to(self.device)
             
-        mask_idx = torch.where(inputs['input_ids'] == self.tokenizer.mask_token_id)[1]
-        probs = torch.softmax(outputs[0, mask_idx], dim=-1)
-        top_k_weights, top_k_indices = torch.topk(probs, top_k)
-        
-        synonyms = []
-        for idx in top_k_indices[0]:
-            token = self.tokenizer.decode([idx.item()]).strip()
-            if token != word and token.isalpha():
-                synonyms.append(token)
+            with torch.no_grad():
+                outputs = self.model(**inputs).logits
                 
-        return synonyms
+            mask_idx = torch.where(inputs['input_ids'] == self.tokenizer.mask_token_id)[1]
+            probs = torch.softmax(outputs[0, mask_idx], dim=-1)
+            top_k_weights, top_k_indices = torch.topk(probs, min(top_k + 5, probs.size(-1)))
+            
+            synonyms = []
+            for idx in top_k_indices[0]:
+                token = self.tokenizer.decode([idx.item()]).strip()
+                if token != word and token.isalpha():
+                    synonyms.append(token)
+                    
+            return synonyms[:top_k]
+        
+        except Exception as e:
+            print(f"Error generating synonyms: {e}")
+            return []
     
     def contextual_augment(self, text: str, aspect: str) -> str:
         """Contextual augmentation preserving aspect"""
@@ -80,23 +89,6 @@ class ModernAugmenter:
                 return aug_text
         except Exception as e:
             print(f"Contextual augmentation failed: {e}")
-        return text
-    
-    def back_translate(self, text: str, aspect: str) -> str:
-        """Back translation augmentation preserving aspect"""
-        try:
-            augmented_texts = self.aug_back_translation.augment(text)
-            if isinstance(augmented_texts, list) and augmented_texts:
-                aug_text = augmented_texts[0]
-                # Ensure aspect is preserved
-                if aspect.lower() not in aug_text.lower():
-                    aug_text = aug_text.replace(
-                        aug_text.split()[0],
-                        aspect
-                    )
-                return aug_text
-        except Exception as e:
-            print(f"Back translation failed: {e}")
         return text
 
 def standardize_sentiment(polarity: str) -> str:
@@ -115,7 +107,7 @@ def preprocess_xml_data(file_path: str) -> pd.DataFrame:
         sentence_id = 1
         
         for sentence in root.findall('sentence'):
-            text = sentence.find('text').text
+            text = sentence.find('text').text.strip()
             aspect_categories = sentence.find('aspectCategories')
             
             if aspect_categories is not None:
@@ -126,13 +118,6 @@ def preprocess_xml_data(file_path: str) -> pd.DataFrame:
                         'Aspect Term': aspect_category.get('category'),
                         'polarity': aspect_category.get('polarity')
                     })
-            else:
-                data.append({
-                    'id': sentence_id,
-                    'Sentence': text,
-                    'Aspect Term': None,
-                    'polarity': None
-                })
             
             sentence_id += 1
             
@@ -160,8 +145,61 @@ def preprocess_col_data(df: pd.DataFrame) -> pd.DataFrame:
     df['polarity_numeric'] = df['polarity'].map(polarity_mapping)
     return df.drop(['polarity'], axis=1)
 
+def apply_augmentation_strategies(df: pd.DataFrame, indices: set, augmenter: ModernAugmenter) -> pd.DataFrame:
+    """Apply multiple augmentation strategies"""
+    augmented_data = []
+    
+    for idx in indices:
+        row = df.loc[idx]
+        aspect = row['Aspect Term']
+        sentence = row['Sentence']
+        aspect_number = row['Aspect_Number']
+        
+        if not aspect or aspect.lower() not in sentence.lower():
+            continue
+            
+        # Base row data to preserve
+        base_data = {
+            'id': row['id'],
+            'Aspect Term': aspect,
+            'polarity_numeric': row['polarity_numeric'],
+            'Aspect_Number': aspect_number
+        }
+        
+        # Strategy 1: Contextual Augmentation
+        aug_sentence = augmenter.contextual_augment(sentence, aspect)
+        if aug_sentence != sentence:
+            aug_data = base_data.copy()
+            aug_data['Sentence'] = aug_sentence
+            augmented_data.append(aug_data)
+        
+        # Strategy 2: Synonym Replacement
+        synonyms = augmenter.get_contextual_synonyms(aspect, sentence)
+        for synonym in synonyms[:2]:
+            aug_data = base_data.copy()
+            aug_data['Sentence'] = sentence.replace(aspect, synonym)
+            aug_data['Aspect Term'] = synonym
+            augmented_data.append(aug_data)
+    
+    return pd.DataFrame(augmented_data)
+
+def extract_and_process_multiAspects(df: pd.DataFrame) -> pd.DataFrame:
+    """Process multiple aspects and add aspect numbers"""
+    # Extract multi-aspect sentences
+    id_counts = df['id'].value_counts()
+    multi_aspect_ids = id_counts[id_counts > 1].index
+    df_multi = df[df['id'].isin(multi_aspect_ids)].copy()
+    
+    # Sort by id and add Aspect_Number
+    df_multi = df_multi.sort_values('id')
+    df_multi = df_multi.groupby('id').apply(
+        lambda x: x.assign(Aspect_Number=range(len(x)))
+    ).reset_index(drop=True)
+    
+    return df_multi
+
 def balance_classes(df: pd.DataFrame) -> pd.DataFrame:
-    """Balance classes using stratified resampling for text data"""
+    """Balance classes using stratified resampling"""
     print("Starting class balancing...")
     
     # Get class distribution
@@ -194,51 +232,8 @@ def balance_classes(df: pd.DataFrame) -> pd.DataFrame:
     
     return df_balanced
 
-def preprocess_data(train_data: str, test_data: str, val_data: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Main preprocessing pipeline with enhanced logging"""
-    try:
-        # Process training data
-        print("Processing training data...")
-        train_df = preprocess_xml_data(train_data)
-        train_df = preprocess_col_data(train_df)
-        
-        print(f"Initial dataset size: {len(train_df)}")
-        
-        # Filter aspects and polarities
-        train_df = train_df[
-            (train_df['polarity_numeric'].isin([0, 2])) &
-            (train_df['Aspect Term'] != 'miscellaneous')
-        ]
-        print(f"After filtering: {len(train_df)} samples")
-        
-        # Process multi-aspects
-        print("Processing multi-aspects...")
-        train_df = extract_and_process_multiAspects(train_df)
-        print(f"After multi-aspect processing: {len(train_df)} samples")
-        
-        # Data augmentation
-        print("Augmenting data...")
-        train_df = augment(train_df)
-        print(f"After augmentation: {len(train_df)} samples")
-        
-        # Balance classes
-        print("Balancing classes...")
-        train_df = balance_classes(train_df)
-        print(f"After balancing: {len(train_df)} samples")
-        
-        # Process validation and test sets
-        print("Processing validation and test data...")
-        val_df = process_dataset(val_data)
-        test_df = process_dataset(test_data)
-        
-        return train_df, val_df, test_df
-        
-    except Exception as e:
-        print(f"Error in preprocessing pipeline: {str(e)}")
-        raise
-
 def augment(df: pd.DataFrame) -> pd.DataFrame:
-    """Enhanced augmentation pipeline with better error handling"""
+    """Main augmentation pipeline"""
     try:
         print("Initializing augmentation...")
         augmenter = ModernAugmenter()
@@ -272,8 +267,8 @@ def augment(df: pd.DataFrame) -> pd.DataFrame:
         print(f"Error in augmentation: {str(e)}")
         raise
 
-def check_data_quality(df: pd.DataFrame, stage: str = ""):
-    """Utility function to check data quality at various stages"""
+def check_data_quality(df: pd.DataFrame, stage: str = "") -> None:
+    """Check data quality and print statistics"""
     print(f"\nData quality check - {stage}")
     print("-" * 50)
     print(f"Total samples: {len(df)}")
@@ -283,8 +278,60 @@ def check_data_quality(df: pd.DataFrame, stage: str = ""):
     print(f"Missing values:\n{df.isnull().sum()}")
     print("-" * 50)
 
-def main(train_data: str, test_data: str, val_data: str):
-    """Enhanced main execution function with quality checks"""
+def preprocess_data(
+    train_data: str,
+    test_data: str,
+    val_data: str
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Main preprocessing pipeline"""
+    try:
+        # Process training data
+        print("Processing training data...")
+        train_df = preprocess_xml_data(train_data)
+        train_df = preprocess_col_data(train_df)
+        
+        # Filter aspects and polarities
+        train_df = train_df[
+            (train_df['polarity_numeric'].isin([0, 2])) &
+            (train_df['Aspect Term'] != 'miscellaneous')
+        ]
+        
+        # Process multi-aspects
+        print("Processing multi-aspects...")
+        train_df = extract_and_process_multiAspects(train_df)
+        
+        # Augment data
+        print("Augmenting data...")
+        train_df = augment(train_df)
+        
+        # Balance classes
+        print("Balancing classes...")
+        train_df = balance_classes(train_df)
+        
+        # Process validation and test sets
+        print("Processing validation and test data...")
+        val_df = process_dataset(val_data)
+        test_df = process_dataset(test_data)
+        
+        return train_df, val_df, test_df
+        
+    except Exception as e:
+        print(f"Error in preprocessing pipeline: {str(e)}")
+        raise
+
+def process_dataset(data_path: str) -> pd.DataFrame:
+    """Process validation and test datasets"""
+    df = preprocess_xml_data(data_path)
+    df = preprocess_col_data(df)
+    df = df[
+        (df['polarity_numeric'].isin([0, 2])) &
+        (df['Aspect Term'] != 'miscellaneous')
+    ]
+    df = extract_and_process_multiAspects(df)
+    return df
+
+def main(train_data: str, test_data: str, val_data: str) -> None:
+    """Main execution function with quality checks"""
     print("Starting preprocessing pipeline...")
     
     try:
@@ -308,7 +355,6 @@ def main(train_data: str, test_data: str, val_data: str):
     except Exception as e:
         print(f"\nError in main execution: {str(e)}")
         raise
-
 
 if __name__ == "__main__":
     train_data = "Datasets/MAMS-ACSA/raw/train.xml"
