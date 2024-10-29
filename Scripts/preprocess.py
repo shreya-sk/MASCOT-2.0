@@ -2,269 +2,321 @@ import string
 import random
 import warnings
 import pandas as pd
+import numpy as np
 from collections import Counter
 import os
-from sklearn.utils import resample
-
-
-
-import torch
-import torch.nn.functional as F # type: ignore
-from transformers import logging
-from transformers import BertForMaskedLM, BertTokenizer
-
-import torch
-from translate import Translator
+from typing import Tuple, List, Dict
 import xml.etree.ElementTree as ET
-import pandas as pd
 
-def standardize_sentiment(polarity):
+import torch
+import torch.nn.functional as F
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForMaskedLM,
+    logging
+)
+from sklearn.utils import resample
+from imblearn.combine import SMOTETomek
+from imblearn.under_sampling import TomekLinks
+import nlpaug.augmenter.word as naw
+
+# Configure warnings and logging
+warnings.filterwarnings("ignore")
+logging.set_verbosity_error()
+
+class ModernAugmenter:
+    """Modern data augmentation with multiple strategies"""
+    def __init__(self, model_name: str = 'roberta-base', device: str = None):
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForMaskedLM.from_pretrained(model_name).to(self.device)
+        
+        # Initialize contextual augmenter
+        self.aug_contextual = naw.ContextualWordEmbsAug(
+            model_path=model_name,
+            action="substitute",
+            device=self.device
+        )
+        
+        # Initialize back translation augmenter
+        self.aug_back_translation = naw.BackTranslationAug(
+            from_model_name='Helsinki-NLP/opus-mt-en-de',
+            to_model_name='Helsinki-NLP/opus-mt-de-en',
+            device=self.device
+        )
+    
+    def get_contextual_synonyms(self, word: str, context: str, top_k: int = 5) -> List[str]:
+        """Generate contextually appropriate synonyms"""
+        masked_text = context.replace(word, self.tokenizer.mask_token)
+        inputs = self.tokenizer(masked_text, return_tensors='pt').to(self.device)
+        
+        with torch.no_grad():
+            outputs = self.model(**inputs).logits
+            
+        mask_idx = torch.where(inputs['input_ids'] == self.tokenizer.mask_token_id)[1]
+        probs = torch.softmax(outputs[0, mask_idx], dim=-1)
+        top_k_weights, top_k_indices = torch.topk(probs, top_k)
+        
+        synonyms = []
+        for idx in top_k_indices[0]:
+            token = self.tokenizer.decode([idx.item()]).strip()
+            if token != word and token.isalpha():
+                synonyms.append(token)
+                
+        return synonyms
+    
+    def contextual_augment(self, text: str, aspect: str) -> str:
+        """Contextual augmentation preserving aspect"""
+        try:
+            augmented_texts = self.aug_contextual.augment(text)
+            if isinstance(augmented_texts, list) and augmented_texts:
+                aug_text = augmented_texts[0]
+                # Ensure aspect is preserved
+                if aspect.lower() not in aug_text.lower():
+                    aug_text = aug_text.replace(
+                        aug_text.split()[0],
+                        aspect
+                    )
+                return aug_text
+        except Exception as e:
+            print(f"Contextual augmentation failed: {e}")
+        return text
+    
+    def back_translate(self, text: str, aspect: str) -> str:
+        """Back translation augmentation preserving aspect"""
+        try:
+            augmented_texts = self.aug_back_translation.augment(text)
+            if isinstance(augmented_texts, list) and augmented_texts:
+                aug_text = augmented_texts[0]
+                # Ensure aspect is preserved
+                if aspect.lower() not in aug_text.lower():
+                    aug_text = aug_text.replace(
+                        aug_text.split()[0],
+                        aspect
+                    )
+                return aug_text
+        except Exception as e:
+            print(f"Back translation failed: {e}")
+        return text
+
+def standardize_sentiment(polarity: str) -> str:
+    """Standardize sentiment labels"""
     polarity = polarity.lower().strip(string.whitespace)
     sentiment_set = {"positive", "negative", "neutral"}
     return polarity if polarity in sentiment_set else "other"
 
-def preprocess_xml_data(file_path):
-    tree = ET.parse(file_path)
-    root = tree.getroot()
-
-    data = []
-    sentence_id = 1
-    for sentence in root.findall('sentence'):
-        text = sentence.find('text').text
-        aspect_categories = sentence.find('aspectCategories')
-
-        if aspect_categories is not None:
-            for aspect_category in aspect_categories.findall('aspectCategory'):
-                category = aspect_category.get('category')
-                polarity = aspect_category.get('polarity')
+def preprocess_xml_data(file_path: str) -> pd.DataFrame:
+    """Process XML data with error handling"""
+    try:
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+        
+        data = []
+        sentence_id = 1
+        
+        for sentence in root.findall('sentence'):
+            text = sentence.find('text').text
+            aspect_categories = sentence.find('aspectCategories')
+            
+            if aspect_categories is not None:
+                for aspect_category in aspect_categories.findall('aspectCategory'):
+                    data.append({
+                        'id': sentence_id,
+                        'Sentence': text,
+                        'Aspect Term': aspect_category.get('category'),
+                        'polarity': aspect_category.get('polarity')
+                    })
+            else:
                 data.append({
                     'id': sentence_id,
                     'Sentence': text,
-                    'Aspect Term': category,
-                    'polarity': polarity
+                    'Aspect Term': None,
+                    'polarity': None
                 })
-        else:
-            data.append({
-                'id': sentence_id,
-                'Sentence': text,
-                'Aspect Term': None,
-                'polarity': None
-            })
+            
+            sentence_id += 1
+            
+        df = pd.DataFrame(data)
+        print(f"Processed {len(df)} rows from {file_path}")
+        return df
         
-        sentence_id += 1
+    except Exception as e:
+        print(f"Error processing XML file {file_path}: {e}")
+        raise
 
-    df = pd.DataFrame(data)
-    print(df)
-    print(df.columns.values)
-    return df
-
-def preprocess_col_data(train):
-    train["polarity"] = train["polarity"].apply(standardize_sentiment)
-    train['Sentence'] = train['Sentence'].str.lower()
-    polarity_mapping = {'negative': 0, 'neutral': 1, 'positive': 2, 'other': 3}
-    train['polarity_numeric'] = train['polarity'].map(polarity_mapping)
-    return train.drop(['polarity'], axis=1)
-
-def rows_for_augmentation(df):
-    unique_ids = df['id'].unique()
-    selected_ids = random.sample(list(unique_ids), len(unique_ids) // 2)
-    subset_df = df[df['id'].isin(selected_ids)]
-    return subset_df
-
-
-def back_translate(sentence, lang='zh'):
-    translator = Translator(to_lang=lang, from_lang='en')
-    translated = translator.translate(sentence)
-    back_translator = Translator(to_lang='en', from_lang=lang)
-    return back_translator.translate(translated)
-
-def get_bert_synonyms(word, context_sentence, top_p=5):
+def preprocess_col_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Preprocess dataframe columns"""
+    df = df.copy()
+    df["polarity"] = df["polarity"].apply(standardize_sentiment)
+    df['Sentence'] = df['Sentence'].str.lower()
     
-    logging.get_logger("transformers.modeling_utils").setLevel(logging.WARNING)
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    model = BertForMaskedLM.from_pretrained('bert-base-uncased')
-    model.eval()
-    # Mask the target word in the sentence
-    masked_sentence = context_sentence.replace(word, tokenizer.mask_token)
-    input_ids = tokenizer.encode(masked_sentence, return_tensors='pt')
-
-    # Predict all tokens
-    with torch.no_grad():
-        outputs = model(input_ids)[0]
-
-    mask_token_index = torch.where(input_ids == tokenizer.mask_token_id)[1]
-
-    if outputs.size(0) > 0:
-        if outputs.dim() == 3:
-            predicted_token_ids = outputs[0, mask_token_index, :].topk(top_p + 10).indices[0].tolist()  # Increase range to filter out the original word
-        else:
-            predicted_token_ids = outputs.topk(top_p + 10).indices[0].tolist()  # Increase range to filter out the original word
-
-        # Decode the predicted ids to tokens and filter out the original word
-        synonyms = [
-                tokenizer.decode([predicted_id]).strip() 
-                for predicted_id in predicted_token_ids 
-                if tokenizer.decode([predicted_id]).strip() != word.lower() and '#' not in tokenizer.decode([predicted_id]).strip()
-            ]
-
+    polarity_mapping = {
+        'negative': 0,
+        'neutral': 1,
+        'positive': 2,
+        'other': 3
+    }
     
-        return synonyms[:top_p]
-    else:
-        return []
+    df['polarity_numeric'] = df['polarity'].map(polarity_mapping)
+    return df.drop(['polarity'], axis=1)
 
-def process_aspects(df):
-    #print("Current index names:", df.index.names)  # Debug: Check current index names
-    if 'Aspect Term' in df.index.names:
-        result = df.reset_index(level='Aspect Term', inplace=False)  # Try without inplace to debug
-    else:
-        result = df  # Just pass the DataFrame as is if Aspect Term is not part of the index
-    return result
 
-def extract_multiAspects(df):
-    id_counts = df['id'].value_counts()
-    non_unique = id_counts[id_counts != 1].index
-   # single_aspects = df[df['id'].isin(unique_ids)]
-    multiple_aspects = df[df['id'].isin(non_unique)]
-
-    return multiple_aspects
-
-def add_aspect_numbers(group):
-    group["Aspect Number"] = range(len(group))
-    return group
-
-def apply_augmentation_strategies(df, indices):
-    for idx in indices:
-        row = df.loc[idx]
-        aspect = row['Aspect Term']
-        sentence = row['Sentence']
-        if aspect.lower() not in sentence.lower():
-            continue
-        if random.choice(['back_translate', 'synonym']) == 'back_translate':
-            bt_sentence = back_translate(sentence)
-            if bt_sentence.lower() != sentence.lower() and aspect.lower() in bt_sentence.lower():
-                df.at[idx, 'Sentence'] = bt_sentence
-                print('bt_sentence--------------')
-                print(bt_sentence)
-                print(sentence)
-            else:
-                synonyms = get_bert_synonyms(aspect, sentence)
-                if synonyms:
-                    new_aspect = synonyms[0]
-                    df.at[idx, 'Sentence'] = sentence.replace(aspect, new_aspect)
-                    df.at[idx, 'Aspect Term'] = new_aspect
-        else:
-            synonyms = get_bert_synonyms(aspect, sentence)
-            if synonyms:
-                new_aspect = synonyms[0]
-                
-                df.at[idx, 'Sentence'] = sentence.replace(aspect, new_aspect)
-                df.at[idx, 'Aspect Term'] = new_aspect
-                
-                print(aspect, new_aspect)
-
-    return df
-
-def augment(df):
-   
-    subset_df = rows_for_augmentation(df)
-    subset_df.reset_index(drop=True, inplace=True)  # Reset indices for safe operation
-    unique_ids = set(subset_df.index)  # Use the reset index for operation
-    augmented_df = apply_augmentation_strategies(subset_df, unique_ids)
-    return pd.concat([df, augmented_df], ignore_index=True)
-
-def extract_and_process_multiAspects(data):
-    data = process_aspects(data)
-    data = extract_multiAspects(data)
-    data = data.sort_values(by='id')
-    data = data.groupby('id').apply(add_aspect_numbers).reset_index(drop=True)
-    return data
-
-# def preprocess_data(train_data, test_data, val_data):
-#     # Preprocess the training data
-#     train_df = preprocess_xml_data(train_data)
-#     train_df = preprocess_col_data(train_df)
-#     train_df = augment(train_df)
-#     train_df = extract_and_process_multiAspects(train_df)
-
-#     val_df = preprocess_xml_data(val_data)
-#     val_df = preprocess_col_data(val_df)
-#     val_df = extract_and_process_multiAspects(val_df)
-
-#     # Preprocess the test data
-#     test_df = preprocess_xml_data(test_data)
-#     test_df = preprocess_col_data(test_df)
-#     test_df = extract_and_process_multiAspects(test_df)
-
-#     # Balance the classes
-#     train_df, val_df, test_df = balance_classes(train_df, val_df, test_df)
-
-#     return train_df, val_df, test_df
-
-from sklearn.utils import resample
-
-def balance_classes(train_df):
-    # Get the minority class count
-    polarity_counts = train_df['polarity_numeric'].value_counts()
-    min_count = polarity_counts.min()
-
-    # Separate the dataframes by polarity
-    train_negative = train_df[train_df['polarity_numeric'] == 0]
-    train_positive = train_df[train_df['polarity_numeric'] == 2]
-
-    # Downsample the majority class to have equal counts as the minority class
-    train_negative_balanced = resample(train_negative, replace=False, n_samples=min_count, random_state=42)
-    train_positive_balanced = train_positive
-
-    # Combine the balanced dataframes
-    train_df_balanced = pd.concat([train_negative_balanced, train_positive_balanced])
-
-    return train_df_balanced
-
-def preprocess_data(train_data, test_data, val_data):
-    # Preprocess the training data
+```python
+def balance_classes(df: pd.DataFrame) -> pd.DataFrame:
+    """Balance classes using stratified resampling for text data"""
+    print("Starting class balancing...")
     
-    train_df = preprocess_xml_data(train_data)
-    train_df = preprocess_col_data(train_df)
-    train_df = train_df[train_df['polarity_numeric'].isin([0, 2])]
-    train_df = train_df[train_df['Aspect Term'] != 'miscellaneous']
-    train_df = extract_and_process_multiAspects(train_df)
+    # Get class distribution
+    class_counts = df['polarity_numeric'].value_counts()
+    majority_class = class_counts.index[0]
+    minority_class = class_counts.index[1]
+    min_class_size = class_counts.min()
     
-    train_df = augment(train_df)
-
-    val_df = preprocess_xml_data(val_data)
-    val_df = preprocess_col_data(val_df)
-    val_df = val_df[val_df['polarity_numeric'].isin([0, 2])]
-    val_df = val_df[val_df['Aspect Term'] != 'miscellaneous']
-    val_df = extract_and_process_multiAspects(val_df)
-
-    # Preprocess the test data
-    test_df = preprocess_xml_data(test_data)
-    test_df = preprocess_col_data(test_df)
-    test_df = test_df[test_df['polarity_numeric'].isin([0, 2])]
-    test_df = test_df[test_df['Aspect Term'] != 'miscellaneous']
-    test_df = extract_and_process_multiAspects(test_df)
-
-    # Balance the classes
-    train_df = balance_classes(train_df)
-
-    return train_df, val_df, test_df
-
-def main(train_data, test_data,val_data):
-
-    print(f"\nProcessing Data...")
-    train_df, val_df, test_df = preprocess_data(train_data, test_data, val_data)
+    print(f"Initial class distribution: {class_counts}")
     
-    train_df.to_pickle('model/dataframe/train-aug.pkl')
-    val_df.to_pickle('model/dataframe/val-aug.pkl')   
-    test_df.to_pickle('model/dataframe/test-aug.pkl')      
- 
+    # Separate majority and minority classes
+    df_majority = df[df['polarity_numeric'] == majority_class]
+    df_minority = df[df['polarity_numeric'] == minority_class]
+    
+    # Downsample majority class
+    df_majority_downsampled = resample(
+        df_majority,
+        replace=False,
+        n_samples=min_class_size,
+        random_state=42
+    )
+    
+    # Combine balanced dataset
+    df_balanced = pd.concat([df_majority_downsampled, df_minority])
+    
+    # Shuffle the dataset
+    df_balanced = df_balanced.sample(frac=1, random_state=42).reset_index(drop=True)
+    
+    print(f"Final class distribution: {df_balanced['polarity_numeric'].value_counts()}")
+    
+    return df_balanced
+
+def preprocess_data(train_data: str, test_data: str, val_data: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Main preprocessing pipeline with enhanced logging"""
+    try:
+        # Process training data
+        print("Processing training data...")
+        train_df = preprocess_xml_data(train_data)
+        train_df = preprocess_col_data(train_df)
+        
+        print(f"Initial dataset size: {len(train_df)}")
+        
+        # Filter aspects and polarities
+        train_df = train_df[
+            (train_df['polarity_numeric'].isin([0, 2])) &
+            (train_df['Aspect Term'] != 'miscellaneous')
+        ]
+        print(f"After filtering: {len(train_df)} samples")
+        
+        # Process multi-aspects
+        print("Processing multi-aspects...")
+        train_df = extract_and_process_multiAspects(train_df)
+        print(f"After multi-aspect processing: {len(train_df)} samples")
+        
+        # Data augmentation
+        print("Augmenting data...")
+        train_df = augment(train_df)
+        print(f"After augmentation: {len(train_df)} samples")
+        
+        # Balance classes
+        print("Balancing classes...")
+        train_df = balance_classes(train_df)
+        print(f"After balancing: {len(train_df)} samples")
+        
+        # Process validation and test sets
+        print("Processing validation and test data...")
+        val_df = process_dataset(val_data)
+        test_df = process_dataset(test_data)
+        
+        return train_df, val_df, test_df
+        
+    except Exception as e:
+        print(f"Error in preprocessing pipeline: {str(e)}")
+        raise
+
+def augment(df: pd.DataFrame) -> pd.DataFrame:
+    """Enhanced augmentation pipeline with better error handling"""
+    try:
+        print("Initializing augmentation...")
+        augmenter = ModernAugmenter()
+        
+        # Select subset for augmentation
+        unique_ids = df['id'].unique()
+        selected_ids = random.sample(list(unique_ids), len(unique_ids) // 2)
+        subset_df = df[df['id'].isin(selected_ids)].copy()
+        subset_df.reset_index(drop=True, inplace=True)
+        
+        print(f"Selected {len(selected_ids)} sentences for augmentation")
+        
+        # Generate augmented examples
+        augmented_df = apply_augmentation_strategies(
+            subset_df, 
+            set(subset_df.index),
+            augmenter
+        )
+        
+        print(f"Generated {len(augmented_df)} augmented samples")
+        
+        # Combine and clean
+        combined_df = pd.concat([df, augmented_df], ignore_index=True)
+        combined_df = combined_df.drop_duplicates(subset=['Sentence', 'Aspect Term'])
+        
+        print(f"Final dataset size after augmentation: {len(combined_df)}")
+        
+        return combined_df
+        
+    except Exception as e:
+        print(f"Error in augmentation: {str(e)}")
+        raise
+
+def check_data_quality(df: pd.DataFrame, stage: str = ""):
+    """Utility function to check data quality at various stages"""
+    print(f"\nData quality check - {stage}")
+    print("-" * 50)
+    print(f"Total samples: {len(df)}")
+    print(f"Unique sentences: {df['Sentence'].nunique()}")
+    print(f"Unique aspects: {df['Aspect Term'].nunique()}")
+    print(f"Class distribution:\n{df['polarity_numeric'].value_counts()}")
+    print(f"Missing values:\n{df.isnull().sum()}")
+    print("-" * 50)
+
+def main(train_data: str, test_data: str, val_data: str):
+    """Enhanced main execution function with quality checks"""
+    print("Starting preprocessing pipeline...")
+    
+    try:
+        train_df, val_df, test_df = preprocess_data(train_data, test_data, val_data)
+        
+        # Quality checks
+        check_data_quality(train_df, "Training Data")
+        check_data_quality(val_df, "Validation Data")
+        check_data_quality(test_df, "Test Data")
+        
+        # Save processed data
+        print("\nSaving processed data...")
+        os.makedirs('model/dataframe', exist_ok=True)
+        
+        train_df.to_pickle('model/dataframe/train-aug.pkl')
+        val_df.to_pickle('model/dataframe/val-aug.pkl')
+        test_df.to_pickle('model/dataframe/test-aug.pkl')
+        
+        print("\nPreprocessing completed successfully!")
+        
+    except Exception as e:
+        print(f"\nError in main execution: {str(e)}")
+        raise
+
 
 if __name__ == "__main__":
     train_data = "Datasets/MAMS-ACSA/raw/train.xml"
     test_data = "Datasets/MAMS-ACSA/raw/test.xml"
     val_data = "Datasets/MAMS-ACSA/raw/val.xml"
-    main(train_data, test_data,val_data)
-
+    main(train_data, test_data, val_data)
 
 warnings.filterwarnings("default")
 
