@@ -82,9 +82,16 @@ def main():
         
         # Log metrics to W&B
         logger.log_metrics({
-            'train_loss': train_loss,
-            'val_loss': val_metrics['loss'],
-            'val_f1': val_metrics['f1']
+            'epoch': epoch,
+            'train/loss': train_loss,
+            'train/aspect_f1': train_metrics['aspect_f1'],
+            'train/opinion_f1': train_metrics['opinion_f1'],
+            'train/sentiment_f1': train_metrics['sentiment_f1'],
+            'val/loss': val_metrics['loss'],
+            'val/aspect_f1': val_metrics['aspect_f1'],
+            'val/opinion_f1': val_metrics['opinion_f1'],
+            'val/sentiment_f1': val_metrics['sentiment_f1'],
+            'learning_rate': optimizer.param_groups[0]['lr']
         }, epoch)
 
         # Optionally visualize attention patterns

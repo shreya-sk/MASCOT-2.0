@@ -1,0 +1,16 @@
+{
+  "os":  "macOS-15.0-arm64-arm-64bit",
+  "python":  "CPython 3.12.4",
+  "startedAt":  "2025-02-21T03:45:04.289976Z",
+  "program":  "/Users/shreya/Desktop/MASCoT/train.py",
+  "codePath":  "train.py",
+  "git":  {
+    "remote":  "git@github.com:shreya-sk/MASCOT-2.0.git",
+    "commit":  "eb8e69692bb246b4862653fcd0cf665dee0cd147"
+  },
+  "email":  "shreyakothari1901@gmail.com",
+  "root":  "/Users/shreya/Desktop/MASCoT",
+  "host":  "shreya",
+  "executable":  "/Users/shreya/Desktop/MASCoT/senti/bin/python",
+  "codePathLocal":  "train.py"
+}

@@ -1,7 +1,7 @@
 # src/training/trainer.py
 import torch
 from tqdm import tqdm
-from .metrics import compute_metrics
+from .metrics import ABSAMetrics
 from torch.cuda.amp import autocast, GradScaler
 
 class ABSATrainer:

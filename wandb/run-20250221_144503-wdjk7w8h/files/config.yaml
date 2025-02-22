@@ -1,0 +1,48 @@
+_wandb:
+    value:
+        cli_version: 0.19.7
+        m: []
+        python_version: 3.12.4
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 49
+                - 53
+                - 55
+            "2":
+                - 1
+                - 5
+                - 11
+                - 49
+                - 53
+                - 55
+            "3":
+                - 13
+                - 16
+                - 23
+                - 55
+            "4": 3.12.4
+            "5": 0.19.7
+            "6": 4.49.0
+            "8":
+                - 5
+            "12": 0.19.7
+            "13": darwin-arm64
+architecture:
+    value: LlamaABSA
+batch_size:
+    value: 16
+hidden_size:
+    value: 768
+learning_rate:
+    value: 0.0001
+max_length:
+    value: 128
+model_name:
+    value: meta-llama/Llama-2-7b
+num_epochs:
+    value: 20
+warmup_steps:
+    value: 1000
