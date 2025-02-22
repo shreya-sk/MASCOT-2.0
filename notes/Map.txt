@@ -1,0 +1,31 @@
+src/
+├── data/
+│   ├── __init__.py
+│   ├── dataset.py          # Dataset classes, data loading
+│   ├── preprocessor.py     # Text preprocessing, span extraction
+│   └── augmentation.py     # Data augmentation strategies
+│
+├── models/
+│   ├── __init__.py 
+│   ├── embeddings.py       # Embedding layers
+│   ├── span_detector.py    # BiLSTM + Pointer Network
+│   ├── span_encoder.py     # Span representation module
+│   ├── cross_attention.py  # Cross-attention mechanism
+│   ├── classifier.py       # MoE classifier
+│   └── model.py           # Main model combining components
+│
+├── training/
+│   ├── __init__.py
+│   ├── trainer.py         # Training loop, optimization
+│   ├── losses.py         # Loss functions
+│   └── metrics.py        # Evaluation metrics
+│
+├── utils/
+│   ├── __init__.py
+│   ├── config.py         # Configuration management
+│   ├── logger.py        # Logging utilities
+│   └── visualization.py  # Attention visualization etc.
+│
+├── constants.py         # Project constants
+├── train.py            # Training script
+└── predict.py          # Inference script
