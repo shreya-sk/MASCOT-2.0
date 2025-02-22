@@ -11,3 +11,6 @@
 - Start Embedding file work
 
 > ### **Week 2:** 20/2
+- Merged feature branch into main
+- Created training branch for error debugging
+- Created a venv for the project > senti

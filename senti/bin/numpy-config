@@ -1,4 +1,4 @@
-#!/Users/shreya/Desktop/MASCoT/senti/bin/python
+#!/Users/shreya/Desktop/MASCOT-2.0/senti/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys

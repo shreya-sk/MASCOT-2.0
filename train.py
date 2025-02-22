@@ -11,21 +11,39 @@ from src.training.trainer import ABSATrainer
 from src.utils.config import LlamaABSAConfig  # Use LlamaABSAConfig instead of ABSAConfig 
 from src.utils.logger import WandbLogger
 from src.utils.visualisation import AttentionVisualizer  # Correct spelling of visualization
-
+# train.py
 def main():
     # Load config
     config = LlamaABSAConfig()
+    
     # Initialize W&B logger
     logger = WandbLogger(config)
-    # Initialize tokenizer and visualizer
+    
+    # Initialize tokenizer FIRST
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    
+    # Initialize visualizer 
     visualizer = AttentionVisualizer(tokenizer)    
+    
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Create datasets and dataloaders
-    train_dataset = ABSADataset(config.train_path, split='train')
-    val_dataset = ABSADataset(config.val_path, split='val')
+    # Create datasets with tokenizer
+    train_dataset = ABSADataset(
+        data_dir=config.train_path,
+        tokenizer=tokenizer,  # Pass tokenizer here
+        split='train',
+        dataset_name=config.dataset_name,
+        max_length=config.max_span_length
+    )
+    
+    val_dataset = ABSADataset(
+        data_dir=config.val_path,
+        tokenizer=tokenizer,  # Pass tokenizer here
+        split='val',
+        dataset_name=config.dataset_name,
+        max_length=config.max_span_length
+    )
     
     train_loader = DataLoader(
         train_dataset,
