@@ -1,50 +1,42 @@
-# train.py (in root directory)
+# train.py
 import torch
+from transformers import LlamaTokenizer
 from torch.utils.data import DataLoader
 import torch.nn as nn
-from transformers import get_linear_schedule_with_warmup, AutoTokenizer
+from transformers import get_linear_schedule_with_warmup
 from src.data import ABSADataset
-from src.models.model import LlamaABSA  # Explicit import from model.py
-from src.models.embedding import LlamaEmbedding  # Explicit import from embedding.py
+from src.models.model import LlamaABSA 
+from src.models.embedding import LlamaEmbedding 
 from src.training.losses import ABSALoss
 from src.training.trainer import ABSATrainer
-from src.utils.config import LlamaABSAConfig  # Use LlamaABSAConfig instead of ABSAConfig 
+from src.utils.config import LlamaABSAConfig
 from src.utils.logger import WandbLogger
-from src.utils.visualisation import AttentionVisualizer  # Correct spelling of visualization
-# train.py
-def main():
-    # Load config
-    config = LlamaABSAConfig()
+from src.utils.visualisation import AttentionVisualizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+def train_dataset(config, tokenizer, logger, dataset_name, device):
+    """Train model on a specific dataset"""
     
-    # Initialize W&B logger
-    logger = WandbLogger(config)
+    print(f"\nTraining on dataset: {dataset_name}")
     
-    # Initialize tokenizer FIRST
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    
-    # Initialize visualizer 
-    visualizer = AttentionVisualizer(tokenizer)    
-    
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Create datasets with tokenizer
+    # Create datasets
     train_dataset = ABSADataset(
-        data_dir=config.train_path,
-        tokenizer=tokenizer,  # Pass tokenizer here
+        data_dir="",  # Path handled in dataset class
+        tokenizer=tokenizer,
         split='train',
-        dataset_name=config.dataset_name,
+        dataset_name=dataset_name,
         max_length=config.max_span_length
     )
     
     val_dataset = ABSADataset(
-        data_dir=config.val_path,
-        tokenizer=tokenizer,  # Pass tokenizer here
-        split='val',
-        dataset_name=config.dataset_name,
+        data_dir="",
+        tokenizer=tokenizer,
+        split='dev', 
+        dataset_name=dataset_name,
         max_length=config.max_span_length
     )
     
+    # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -59,17 +51,14 @@ def main():
         num_workers=config.num_workers
     )
     
-    # Create model
+    # Initialize model, optimizer, scheduler and loss
     model = LlamaABSA(config).to(device)
-    
-    # Create optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay
     )
     
-    # Create scheduler
     num_training_steps = len(train_loader) * config.num_epochs
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
@@ -77,7 +66,6 @@ def main():
         num_training_steps=num_training_steps
     )
     
-    # Create loss function
     loss_fn = ABSALoss(config)
     
     # Create trainer
@@ -90,7 +78,11 @@ def main():
         config=config
     )
     
+    # Initialize visualizer
+    visualizer = AttentionVisualizer(tokenizer)
+    
     # Training loop
+    best_f1 = 0
     for epoch in range(config.num_epochs):
         # Train
         train_loss = trainer.train_epoch(train_loader, epoch)
@@ -98,37 +90,82 @@ def main():
         # Evaluate
         val_metrics = trainer.evaluate(val_loader)
         
-        # Log metrics to W&B
+        # Log metrics with dataset name
         logger.log_metrics({
+            'dataset': dataset_name,
+            'epoch': epoch,
             'train_loss': train_loss,
             'val_loss': val_metrics['loss'],
             'val_f1': val_metrics['f1']
         }, epoch)
-
-        # Optionally visualize attention patterns
+        
+        # Visualize attention if needed
         if epoch % config.viz_interval == 0:
             attention_weights = trainer.get_attention_weights(val_loader)
             visualizer.plot_attention(
                 attention_weights,
-                tokens=tokenizer.convert_ids_to_tokens(val_batch['input_ids'][0]),
-                save_path=f'visualizations/attention_epoch_{epoch}.png'
+                tokens=tokenizer.convert_ids_to_tokens(val_loader.dataset[0]['input_ids']),
+                save_path=f'visualizations/{dataset_name}_attention_epoch_{epoch}.png'
             )
         
-
-        # Log metrics
+        # Print metrics
         print(f"Epoch {epoch}:")
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Val Loss: {val_metrics['loss']:.4f}")
         print(f"Val F1: {val_metrics['f1']:.4f}")
         
-        # Save best model
-        if val_metrics['f1'] > trainer.best_f1:
-            trainer.best_f1 = val_metrics['f1']
-            model_path = f'checkpoints/best_model.pt'
+        # Save best model for this dataset
+        if val_metrics['f1'] > best_f1:
+            best_f1 = val_metrics['f1']
+            model_path = f'checkpoints/best_model_{dataset_name}.pt'
             torch.save(model.state_dict(), model_path)
-            logger.log_model(model, val_metrics)
-        
+            logger.log_model(model, {
+                'dataset': dataset_name,
+                **val_metrics
+            })
+    
+    return best_f1
+
+def main():
+    # Load config
+    config = LlamaABSAConfig()
+    
+    # Initialize W&B logger
+    logger = WandbLogger(config)
+    
+    # Initialize tokenizer
+    tokenizer = LlamaTokenizer.from_pretrained(
+        config.model_name,
+        padding_side="right",
+        truncation_side="right",
+        model_max_length=config.max_span_length,
+        trust_remote_code=True
+    )
+    
+    special_tokens = {
+        "pad_token": "<pad>",
+        "eos_token": "</s>",
+        "bos_token": "<s>",
+        "unk_token": "<unk>",
+    }
+    tokenizer.add_special_tokens(special_tokens)
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Train on each dataset
+    results = {}
+    for dataset_name in ["laptop14", "rest14", "rest15", "rest16"]:
+        best_f1 = train_dataset(config, tokenizer, logger, dataset_name, device)
+        results[dataset_name] = best_f1
+    
+    # Print final results
+    print("\nFinal Results:")
+    for dataset, f1 in results.items():
+        print(f"{dataset}: Best F1 = {f1:.4f}")
+    
     # End W&B run
     logger.finish()
+
 if __name__ == '__main__':
     main()

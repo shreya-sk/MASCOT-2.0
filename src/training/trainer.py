@@ -84,7 +84,7 @@ class ABSATrainer:
                 all_labels.extend(labels)
         
         # Calculate metrics
-        metrics = compute_metrics(all_predictions, all_labels)
+        metrics = ABSAMetrics(all_predictions, all_labels)
         metrics['loss'] = total_loss / len(val_loader)
         
         return metrics

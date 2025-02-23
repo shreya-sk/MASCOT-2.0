@@ -1,8 +1,8 @@
+# project/src/data/dataset.py
 import os
 from torch.utils.data import Dataset
 from typing import Optional, Dict
 import torch
-
 from .utils import read_aste_data, SpanLabel
 from .preprocessor import ABSAPreprocessor
 
@@ -25,9 +25,14 @@ class ABSADataset(Dataset):
             dataset_name: Dataset name ('laptop14', 'rest14', 'rest15', 'rest16')
             max_length: Maximum sequence length
         """
-        # Construct file path
-        file_path = os.path.join(data_dir, 'aste', dataset_name, f'{split}.txt')
+        # Construct file path using project root directory
+        # Go up two levels from src/data to get to project root
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        file_path = os.path.join(project_root, 'Datasets', 'aste', dataset_name, f'{split}.txt')
         
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Data file not found at {file_path}")
+            
         # Load and preprocess data
         self.data = read_aste_data(file_path)
         self.preprocessor = ABSAPreprocessor(tokenizer, max_length)
