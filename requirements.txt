@@ -5,4 +5,7 @@ dataclasses
 torch
 matplotlib
 seaborn
+tiktoken
+sentencepiece
+
 
