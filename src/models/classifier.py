@@ -1,4 +1,5 @@
 # src/models/classifier.py
+import torch.nn as nn
 class SentimentClassifier(nn.Module):
     """Classifies sentiment for detected spans"""
     def __init__(self, config):

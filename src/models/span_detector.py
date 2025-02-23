@@ -1,4 +1,7 @@
 # src/models/span_detector.py
+import torch
+import torch.nn as nn
+
 class SpanDetector(nn.Module):
     """Detects aspect and opinion spans using bidirectional modeling"""
     def __init__(self, config):

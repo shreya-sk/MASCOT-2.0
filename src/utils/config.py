@@ -1,8 +1,16 @@
 # # src/utils/config.py
 from dataclasses import dataclass
 from typing import List
+
 @dataclass
 class LlamaABSAConfig:
+    # hierarchichal configuration
+    num_attention_heads: int = 8
+    global_encoder_layers: int = 2
+    local_encoder_layers: int = 2
+    fusion_dropout: float = 0.1
+
+
     # Model settings
     model_name: str = "meta-llama/Llama-2-7b"
     hidden_size: int = 768
