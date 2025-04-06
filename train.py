@@ -11,6 +11,7 @@ from src.training.losses import ABSALoss
 from src.training.trainer import ABSATrainer
 from src.utils.config import LlamaABSAConfig
 from src.utils.logger import WandbLogger
+from src.data.preprocessor import StellaABSAPreprocessor
 from src.utils.visualisation import AttentionVisualizer
 
 def train_dataset(config, tokenizer, logger, dataset_name, device):
@@ -18,21 +19,34 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
     
     print(f"\nTraining on dataset: {dataset_name}")
     
-    # Create datasets
-    train_dataset = ABSADataset(
-        data_dir="",  # Path handled in dataset class
+    # Create preprocessor
+    preprocessor = StellaABSAPreprocessor(
         tokenizer=tokenizer,
+        max_length=config.max_seq_length,
+        use_syntax=config.use_syntax
+    )
+    
+    # Create datasets with domain id if using domain adaptation
+    domain_id = config.domain_mapping.get(dataset_name, 0) if config.domain_adaptation else None
+    
+    train_dataset = ABSADataset(
+        data_dir=config.dataset_paths[dataset_name],
+        tokenizer=tokenizer,
+        preprocessor=preprocessor,
         split='train',
         dataset_name=dataset_name,
-        max_length=config.max_span_length
+        max_length=config.max_seq_length,
+        domain_id=domain_id
     )
     
     val_dataset = ABSADataset(
-        data_dir="",
+        data_dir=config.dataset_paths[dataset_name],
         tokenizer=tokenizer,
-        split='dev', 
+        preprocessor=preprocessor,
+        split='dev',
         dataset_name=dataset_name,
-        max_length=config.max_span_length
+        max_length=config.max_seq_length,
+        domain_id=domain_id
     )
     
     # Create dataloaders with smaller batch size for Llama
@@ -40,14 +54,16 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=config.num_workers
+        num_workers=config.num_workers,
+        pin_memory=True
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=config.num_workers
+        num_workers=config.num_workers,
+        pin_memory=True
     )
     
     # Initialize model
@@ -60,9 +76,8 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
     
     # Initialize optimizer
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay
+        optimizer_grouped_parameters,
+        weight_decay=config.weight_decay,
     )
     
     # Calculate steps with gradient accumulation
@@ -70,10 +85,11 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
     
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=config.warmup_steps,
+        num_warmup_steps=num_warmup_steps,
         num_training_steps=num_training_steps
     )
     
+    # Initialize loss function
     loss_fn = ABSALoss(config)
     
     # Create trainer with gradient accumulation
@@ -86,8 +102,8 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
         config=config
     )
     
-    # Initialize visualizer
-    visualizer = AttentionVisualizer(tokenizer)
+    # Set up mixed precision training if enabled
+    scaler = torch.cuda.amp.GradScaler() if config.use_fp16 else None
     
     # Create checkpoint directory
     os.makedirs('checkpoints', exist_ok=True)
@@ -98,11 +114,12 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
     
     
     for epoch in range(config.num_epochs):
-        # Train
-        train_loss = trainer.train_epoch(train_loader, epoch)
+        # Training
+        model.train()
+        train_loss = 0.0
+        train_steps = 0
         
-        # Evaluate
-        val_metrics = trainer.evaluate(val_loader)
+        train_iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs} (Train)")
         
         # Log metrics with dataset name
         logger.log_metrics({
@@ -155,10 +172,117 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
                 'dataset': dataset_name,
                 **val_metrics
             })
+            
+            # Log training metrics
+            if global_step % config.log_interval == 0:
+                logger.log_metrics({
+                    'dataset': dataset_name,
+                    'epoch': epoch + 1,
+                    'train_loss': loss.item(),
+                    'learning_rate': scheduler.get_last_lr()[0]
+                }, global_step)
+            
+            # Evaluate model periodically
+            if global_step % config.eval_interval == 0:
+                val_metrics = evaluate(model, val_loader, loss_fn, device, metrics)
+                
+                # Log validation metrics
+                val_metrics['dataset'] = dataset_name
+                val_metrics['epoch'] = epoch + 1
+                logger.log_metrics(val_metrics, global_step)
+                
+                # Check if this is the best model
+                if val_metrics.get('overall_f1', 0) > best_f1:
+                    best_f1 = val_metrics.get('overall_f1', 0)
+                    
+                    # Save best model
+                    os.makedirs('checkpoints', exist_ok=True)
+                    torch.save(
+                        model.state_dict(), 
+                        f"checkpoints/{config.experiment_name}_{dataset_name}_best.pt"
+                    )
+                    
+                    logger.log_model(model, {
+                        'dataset': dataset_name,
+                        **val_metrics
+                    })
+                    
+                    print(f"New best model saved with F1 = {best_f1:.4f}")
+                
+                # Back to training mode
+                model.train()
+            
+            # Save model periodically
+            if global_step % config.save_interval == 0:
+                os.makedirs('checkpoints', exist_ok=True)
+                torch.save(
+                    model.state_dict(), 
+                    f"checkpoints/{config.experiment_name}_{dataset_name}_last.pt"
+                )
+        
+        # End of epoch evaluation
+        val_metrics = evaluate(model, val_loader, loss_fn, device, metrics)
+        
+        # Log end of epoch metrics
+        val_metrics['dataset'] = dataset_name
+        val_metrics['epoch'] = epoch + 1
+        val_metrics['train_loss'] = train_loss / train_steps
+        logger.log_metrics(val_metrics, global_step)
+        
+        # Print end of epoch summary
+        print(f"Epoch {epoch+1}/{config.num_epochs}:")
+        print(f"  Train Loss: {train_loss/train_steps:.4f}")
+        print(f"  Val Loss: {val_metrics.get('loss', 0):.4f}")
+        print(f"  Val F1: {val_metrics.get('overall_f1', 0):.4f}")
+        print(f"  Best F1: {best_f1:.4f}")
+        
+        # Save model at the end of each epoch
+        torch.save(
+            model.state_dict(), 
+            f"checkpoints/{config.experiment_name}_{dataset_name}_last.pt"
+        )
     
     return best_f1
 
+def evaluate(model, dataloader, loss_fn, device, metrics):
+    """Evaluate model on a dataloader"""
+    model.eval()
+    metrics.reset()
+    
+    total_loss = 0.0
+    num_batches = 0
+    
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            # Move batch to device
+            batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            
+            # Forward pass
+            outputs = model(**batch)
+            loss_dict = loss_fn(outputs, batch)
+            
+            # Update metrics
+            metrics.update(outputs, batch)
+            total_loss += loss_dict['loss'].item()
+            num_batches += 1
+    
+    # Compute metrics
+    eval_metrics = metrics.compute()
+    eval_metrics['loss'] = total_loss / num_batches
+    
+    return eval_metrics
+
 def main():
+    parser = argparse.ArgumentParser(description='Train Stella ABSA model')
+    parser.add_argument('--config', type=str, default=None, help='Path to config file')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--dataset', type=str, default=None, help='Specific dataset to train on')
+    parser.add_argument('--device', type=str, default=None, help='Device to use (cuda or cpu)')
+    args = parser.parse_args()
+    
+    # Set random seed
+    set_seed(args.seed)
+    
     # Load config
    
     config = LlamaABSAConfig(use_online_model=True)
@@ -223,7 +347,13 @@ def main():
         device = torch.device('cpu')
         print("Using CPU - training will be very slow")
     
-    # Train on each dataset
+    if tokenizer.pad_token is None:
+        special_tokens["pad_token"] = "[PAD]"
+    
+    tokenizer.add_special_tokens(special_tokens)
+    
+    # Train on each dataset or a specific one
+    datasets = [args.dataset] if args.dataset else config.datasets
     results = {}
     for dataset_name in config.datasets:
         try:
@@ -239,6 +369,31 @@ def main():
     print("\nFinal Results:")
     for dataset, f1 in results.items():
         print(f"{dataset}: Best F1 = {f1}")
+    
+    # Test on specific examples
+    test_examples = [
+        "The food was delicious but the service was terrible.",
+        "Great atmosphere and friendly staff!",
+        "The battery life is poor but the screen quality is excellent."
+    ]
+    
+    # Initialize predictor with the best model
+    if datasets:
+        best_dataset = max(results.items(), key=lambda x: x[1])[0]
+        predictor = StellaABSAPredictor(
+            model_path=f"checkpoints/{config.experiment_name}_{best_dataset}_best.pt",
+            config=config,
+            device=device,
+            tokenizer_path=config.model_name
+        )
+        
+        print("\nTest Examples:")
+        for example in test_examples:
+            predictions = predictor.predict(example)
+            print(f"\nInput: {example}")
+            print("Predictions:")
+            for triplet in predictions['triplets']:
+                print(f"  Aspect: {triplet['aspect']}, Opinion: {triplet['opinion']}, Sentiment: {triplet['sentiment']} (Confidence: {triplet['confidence']:.2f})")
     
     # End W&B run
     logger.finish()
