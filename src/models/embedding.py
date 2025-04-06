@@ -1,59 +1,57 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, AutoConfig
-import torch.nn as nn
+# In src/models/embedding.py
 import torch
-from huggingface_hub import InferenceApi
+import torch.nn as nn
+from sentence_transformers import SentenceTransformer
 
-class LlamaEmbedding(nn.Module):
+class ModernEmbedding(nn.Module):
+    """Modern embedding layer for ABSA using pre-trained models"""
     def __init__(self, config):
         super().__init__()
         
-        try:
-            # Try loading with 8-bit quantization first
-            model_config = AutoConfig.from_pretrained(
-                config.model_name,
-                rope_scaling={
-                    "type": "linear",
-                    "factor": 2.0
-                }
-            )
-            
-            self.model = AutoModelForCausalLM.from_pretrained(
-                config.model_name,
-                config=model_config,
-                token=config.auth_token,
-                device_map="auto",
-                torch_dtype=torch.float16  # Use fp16 instead of 8-bit
-            )
-            
-        except ImportError as e:
-            print(f"Warning: 8-bit quantization not available: {e}")
-            print("Falling back to fp16...")
-            
-            # Fallback to basic fp16 without quantization
-            self.model = AutoModelForCausalLM.from_pretrained(
-                config.model_name,
-                torch_dtype=torch.float16,
-                device_map="auto"
-            )
+        # Choose one of these high-quality models
+        model_name = "intfloat/e5-large-v2"  # or "thenlper/gte-large" or "BAAI/bge-large-en-v1.5"
+        print(f"Loading embedding model: {model_name}")
         
-        # Project to desired dimension 
-        self.projection = nn.Linear(
-            self.model.config.hidden_size,
-            config.hidden_size
-        )
+        self.model = SentenceTransformer(model_name)
+        self.tokenizer = self.model.tokenizer
+        self.embedding_dim = self.model.get_sentence_embedding_dimension()
         
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, input_ids, attention_mask):
-        with torch.cuda.amp.autocast():
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                return_dict=True
-            )
+        # Project to desired dimension if needed
+        if hasattr(config, 'hidden_size') and config.hidden_size != self.embedding_dim:
+            self.projection = nn.Linear(self.embedding_dim, config.hidden_size)
+        else:
+            self.projection = nn.Identity()
             
-        hidden_states = outputs.hidden_states[-1]
-        embeddings = self.projection(hidden_states)
+        self.dropout = nn.Dropout(getattr(config, 'dropout', 0.1))
+        
+    def forward(self, input_ids, attention_mask=None, texts=None):
+        """
+        Forward pass to get embeddings
+        
+        Args:
+            input_ids: Token IDs (used if texts is None)
+            attention_mask: Attention mask (not used with sentence-transformers)
+            texts: Raw text input (preferred method)
+        """
+        if texts is None and hasattr(self, 'tokenizer'):
+            # Convert input_ids back to text if needed
+            texts = [self.tokenizer.decode(ids, skip_special_tokens=True) 
+                    for ids in input_ids]
+        
+        # Get embeddings 
+        with torch.no_grad():
+            if isinstance(texts, list):
+                embeddings = self.model.encode(texts, convert_to_tensor=True)
+            else:
+                # Handle single text case
+                embeddings = self.model.encode([texts], convert_to_tensor=True)
+        
+        # Project to desired dimension
+        embeddings = self.projection(embeddings)
+        
+        # Expand dimensions to match expected shape [batch, seq_len, hidden]
+        if len(embeddings.shape) == 2:
+            # Create sequence length dimension (use same embedding for each token)
+            embeddings = embeddings.unsqueeze(1).expand(-1, input_ids.size(1), -1)
             
         return self.dropout(embeddings)

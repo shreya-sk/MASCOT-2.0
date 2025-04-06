@@ -1,39 +1,26 @@
-# src/models/model.py
-from src.models.embedding import LlamaEmbedding
-from src.models.span_detector import SpanDetector
-from src.models.classifier import SentimentClassifier
-import torch.nn as nn
+# In src/models/model.py
+from src.models.embedding import ModernEmbedding
+
 class LlamaABSA(nn.Module):
-    """ABSA model using Llama embeddings"""
+    """ABSA model using modern embeddings"""
     def __init__(self, config):
         super().__init__()
-        self.embeddings = LlamaEmbedding(config)
+        self.embeddings = ModernEmbedding(config)
         
-        # Aspect-Opinion span detection
-        self.span_detector = SpanDetector(
-            input_dim=config.hidden_size,
-            hidden_dim=config.hidden_size,
-            num_layers=config.num_layers
-        )
+        # The rest of your model remains the same
+        self.span_detector = SpanDetector(config)
+        self.sentiment_classifier = SentimentClassifier(config)
         
-        # Sentiment classification
-        self.sentiment_classifier = SentimentClassifier(
-            input_dim=config.hidden_size,
-            num_classes=3  # POS, NEU, NEG
-        )
-
-    def forward(self, input_ids, attention_mask, span_positions=None):
-        # Get Llama embeddings
+    def forward(self, input_ids, attention_mask, texts=None, **kwargs):
+        # Get embeddings
         embeddings = self.embeddings(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            span_positions=span_positions
+            texts=texts
         )
         
-        # Detect aspect-opinion spans
-        aspect_logits, opinion_logits = self.span_detector(embeddings)
-        
-        # Classify sentiment
+        # Rest of your model
+        aspect_logits, opinion_logits = self.span_detector(embeddings, attention_mask)
         sentiment_logits = self.sentiment_classifier(
             embeddings,
             aspect_logits,

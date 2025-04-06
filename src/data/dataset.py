@@ -39,8 +39,15 @@ class ABSADataset(Dataset):
         
     def __len__(self) -> int:
         return len(self.data)
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a single instance"""
+    
+    
+    def __getitem__(self, idx):
         text, span_labels = self.data[idx]
-        return self.preprocessor.preprocess(text, span_labels)
+        
+        # Regular preprocessing
+        tokenized = self.preprocessor.preprocess(text, span_labels)
+        
+        # Add original text
+        tokenized['text'] = text
+        
+        return tokenized

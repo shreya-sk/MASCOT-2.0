@@ -2,11 +2,12 @@
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
-from src.models.embedding import LlamaEmbedding
+from src.models.embedding import OnlineLlamaEmbedding
 from src.models.hierarchical_encoder import HierarchicalEncoder
 from src.utils.config import LlamaABSAConfig
 from src.models.hierarchical_encoder import HierarchicalEncoder
 
+from src.models.embedding import OnlineLlamaEmbedding
 
 def test_embeddings():
     try:

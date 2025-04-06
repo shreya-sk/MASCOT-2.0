@@ -1,49 +1,51 @@
-from dataclasses import dataclass
+# src/utils/config.py
+from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 import os
+
 @dataclass
 class LlamaABSAConfig:
     """Configuration for Llama-based ABSA model"""
-
+    
+    # Model settings
+    model_name: str = "Llama-3.3-70B-Instruct"  # Path or name of model
+    use_local: bool = True  # Use local model files
+    # Add these lines to LlamaABSAConfig class
+    use_online_model: bool = True
+    model_name: str = "meta-llama/Llama-3-8B-Instruct"  # A smaller model is more responsive
+    hf_api_token: str = os.environ.get("HF_TOKEN", None)
     
     # Architecture settings
-    hidden_size: int = 2048  # Reduced for testing
-    num_attention_heads: int = 32
-    max_seq_length: int = 512
+    hidden_size: int = 768  # Size after projection (can be smaller than model)
+    num_layers: int = 2
+    num_attention_heads: int = 12
     dropout: float = 0.1
     
-
-    #model_path: str = "./Llama-3.3-70B-Instruct"
-    tokenizer_path: str = "./Llama-3.3-70B-Instruct/original/tokenizer.model"
-    model_name: str = "meta-llama/Llama-3.3-70B-Instruct"
-    use_local: bool = False
-    auth_token: str = os.environ.get("HF_TOKEN", None)
-
-
-
-    
-    
-    # Optimization settings
-    use_8bit: bool = False
-    use_fp16: bool = True  
-   
-    use_flash_attention: bool = True
+    # Memory optimization
+    use_8bit: bool = False  # Use 8-bit quantization (or 4-bit if False)
+    use_fp16: bool = True  # Use mixed precision
     gradient_checkpointing: bool = True
     
+    # Loss weights
+    aspect_loss_weight: float = 1.0
+    opinion_loss_weight: float = 1.0
+    sentiment_loss_weight: float = 1.0
+    
     # Training settings
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-5  # Lower learning rate for Llama fine-tuning
     weight_decay: float = 0.01
     warmup_steps: int = 1000
-    batch_size: int = 16
-    num_epochs: int = 20
+    batch_size: int = 8  # Smaller batch size for large model
+    gradient_accumulation_steps: int = 4  # Gradient accumulation for larger effective batch
+    num_epochs: int = 10
     num_workers: int = 4
     
     # Logging settings
-    experiment_name: str = "llama-absa-baseline"
+    experiment_name: str = "llama-absa"
     viz_interval: int = 5
     
-    # Dataset settings
-    datasets: List[str] = ("laptop14", "rest14", "rest15", "rest16")
+    # Data settings
+    datasets: List[str] = field(default_factory=lambda: ["laptop14", "rest14", "rest15", "rest16"])
     dataset_paths: Optional[Dict[str, str]] = None
     max_span_length: int = 128
     
@@ -57,8 +59,18 @@ class LlamaABSAConfig:
             }
         
         # Validate settings
-        if self.batch_size > 32 and not self.use_8bit:
-            print("Warning: Large batch size without 8-bit quantization may cause OOM")
+        if self.batch_size > 8 and not self.use_8bit and self.hidden_size > 1024:
+            print("Warning: Reducing batch size to 8 to avoid OOM with large model")
+            self.batch_size = 8
             
-        if self.max_seq_length > 2048:
-            print("Warning: Very large sequence length may impact performance")
+        # Check if we're actually using local files
+        if self.use_local and not os.path.exists(self.model_name):
+            print(f"Warning: Local model path {self.model_name} not found")
+            print("Checking for model files in current directory...")
+            
+            if os.path.exists("Llama-3.3-70B-Instruct"):
+                print("Found Llama-3.3-70B-Instruct directory, using it")
+                self.model_name = "Llama-3.3-70B-Instruct"
+            else:
+                print("No local model files found, will try to download from Hugging Face")
+                self.use_local = False
