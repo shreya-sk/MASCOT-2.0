@@ -36,7 +36,8 @@ MASCOT-2.0/
 │   └── utils/
 │       ├── __init__.py
 │       ├── config.py     
-│       ├── logger.py     
+│     gger.py     
+│       ├── optimization.py   
 │       └── visualisation.py
 ├── checkpoints/          
 ├── visualizations/       
