@@ -1,4 +1,7 @@
 # src/models/span_detector.py
+from torch.nn import nn
+from src.models.cross_attention import MultiHeadCrossAttention
+
 class SpanDetector(nn.Module):
     """Detects aspect and opinion spans using bidirectional modeling"""
     def __init__(self, config):

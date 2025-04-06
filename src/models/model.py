@@ -1,5 +1,7 @@
 # src/models/model.py
 from src.models.embedding import LlamaEmbedding
+from src.models.span_detector import SpanDetector
+from src.models.classifier import SentimentClassifier
 import torch.nn as nn
 class LlamaABSA(nn.Module):
     """ABSA model using Llama embeddings"""
@@ -8,7 +10,7 @@ class LlamaABSA(nn.Module):
         self.embeddings = LlamaEmbedding(config)
         
         # Aspect-Opinion span detection
-        self.span_detector = MultiAspectSpanDetector(
+        self.span_detector = SpanDetector(
             input_dim=config.hidden_size,
             hidden_dim=config.hidden_size,
             num_layers=config.num_layers

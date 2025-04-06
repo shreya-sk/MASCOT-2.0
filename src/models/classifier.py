@@ -1,4 +1,6 @@
 # src/models/classifier.py
+
+import torch.nn as nn
 class SentimentClassifier(nn.Module):
     """Classifies sentiment for detected spans"""
     def __init__(self, config):
@@ -6,7 +8,7 @@ class SentimentClassifier(nn.Module):
         
         # Span representation fusion
         self.fusion = nn.Sequential(
-            nn.Linear(config.hidden_size * 2, config.hidden_size),
+            nn.Linear(config.hidden_size * 2, config.hidden_size), # type: ignore
             nn.GELU(),
             nn.Dropout(config.dropout)
         )

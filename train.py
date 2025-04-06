@@ -1,6 +1,7 @@
 # train.py
 import torch
-from transformers import LlamaTokenizer
+from transformers import LlamaTokenizerFast, AutoTokenizer
+from src.utils.logger import WandbLogger as logger
 from torch.utils.data import DataLoader
 import torch.nn as nn
 from transformers import get_linear_schedule_with_warmup
@@ -10,7 +11,6 @@ from src.models.embedding import LlamaEmbedding
 from src.training.losses import ABSALoss
 from src.training.trainer import ABSATrainer
 from src.utils.config import LlamaABSAConfig
-from src.utils.logger import WandbLogger
 from src.utils.visualisation import AttentionVisualizer
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -130,26 +130,37 @@ def main():
     # Load config
     config = LlamaABSAConfig()
     
-    # Initialize W&B logger
-    logger = WandbLogger(config)
-    
-    # Initialize tokenizer
-    tokenizer = LlamaTokenizer.from_pretrained(
-        config.model_name,
-        padding_side="right",
-        truncation_side="right",
-        model_max_length=config.max_span_length,
-        trust_remote_code=True
-    )
-    
+    try:
+        # First try AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model_name,
+            use_fast=True,  # Use fast tokenizer
+            padding_side="right",
+            truncation_side="right", 
+            model_max_length=config.max_span_length,
+            trust_remote_code=True
+        )
+    except Exception as e:
+        print(f"AutoTokenizer failed: {e}")
+        print("Falling back to LlamaTokenizerFast...")
+        # Fallback to LlamaTokenizerFast
+        tokenizer = LlamaTokenizerFast.from_pretrained(
+            config.model_name,
+            padding_side="right",
+            truncation_side="right",
+            model_max_length=config.max_span_length,
+            trust_remote_code=True
+        )
+
+    # Handle special tokens
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
     special_tokens = {
-        "pad_token": "<pad>",
-        "eos_token": "</s>",
-        "bos_token": "<s>",
-        "unk_token": "<unk>",
+        "additional_special_tokens": ["[AT]", "[OT]", "[AC]", "[SP]"]
     }
     tokenizer.add_special_tokens(special_tokens)
-    
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
