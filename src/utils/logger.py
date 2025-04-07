@@ -1,6 +1,7 @@
 # src/utils/logger.py
 import wandb
 from typing import Dict, Any
+from wandb.sdk.wandb_settings import Settings
 
 class WandbLogger:
     """Weights & Biases logger for experiment tracking"""
@@ -9,7 +10,8 @@ class WandbLogger:
         self.run = wandb.init(
             project="absa-llama",
             config=config,
-            name=config.experiment_name
+            name=config.experiment_name,
+            settings=Settings(init_timeout=300) 
         )
         
     def log_metrics(self, metrics: Dict[str, float], step: int):

@@ -1,4 +1,7 @@
 # src/models/span_detector.py
+import torch.nn as nn # type: ignore # type: ignore
+from src.models.cross_attention import MultiHeadCrossAttention
+
 class SpanDetector(nn.Module):
     """Detects aspect and opinion spans using bidirectional modeling"""
     def __init__(self, config):
@@ -11,7 +14,7 @@ class SpanDetector(nn.Module):
             num_layers=2,
             bidirectional=True,
             batch_first=True,
-            dropout=config.dropout if config.num_layers > 1 else 0
+            dropout=config.dropout if getattr(config, 'num_layers', 2) > 1 else 0
         )
         
         # Cross attention between aspects and opinions
@@ -32,17 +35,34 @@ class SpanDetector(nn.Module):
         
         self.dropout = nn.Dropout(config.dropout)
         
-    def forward(self, hidden_states, attention_mask=None):
-        # BiLSTM encoding
-        lstm_out, _ = self.lstm(hidden_states)
-        lstm_out = self.dropout(lstm_out)
+    def forward(self, aspect_embeddings=None, opinion_embeddings=None, attention_mask=None, hidden_states=None):
+        """Forward pass supporting both separate embeddings and single hidden states"""
+        # If separate embeddings aren't provided, use hidden_states for both
+        if aspect_embeddings is None and opinion_embeddings is None:
+            if hidden_states is None:
+                raise ValueError("Either hidden_states or aspect/opinion embeddings must be provided")
+            aspect_embeddings = opinion_embeddings = hidden_states
+        
+        # BiLSTM encoding for aspects
+        aspect_lstm_out, _ = self.lstm(aspect_embeddings)
+        aspect_lstm_out = self.dropout(aspect_lstm_out)
+        
+        # BiLSTM encoding for opinions
+        if opinion_embeddings is aspect_embeddings:
+            opinion_lstm_out = aspect_lstm_out
+        else:
+            opinion_lstm_out, _ = self.lstm(opinion_embeddings)
+            opinion_lstm_out = self.dropout(opinion_lstm_out)
         
         # Cross attention between aspects and opinions
-        aspect_hidden = self.cross_attention(lstm_out, lstm_out, attention_mask)
-        opinion_hidden = self.cross_attention(lstm_out, lstm_out, attention_mask)
+        aspect_hidden = self.cross_attention(aspect_lstm_out, opinion_lstm_out, attention_mask)
+        opinion_hidden = self.cross_attention(opinion_lstm_out, aspect_lstm_out, attention_mask)
         
         # Span predictions
         aspect_logits = self.aspect_classifier(aspect_hidden)
         opinion_logits = self.opinion_classifier(opinion_hidden)
         
-        return aspect_logits, opinion_logits
+        # Generate span features for sentiment classification
+        span_features = aspect_hidden * opinion_hidden
+        
+        return aspect_logits, opinion_logits, span_features
