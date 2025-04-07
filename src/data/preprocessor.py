@@ -1,13 +1,12 @@
 from typing import List, Dict, Any
-#from data.utils import SENTIMENT_MAP, convert_to_bio_labels
-from data.utils import SENTIMENT_MAP, convert_to_bio_labels
-import torch
+import torch # type: ignore # type: ignore
 from transformers import PreTrainedTokenizer
-import spacy
-from spacy.tokens import Doc
+import spacy # type: ignore
+from spacy.tokens import Doc # type: ignore # type: ignore
 import numpy as np
 
-from .utils import SENTIMENT_MAP, convert_to_bio_labels, SpanLabel
+# Fix this import to include SpanLabel
+from src.data.utils import SENTIMENT_MAP, convert_to_bio_labels, SpanLabel
 
 class StellaABSAPreprocessor:
     """

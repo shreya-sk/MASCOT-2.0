@@ -1,7 +1,7 @@
 # src/models/context_span_detector.py
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import torch # type: ignore
+import torch.nn as nn # type: ignore
+import torch.nn.functional as F # type: ignore
 
 class SyntaxGuidedAttention(nn.Module):
     """

@@ -1,23 +1,11 @@
 # Llama model files and large tensor files
-Llama-3.3-70B-Instruct/
-*.safetensors
-*.bin
-*.pt
-*.pth
-*.ckpt
-*.onnx
-*.pb
-model-*.safetensors
+
 
 # Weights & Biases
 wandb/
 *.wandb
 
-# Python virtual environment
-senti/
-venv/
-env/
-.env/
+
 
 # Python cache files
 __pycache__/

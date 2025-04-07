@@ -1,18 +1,32 @@
 # train.py
 import os
-import torch
+import argparse
+import torch # type: ignore # type: ignore
+import random
+import numpy as np
+from tqdm import tqdm
 from transformers import AutoTokenizer
-from torch.utils.data import DataLoader
-import torch.nn as nn
+from torch.utils.data import DataLoader # type: ignore
 from transformers import get_linear_schedule_with_warmup
-from src.data import ABSADataset
-from src.models.model import LlamaABSA
+
+# Import your custom modules
+from src.data.dataset import ABSADataset
+from src.data.preprocessor import StellaABSAPreprocessor
+from src.models.absa import StellaABSA # You need this file
 from src.training.losses import ABSALoss
 from src.training.trainer import ABSATrainer
-from src.utils.config import LlamaABSAConfig
+from src.training.metrics import ABSAMetrics
+from src.utils.config import StellaABSAConfig
 from src.utils.logger import WandbLogger
-from src.data.preprocessor import StellaABSAPreprocessor
 from src.utils.visualisation import AttentionVisualizer
+from src.inference.predictor import StellaABSAPredictor
+
+def set_seed(seed: int):
+    """Set random seed for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 def train_dataset(config, tokenizer, logger, dataset_name, device):
     """Train model on a specific dataset"""
@@ -49,7 +63,7 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
         domain_id=domain_id
     )
     
-    # Create dataloaders with smaller batch size for Llama
+    # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -67,14 +81,26 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
     )
     
     # Initialize model
-    print(f"Initializing LlamaABSA model for dataset: {dataset_name}")
-    model = LlamaABSA(config).to(device)
+    print(f"Initializing StellaABSAConfig model for dataset: {dataset_name}")
+    model = StellaABSA(config).to(device)
     
     # Set up gradient accumulation steps
     gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
     print(f"Using gradient accumulation with {gradient_accumulation_steps} steps")
     
     # Initialize optimizer
+    # Separate learning rates for base model and new components
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if "embeddings" in n],
+            "lr": config.learning_rate / 10.0,  # Lower learning rate for pretrained parts
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if "embeddings" not in n],
+            "lr": config.learning_rate,
+        },
+    ]
+    
     optimizer = torch.optim.AdamW(
         optimizer_grouped_parameters,
         weight_decay=config.weight_decay,
@@ -82,6 +108,7 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
     
     # Calculate steps with gradient accumulation
     num_training_steps = len(train_loader) // gradient_accumulation_steps * config.num_epochs
+    num_warmup_steps = int(num_training_steps * getattr(config, 'warmup_ratio', 0.1))
     
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
@@ -91,6 +118,9 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
     
     # Initialize loss function
     loss_fn = ABSALoss(config)
+    
+    # Initialize metrics
+    metrics = ABSAMetrics()
     
     # Create trainer with gradient accumulation
     trainer = ABSATrainer(
@@ -102,6 +132,9 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
         config=config
     )
     
+    # Initialize visualizer
+    visualizer = AttentionVisualizer(tokenizer)
+    
     # Set up mixed precision training if enabled
     scaler = torch.cuda.amp.GradScaler() if config.use_fp16 else None
     
@@ -109,9 +142,8 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
     os.makedirs('checkpoints', exist_ok=True)
     
     # Training loop
-    best_f1 = 0
-
-    
+    best_f1 = 0.0
+    global_step = 0
     
     for epoch in range(config.num_epochs):
         # Training
@@ -121,60 +153,63 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
         
         train_iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs} (Train)")
         
-        # Log metrics with dataset name
-        logger.log_metrics({
-            'dataset': dataset_name,
-            'epoch': epoch,
-            'train_loss': train_loss,
-            'val_loss': val_metrics['loss'],
-            'val_f1': val_metrics.get('f1', 0)
-        }, epoch)
-        
-        # Visualize attention if needed and available
-        if epoch % config.viz_interval == 0:
-            try:
-                attention_weights = trainer.get_attention_weights(val_loader)
-                if attention_weights is not None:
-                    # Create visualizations directory if it doesn't exist
-                    os.makedirs('visualizations', exist_ok=True)
+        for batch_idx, batch in enumerate(train_iterator):
+            # Move batch to device
+            batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            
+            # Forward pass with mixed precision if enabled
+            if config.use_fp16:
+                with torch.cuda.amp.autocast():
+                    outputs = model(**batch)
+                    loss_dict = loss_fn(outputs, batch)
+                    loss = loss_dict['loss'] / gradient_accumulation_steps
                     
-                    visualizer.plot_attention(
-                        attention_weights,
-                        tokens=tokenizer.convert_ids_to_tokens(val_loader.dataset[0]['input_ids']),
-                        save_path=f'visualizations/{dataset_name}_attention_epoch_{epoch}.png'
-                    )
-            except Exception as e:
-                print(f"Warning: Could not visualize attention: {e}")
-        
-        # Print metrics
-        print(f"Epoch {epoch}:")
-        print(f"Train Loss: {train_loss:.4f}")
-        print(f"Val Loss: {val_metrics['loss']:.4f}")
-        print(f"Val F1: {val_metrics.get('f1', 0):.4f}")
-        
-        # Save checkpoint every epoch
-        torch.save(
-            {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_metrics': val_metrics,
-            },
-            f'checkpoints/checkpoint_{dataset_name}_epoch_{epoch}.pt'
-        )
-        
-        # Save best model for this dataset
-        current_f1 = val_metrics.get('f1', 0)
-        if current_f1 > best_f1:
-            best_f1 = current_f1
-            torch.save(model.state_dict(), f'checkpoints/best_model_{dataset_name}.pt')
-            logger.log_model(model, {
-                'dataset': dataset_name,
-                **val_metrics
+                # Backward pass with gradient scaling
+                scaler.scale(loss).backward()
+                
+                # Only step optimizer after accumulating gradients
+                if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                    # Gradient clipping
+                    if hasattr(config, 'max_grad_norm') and config.max_grad_norm > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                    
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    scheduler.step()
+                    global_step += 1
+            else:
+                # Standard forward and backward pass
+                outputs = model(**batch)
+                loss_dict = loss_fn(outputs, batch)
+                loss = loss_dict['loss'] / gradient_accumulation_steps
+                
+                loss.backward()
+                
+                # Only step optimizer after accumulating gradients
+                if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                    # Gradient clipping
+                    if hasattr(config, 'max_grad_norm') and config.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                    
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step()
+                    global_step += 1
+            
+            # Update metrics
+            train_loss += loss.item() * gradient_accumulation_steps
+            train_steps += 1
+            
+            # Update progress bar
+            train_iterator.set_postfix({
+                'loss': f"{loss.item():.4f}", 
+                'lr': f"{scheduler.get_last_lr()[0]:.7f}"
             })
             
             # Log training metrics
-            if global_step % config.log_interval == 0:
+            if global_step > 0 and hasattr(config, 'log_interval') and global_step % config.log_interval == 0:
                 logger.log_metrics({
                     'dataset': dataset_name,
                     'epoch': epoch + 1,
@@ -183,7 +218,7 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
                 }, global_step)
             
             # Evaluate model periodically
-            if global_step % config.eval_interval == 0:
+            if global_step > 0 and hasattr(config, 'eval_interval') and global_step % config.eval_interval == 0:
                 val_metrics = evaluate(model, val_loader, loss_fn, device, metrics)
                 
                 # Log validation metrics
@@ -213,7 +248,7 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
                 model.train()
             
             # Save model periodically
-            if global_step % config.save_interval == 0:
+            if global_step > 0 and hasattr(config, 'save_interval') and global_step % config.save_interval == 0:
                 os.makedirs('checkpoints', exist_ok=True)
                 torch.save(
                     model.state_dict(), 
@@ -228,6 +263,22 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
         val_metrics['epoch'] = epoch + 1
         val_metrics['train_loss'] = train_loss / train_steps
         logger.log_metrics(val_metrics, global_step)
+        
+        # Visualize attention if needed and available
+        if epoch % config.viz_interval == 0:
+            try:
+                attention_weights = trainer.get_attention_weights(val_loader)
+                if attention_weights is not None:
+                    # Create visualizations directory if it doesn't exist
+                    os.makedirs('visualizations', exist_ok=True)
+                    
+                    visualizer.plot_attention(
+                        attention_weights,
+                        tokens=tokenizer.convert_ids_to_tokens(val_loader.dataset[0]['input_ids']),
+                        save_path=f'visualizations/{dataset_name}_attention_epoch_{epoch}.png'
+                    )
+            except Exception as e:
+                print(f"Warning: Could not visualize attention: {e}")
         
         # Print end of epoch summary
         print(f"Epoch {epoch+1}/{config.num_epochs}:")
@@ -273,22 +324,35 @@ def evaluate(model, dataloader, loss_fn, device, metrics):
     return eval_metrics
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Stella ABSA model')
+    parser = argparse.ArgumentParser(description='Train LLAMA ABSA model')
     parser.add_argument('--config', type=str, default=None, help='Path to config file')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--dataset', type=str, default=None, help='Specific dataset to train on')
     parser.add_argument('--device', type=str, default=None, help='Device to use (cuda or cpu)')
+    parser.add_argument('--learning_rate', type=float, default=None, help='Learning rate')
+    parser.add_argument('--batch_size', type=int, default=None, help='Batch size')
+    parser.add_argument('--hidden_size', type=int, default=None, help='Hidden size')
+    parser.add_argument('--dropout', type=float, default=None, help='Dropout rate')
     args = parser.parse_args()
     
     # Set random seed
     set_seed(args.seed)
     
     # Load config
-   
-    config = LlamaABSAConfig(use_online_model=True)
+    config = StellaABSAConfig()
+    
+    # Override config with command line arguments
+    if args.learning_rate is not None:
+        config.learning_rate = args.learning_rate
+    if args.batch_size is not None:
+        config.batch_size = args.batch_size
+    if args.hidden_size is not None:
+        config.hidden_size = args.hidden_size
+    if args.dropout is not None:
+        config.dropout = args.dropout
     
     # Initialize W&B logger
-    logger = WandbLogger(config.__dict__)
+    logger = WandbLogger(config)
     
     # Initialize tokenizer
     print(f"Loading tokenizer from: {config.model_name}")
@@ -337,25 +401,24 @@ def main():
     tokenizer.add_special_tokens(task_tokens)
     
     # Set device with mixed precision
-    if torch.cuda.is_available():
+    if args.device:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
         device = torch.device('cuda')
         print(f"Using GPU: {torch.cuda.get_device_name(0)}")
         # Print available GPU memory
-        free_memory, total_memory = torch.cuda.mem_get_info(0)
-        print(f"GPU Memory: {free_memory/1024**3:.2f}GB free / {total_memory/1024**3:.2f}GB total")
+        if hasattr(torch.cuda, 'mem_get_info'):
+            free_memory, total_memory = torch.cuda.mem_get_info(0)
+            print(f"GPU Memory: {free_memory/1024**3:.2f}GB free / {total_memory/1024**3:.2f}GB total")
     else:
         device = torch.device('cpu')
         print("Using CPU - training will be very slow")
     
-    if tokenizer.pad_token is None:
-        special_tokens["pad_token"] = "[PAD]"
-    
-    tokenizer.add_special_tokens(special_tokens)
-    
     # Train on each dataset or a specific one
     datasets = [args.dataset] if args.dataset else config.datasets
     results = {}
-    for dataset_name in config.datasets:
+    
+    for dataset_name in datasets:
         try:
             best_f1 = train_dataset(config, tokenizer, logger, dataset_name, device)
             results[dataset_name] = best_f1
@@ -378,22 +441,29 @@ def main():
     ]
     
     # Initialize predictor with the best model
-    if datasets:
-        best_dataset = max(results.items(), key=lambda x: x[1])[0]
-        predictor = StellaABSAPredictor(
-            model_path=f"checkpoints/{config.experiment_name}_{best_dataset}_best.pt",
-            config=config,
-            device=device,
-            tokenizer_path=config.model_name
-        )
-        
-        print("\nTest Examples:")
-        for example in test_examples:
-            predictions = predictor.predict(example)
-            print(f"\nInput: {example}")
-            print("Predictions:")
-            for triplet in predictions['triplets']:
-                print(f"  Aspect: {triplet['aspect']}, Opinion: {triplet['opinion']}, Sentiment: {triplet['sentiment']} (Confidence: {triplet['confidence']:.2f})")
+    if datasets and any(isinstance(f1, (int, float)) for f1 in results.values()):
+        # Find best dataset with numerical F1 value
+        valid_results = {k: v for k, v in results.items() if isinstance(v, (int, float))}
+        if valid_results:
+            best_dataset = max(valid_results.items(), key=lambda x: x[1])[0]
+            try:
+                predictor = StellaABSAPredictor(
+                    model_path=f"checkpoints/{config.experiment_name}_{best_dataset}_best.pt",
+                    config=config,
+                    device=device,
+                    tokenizer_path=config.model_name
+                )
+                
+                print("\nTest Examples:")
+                for example in test_examples:
+                    predictions = predictor.predict(example)
+                    print(f"\nInput: {example}")
+                    print("Predictions:")
+                    for triplet in predictions['triplets']:
+                        print(f"  Aspect: {triplet['aspect']}, Opinion: {triplet['opinion']}, "
+                              f"Sentiment: {triplet['sentiment']} (Confidence: {triplet['confidence']:.2f})")
+            except Exception as e:
+                print(f"Error running predictions: {e}")
     
     # End W&B run
     logger.finish()

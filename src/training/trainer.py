@@ -1,8 +1,8 @@
 # src/training/trainer.py
-import torch
+import torch # type: ignore # type: ignore
 import gc
 from tqdm import tqdm
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import autocast, GradScaler # type: ignore
 
 class ABSATrainer:
     def __init__(

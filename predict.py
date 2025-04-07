@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 # predict_stella.py
 import argparse
-import torch
+import torch # type: ignore
 import json
 from transformers import AutoTokenizer
 
-from src.utils.stella_config import StellaABSAConfig
-from src.inference.stella_predictor import StellaABSAPredictor
+from src.utils.config import StellaABSAConfig
+from src.inference.predictor import StellaABSAPredictor
 
 def main():
     parser = argparse.ArgumentParser(description='Run Stella ABSA predictions')
