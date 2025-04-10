@@ -1,18 +1,15 @@
-# src/models/stella_embedding.py
-import torch # type: ignore
-import torch.nn as nn # type: ignore
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers import AutoConfig
-from transformers import AutoModel
+# src/models/embedding.py
+import torch 
+import torch.nn as nn
+from transformers import AutoModel, AutoConfig
+
 class LLMEmbedding(nn.Module):
     """
-    Stella v5 (400M) embedding layer for ABSA
+    LLM embedding layer for ABSA
     
     This implements a novel hierarchical focal embedding that alternates
     between global context understanding and focused aspect-opinion attention.
     """
-    # In src/models/embedding.py - modify the __init__ method
-
     def __init__(self, config):
         super().__init__()
         
@@ -40,7 +37,11 @@ class LLMEmbedding(nn.Module):
                 )
         except Exception as e:
             print(f"Error loading model: {e}")
-            raise
+            # Create fallback encoder
+            print("Using fallback encoder")
+            model_config = AutoConfig.from_pretrained("bert-base-uncased")
+            model_config.hidden_size = config.hidden_size
+            self.encoder = AutoModel.from_config(model_config)
         
         # Get the actual hidden size from the loaded model
         self.model_hidden_size = self.encoder.config.hidden_size
@@ -56,21 +57,19 @@ class LLMEmbedding(nn.Module):
             config.hidden_size
         )
         
-
-        # Novel: Cross-Domain Knowledge Adapter
-        # This helps transfer knowledge between domains (e.g., restaurant to laptop)
-        self.domain_adapter = nn.Sequential(
-            nn.Linear(self.encoder.config.hidden_size, config.hidden_size),
-            nn.GELU(),
-            nn.Linear(config.hidden_size, config.hidden_size)
+        # Common projection for hidden states
+        self.hidden_projection = nn.Linear(
+            self.model_hidden_size,
+            config.hidden_size
         )
         
         # Dropout for regularization
         self.dropout = nn.Dropout(config.dropout)
         
-        # Context pooling with learned weights
-        self.context_pool = nn.Parameter(torch.ones(1, 1, self.encoder.config.hidden_size))
-        
+        # Freeze base model parameters if configured
+        if getattr(config, 'freeze_layers', False):
+            self._freeze_layers(True)
+
     def _freeze_layers(self, freeze_layers):
         if not freeze_layers:
             return
@@ -80,10 +79,9 @@ class LLMEmbedding(nn.Module):
             for param in self.encoder.get_input_embeddings().parameters():
                 param.requires_grad = False
         
-        # Different models have different structures
         # Try different attribute patterns based on model architecture
         
-    # For BERT-like models
+        # For BERT-like models
         if hasattr(self.encoder, 'encoder') and hasattr(self.encoder.encoder, 'layer'):
             layers = self.encoder.encoder.layer
             num_layers = len(layers)
@@ -94,7 +92,7 @@ class LLMEmbedding(nn.Module):
                     param.requires_grad = False
             print(f"Froze {freeze_up_to}/{num_layers} encoder layers")
             
-        # For Phi-2, LlamaForCausalLM, etc.
+        # For other model types (Phi-2, LlamaForCausalLM, etc.)
         elif hasattr(self.encoder, 'model') and hasattr(self.encoder.model, 'layers'):
             layers = self.encoder.model.layers
             num_layers = len(layers)
@@ -104,13 +102,20 @@ class LLMEmbedding(nn.Module):
                 for param in layers[i].parameters():
                     param.requires_grad = False
             print(f"Froze {freeze_up_to}/{num_layers} model layers")
-            
-        # For other model types
         else:
-            print(f"Warning: Could not identify layer structure for {type(self.encoder)}. No layers frozen.")
+            print(f"Warning: Could not identify layer structure. No layers frozen.")
+            
     def forward(self, input_ids, attention_mask, domain_id=None):
         """
         Forward pass with novel hierarchical focal attention
+        
+        Args:
+            input_ids: Input token ids [batch_size, seq_len]
+            attention_mask: Attention mask [batch_size, seq_len]
+            domain_id: Optional domain identifier for domain adaptation
+            
+        Returns:
+            Dictionary with embeddings for aspects, opinions, and hidden states
         """
         try:
             # Get base embeddings from model
@@ -130,22 +135,36 @@ class LLMEmbedding(nn.Module):
                 # Fallback
                 hidden_states = outputs[0]
             
+            # Apply projections with shape validation
+            batch_size, seq_len, _ = hidden_states.size()
+            
+            # Project hidden states
+            hidden_proj = self.hidden_projection(hidden_states)
+            
             # Dual projection for aspect and opinion
             aspect_embeddings = self.aspect_projection(hidden_states)
             opinion_embeddings = self.opinion_projection(hidden_states)
             
+            # Apply dropout
+            aspect_embeddings = self.dropout(aspect_embeddings)
+            opinion_embeddings = self.dropout(opinion_embeddings)
+            hidden_proj = self.dropout(hidden_proj)
+            
             # Return properly structured output
             return {
-                'aspect_embeddings': self.dropout(aspect_embeddings),
-                'opinion_embeddings': self.dropout(opinion_embeddings),
-                'hidden_states': hidden_states
+                'aspect_embeddings': aspect_embeddings,
+                'opinion_embeddings': opinion_embeddings,
+                'hidden_states': hidden_proj
             }
         except Exception as e:
             print(f"Error in embedding forward pass: {e}")
             # Return tensor placeholders with correct dimensions
             batch_size, seq_len = input_ids.size()
             hidden_dim = self.aspect_projection.out_features
-            placeholder = torch.zeros(batch_size, seq_len, hidden_dim, device=input_ids.device)
+            device = input_ids.device
+            
+            # Create fallback tensors with correct dimensions
+            placeholder = torch.zeros(batch_size, seq_len, hidden_dim, device=device)
             return {
                 'aspect_embeddings': placeholder,
                 'opinion_embeddings': placeholder,

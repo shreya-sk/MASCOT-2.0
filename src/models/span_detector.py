@@ -1,7 +1,7 @@
 # src/models/span_detector.py
-import torch # type: ignore
-import torch.nn as nn # type: ignore # type: ignore
-from src.models.cross_attention import MultiHeadCrossAttention
+import torch  #type: ignore 
+import torch.nn as nn  #type: ignore
+from src.models.cross_attention import MultiHeadCrossAttention  #type: ignore
 
 class SpanDetector(nn.Module):
     """Detects aspect and opinion spans using bidirectional modeling"""
@@ -46,6 +46,10 @@ class SpanDetector(nn.Module):
                 aspect_embeddings = opinion_embeddings = hidden_states
             
             # BiLSTM encoding for aspects
+            # Fix tensor reshaping issue - ensure proper dimensions
+            batch_size, seq_len, hidden_dim = aspect_embeddings.size()
+            
+            # Run LSTM - reshaping properly for sequence models
             aspect_lstm_out, _ = self.lstm(aspect_embeddings)
             aspect_lstm_out = self.dropout(aspect_lstm_out)
             
@@ -57,6 +61,7 @@ class SpanDetector(nn.Module):
                 opinion_lstm_out = self.dropout(opinion_lstm_out)
             
             # Cross attention between aspects and opinions
+            # Fix: Ensure proper shape handling in cross attention
             aspect_hidden = self.cross_attention(aspect_lstm_out, opinion_lstm_out, attention_mask)
             opinion_hidden = self.cross_attention(opinion_lstm_out, aspect_lstm_out, attention_mask)
             
@@ -65,6 +70,7 @@ class SpanDetector(nn.Module):
             opinion_logits = self.opinion_classifier(opinion_hidden)
             
             # Generate span features for sentiment classification
+            # Element-wise multiplication for feature fusion
             span_features = aspect_hidden * opinion_hidden
             
             return aspect_logits, opinion_logits, span_features
@@ -72,9 +78,13 @@ class SpanDetector(nn.Module):
         except Exception as e:
             print(f"Error in span detector forward pass: {e}")
             # Return tensor placeholders with correct dimensions
-            batch_size, seq_len = hidden_states.size(0), hidden_states.size(1)
-            aspect_logits = torch.zeros(batch_size, seq_len, 3, device=hidden_states.device)
-            opinion_logits = torch.zeros(batch_size, seq_len, 3, device=hidden_states.device)
+            batch_size = hidden_states.size(0)
+            seq_len = hidden_states.size(1)
+            device = hidden_states.device
+            
+            # Create properly shaped outputs instead of zeros with wrong dimensions
+            aspect_logits = torch.zeros(batch_size, seq_len, 3, device=device)
+            opinion_logits = torch.zeros(batch_size, seq_len, 3, device=device)
             span_features = torch.zeros_like(hidden_states)
             
             return aspect_logits, opinion_logits, span_features

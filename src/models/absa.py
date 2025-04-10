@@ -114,13 +114,11 @@ class LLMABSA(nn.Module):
         
         return outputs
         
-        
     
-# In src/models/absa.py - add a generative component
 class GenerativeLLMABSA(nn.Module):
     def __init__(self, config):
         super().__init__()
-        # Your existing code for span detection and sentiment classification
+        # Initialize components
         self.embeddings = LLMEmbedding(config)
         self.span_detector = SpanDetector(config)
         self.sentiment_classifier = AspectOpinionJointClassifier(
@@ -131,16 +129,28 @@ class GenerativeLLMABSA(nn.Module):
                                     use_aspect_first=True
                                 )
         
-        # Add the new generative component
-        # Initialize tokenizer in the model
-        
+        # Add the generative component
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
         self.explanation_generator = ExplanationGenerator(config, self.tokenizer)
-
+        
+        # Save config for future reference
+        self.config = config
         
     def forward(self, input_ids, attention_mask, generate=False, **kwargs):
-    # Get embeddings
+        """
+        Forward pass for the complete ABSA model
+        
+        Args:
+            input_ids: Input token ids [batch_size, seq_len]
+            attention_mask: Attention mask [batch_size, seq_len]
+            generate: Whether to generate explanations
+            **kwargs: Additional keyword arguments
+            
+        Returns:
+            dict: Dictionary of outputs including logits and optional explanations
+        """
         try:
+            # Get embeddings
             embeddings_output = self.embeddings(
                 input_ids=input_ids,
                 attention_mask=attention_mask
@@ -149,11 +159,11 @@ class GenerativeLLMABSA(nn.Module):
             # Extract hidden states
             hidden_states = self._extract_hidden_states(embeddings_output)
             
-            # Create simple outputs for testing
-            batch_size, seq_len = input_ids.size()
-            device = input_ids.device
+            # Ensure we have the correct dimensions
+            batch_size, seq_len, hidden_dim = hidden_states.size()
+            device = hidden_states.device
             
-            # Use the span detector if possible, otherwise create dummy outputs
+            # Use the span detector - properly handling dimensions
             try:
                 aspect_logits, opinion_logits, span_features = self.span_detector(
                     hidden_states=hidden_states, 
@@ -161,12 +171,12 @@ class GenerativeLLMABSA(nn.Module):
                 )
             except Exception as e:
                 print(f"Error in span detector forward pass: {e}")
-                # Create dummy logits
+                # Create fallback outputs with correct shapes
                 aspect_logits = torch.zeros(batch_size, seq_len, 3, device=device)
                 opinion_logits = torch.zeros(batch_size, seq_len, 3, device=device)
                 span_features = torch.zeros_like(hidden_states)
                 
-            # Use sentiment classifier if possible, otherwise create dummy outputs
+            # Use sentiment classifier
             try:
                 sentiment_logits, confidence_scores = self.sentiment_classifier(
                     hidden_states=hidden_states,
@@ -175,7 +185,7 @@ class GenerativeLLMABSA(nn.Module):
                 )
             except Exception as e:
                 print(f"Error in sentiment classifier forward pass: {e}")
-                # Create dummy sentiment logits and confidence scores
+                # Create fallback outputs with correct shapes
                 sentiment_logits = torch.zeros(batch_size, 3, device=device)
                 confidence_scores = torch.ones(batch_size, 1, device=device)
                 
@@ -191,7 +201,6 @@ class GenerativeLLMABSA(nn.Module):
             if generate:
                 try:
                     # Extract triplets from predictions
-                    batch_size = input_ids.size(0)
                     aspect_preds = aspect_logits.argmax(dim=-1)  # [batch_size, seq_len]
                     opinion_preds = opinion_logits.argmax(dim=-1)  # [batch_size, seq_len]
                     sentiment_preds = sentiment_logits.argmax(dim=-1)  # [batch_size]
@@ -208,27 +217,33 @@ class GenerativeLLMABSA(nn.Module):
                     outputs['explanations'] = explanation_logits
                 except Exception as e:
                     print(f"Error in explanation generation: {e}")
-                    # Add dummy explanations for testing
-                    explanations = []
-                    for b in range(batch_size):
-                        explanations.append(["This is a placeholder explanation."])
-                    outputs['explanations'] = explanations
-                    
+                    # Add placeholder explanations with correct shape
+                    vocab_size = getattr(self.config, 'vocab_size', 32000)
+                    max_gen_len = getattr(self.config, 'max_generation_length', 64)
+                    outputs['explanations'] = torch.zeros(batch_size, max_gen_len, vocab_size, device=device)
+            
             return outputs
             
         except Exception as e:
             print(f"Error in model forward pass: {e}")
-            # Return dummy outputs for testing
+            # Return minimal outputs with correct shapes
             batch_size, seq_len = input_ids.size()
             device = input_ids.device
             
-            return {
+            outputs = {
                 'aspect_logits': torch.zeros(batch_size, seq_len, 3, device=device),
                 'opinion_logits': torch.zeros(batch_size, seq_len, 3, device=device),
                 'sentiment_logits': torch.zeros(batch_size, 3, device=device),
                 'confidence_scores': torch.ones(batch_size, 1, device=device),
-                'explanations': ["This is a fallback explanation."] if generate else None
             }
+            
+            if generate:
+                vocab_size = getattr(self.config, 'vocab_size', 32000)
+                max_gen_len = getattr(self.config, 'max_generation_length', 64)
+                outputs['explanations'] = torch.zeros(batch_size, max_gen_len, vocab_size, device=device)
+                
+            return outputs
+            
     def _extract_hidden_states(self, embeddings_output):
         """Extract hidden states from embeddings output"""
         if isinstance(embeddings_output, dict):
@@ -244,8 +259,6 @@ class GenerativeLLMABSA(nn.Module):
                 return list(embeddings_output.values())[0]
         else:
             return embeddings_output
-        
-      # Add to your ABSA model class
     def _extract_triplets(self, aspect_logits, opinion_logits, sentiment_logits, input_ids, tokenizer):
         """Extract triplets from model predictions for generative explanation"""
         batch_size = aspect_logits.size(0)

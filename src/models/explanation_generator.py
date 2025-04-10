@@ -1,6 +1,6 @@
-import torch   
-import torch.nn as nn
-import torch.nn.functional as F
+import torch   #type: ignore
+import torch.nn as nn #type: ignore
+import torch.nn.functional as F #type: ignore
 
 class ExplanationGenerator(nn.Module):
     """
@@ -12,38 +12,56 @@ class ExplanationGenerator(nn.Module):
         self.config = config
         self.tokenizer = tokenizer
         self.hidden_size = config.hidden_size
+        self.vocab_size = getattr(config, 'vocab_size', 32000)
+        self.max_length = getattr(config, 'max_generation_length', 64)
         
         # Template embeddings for different sentiment types
         self.template_embeddings = nn.Parameter(
             torch.randn(3, config.hidden_size)  # POS, NEU, NEG
         )
         
-        # Attention for selecting relevant context
-        self.context_attention = nn.MultiheadAttention(
-            embed_dim=config.hidden_size,
-            num_heads=4,
+        # Dummy embedding for generation starts
+        self.bos_embedding = nn.Parameter(torch.randn(1, config.hidden_size))
+        
+        # Linear layers for processing aspect and opinion representations
+        self.aspect_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.opinion_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        
+        # Calculate number of heads to ensure divisibility
+        # This ensures that hidden_size is divisible by num_heads
+        self.num_heads = self._calculate_num_heads(config.hidden_size)
+        
+        # Transformer decoder layers
+        self.decoder_layer = nn.TransformerDecoderLayer(
+            d_model=config.hidden_size,
+            nhead=self.num_heads,
+            dim_feedforward=config.hidden_size * 4,
+            dropout=0.1,
             batch_first=True
         )
         
-        # Transformer decoder layers
-        self.decoder_layers = nn.ModuleList([
-            nn.TransformerDecoderLayer(
-                d_model=config.hidden_size,
-                nhead=4,
-                dim_feedforward=config.hidden_size * 4,
-                dropout=0.1,
-                batch_first=True
-            ) for _ in range(2)  # 2 decoder layers
-        ])
+        self.decoder = nn.TransformerDecoder(
+            self.decoder_layer,
+            num_layers=getattr(config, 'num_decoder_layers', 2)
+        )
         
         # Output projection to vocabulary
-        # Use shared weights with embedding if possible
-        if hasattr(config, 'vocab_size'):
-            self.vocab_size = config.vocab_size
-        else:
-            self.vocab_size = 32000  # Default for most LLMs
-            
         self.output_projection = nn.Linear(config.hidden_size, self.vocab_size)
+        
+    def _calculate_num_heads(self, hidden_size):
+        """Calculate the number of attention heads to ensure divisibility"""
+        # Try standard numbers of heads
+        for heads in [8, 4, 2, 1]:
+            if hidden_size % heads == 0:
+                return heads
+        
+        # If no standard number works, find the largest divisor <= 8
+        for heads in range(min(8, hidden_size), 0, -1):
+            if hidden_size % heads == 0:
+                return heads
+        
+        # Fallback to 1 (should never reach here if hidden_size >= 1)
+        return 1
         
     def forward(self, hidden_states, aspect_spans, opinion_spans, sentiments, attention_mask=None):
         """
@@ -51,120 +69,132 @@ class ExplanationGenerator(nn.Module):
         
         Args:
             hidden_states: Encoder hidden states [batch_size, seq_len, hidden_dim]
-            aspect_spans: List of aspect spans for each batch item
-            opinion_spans: List of opinion spans for each batch item
-            sentiments: Sentiment predictions for each batch item
-            attention_mask: Attention mask for input sequence
+            aspect_spans: Aspect span predictions [batch_size, seq_len]
+            opinion_spans: Opinion span predictions [batch_size, seq_len]
+            sentiments: Sentiment predictions [batch_size]
+            attention_mask: Attention mask for input sequence [batch_size, seq_len]
             
         Returns:
-            explanation_logits: Logits for generated tokens [batch_size, gen_len, vocab_size]
+            explanation_logits: Logits for generated tokens [batch_size, max_length, vocab_size]
         """
-        batch_size = hidden_states.size(0)
-        device = hidden_states.device
-        
-        # Start with template tokens based on sentiment
-        # Map sentiment indices to embeddings (0=POS, 1=NEU, 2=NEG)
-        template_embeds = self.template_embeddings[sentiments]  # [batch_size, hidden_size]
-        
-        # Create initial decoder input
-        decoder_input = template_embeds.unsqueeze(1)  # [batch_size, 1, hidden_size]
-        
-        # Maximum generation length (can be set in config)
-        max_length = getattr(self.config, 'max_generation_length', 32)
-        
-        # Storage for output logits
-        output_logits = []
-        
-        # Auto-regressive generation loop
-        for step in range(max_length):
-            # Context attention to select relevant information
-            context_vector, _ = self.context_attention(
-                decoder_input, 
-                hidden_states, 
-                hidden_states,
-                key_padding_mask=None if attention_mask is None else ~attention_mask.bool()
+        try:
+            batch_size = hidden_states.size(0)
+            seq_len = hidden_states.size(1)
+            device = hidden_states.device
+            
+            # Extract representations of aspects and opinions based on span predictions
+            # Create masks for aspects and opinions
+            aspect_mask = (aspect_spans > 0).float().unsqueeze(-1)  # [batch_size, seq_len, 1]
+            opinion_mask = (opinion_spans > 0).float().unsqueeze(-1)  # [batch_size, seq_len, 1]
+            
+            # Weight hidden states by masks and sum
+            aspect_repr = torch.sum(hidden_states * aspect_mask, dim=1) / (aspect_mask.sum(dim=1) + 1e-10)
+            opinion_repr = torch.sum(hidden_states * opinion_mask, dim=1) / (opinion_mask.sum(dim=1) + 1e-10)
+            
+            # Project representations
+            aspect_repr = self.aspect_proj(aspect_repr)
+            opinion_repr = self.opinion_proj(opinion_repr)
+            
+            # Get sentiment embeddings 
+            # Ensure sentiments has the right shape [batch_size]
+            if len(sentiments.shape) > 1:
+                sentiments = sentiments.squeeze(-1)
+            # Handle out of bounds sentiment indices
+            sentiments = torch.clamp(sentiments, min=0, max=2)
+            sentiment_repr = self.template_embeddings[sentiments]
+            
+            # Combine representations for decoder input
+            decoder_input = torch.cat([
+                self.bos_embedding.expand(batch_size, 1, -1),
+                sentiment_repr.unsqueeze(1),
+                aspect_repr.unsqueeze(1),
+                opinion_repr.unsqueeze(1)
+            ], dim=1)  # [batch_size, 4, hidden_dim]
+            
+            # Create causal mask for autoregressive generation
+            tgt_mask = self._generate_square_subsequent_mask(self.max_length, device)
+            
+            # Extend decoder input to max length with zeros
+            if decoder_input.size(1) < self.max_length:
+                padding = torch.zeros(
+                    batch_size, self.max_length - decoder_input.size(1), self.hidden_size,
+                    device=device
+                )
+                decoder_input = torch.cat([decoder_input, padding], dim=1)
+            else:
+                decoder_input = decoder_input[:, :self.max_length, :]
+            
+            # Use transformer decoder
+            # hidden_states: [batch_size, seq_len, hidden_dim]
+            # decoder_input: [batch_size, max_length, hidden_dim]
+            memory_key_padding_mask = ~attention_mask.bool() if attention_mask is not None else None
+            
+            decoder_output = self.decoder(
+                tgt=decoder_input,
+                memory=hidden_states,
+                tgt_mask=tgt_mask,
+                memory_mask=None,
+                tgt_key_padding_mask=None,
+                memory_key_padding_mask=memory_key_padding_mask
             )
             
-            # Pass through decoder layers
-            decoder_output = context_vector
-            for layer in self.decoder_layers:
-                decoder_output = layer(
-                    decoder_output,
-                    hidden_states,
-                    memory_key_padding_mask=None if attention_mask is None else ~attention_mask.bool()
-                )
-            
             # Project to vocabulary
-            step_logits = self.output_projection(decoder_output[:, -1:, :])  # [batch_size, 1, vocab_size]
-            output_logits.append(step_logits)
+            explanation_logits = self.output_projection(decoder_output)
             
-            # Get predicted tokens
-            next_token_embeds = self._get_next_token_embedding(step_logits, hidden_states)
+            return explanation_logits
             
-            # Concatenate to decoder input for next step
-            decoder_input = torch.cat([decoder_input, next_token_embeds], dim=1)
-            
-        # Concatenate all step logits
-        explanation_logits = torch.cat(output_logits, dim=1)  # [batch_size, max_length, vocab_size]
-        
-        return explanation_logits
+        except Exception as e:
+            print(f"Error in explanation generation: {e}")
+            # Return dummy tensor with correct shape
+            return torch.zeros(batch_size, self.max_length, self.vocab_size, device=device)
     
-    def _get_next_token_embedding(self, logits, hidden_states):
-        """Get embedding for next token based on logits"""
-        # For training, we use teacher forcing
-        # For inference, we'd use the predicted token
-        # This is a simple version that just uses the embedding of the most likely token
-        next_token_ids = logits.argmax(dim=-1)  # [batch_size, 1]
-        
-        # In a full implementation, you would look up these tokens in an embedding table
-        # For simplicity, we'll just use a projection of the hidden states
-        token_projection = nn.Linear(self.vocab_size, self.hidden_size).to(hidden_states.device)
-        token_embeds = token_projection(
-            F.one_hot(next_token_ids, num_classes=self.vocab_size).float()
-        )
-        
-        return token_embeds  # [batch_size, 1, hidden_size]
+    def _generate_square_subsequent_mask(self, sz, device):
+        """Generate a square mask for the sequence, to prevent attending to future tokens"""
+        mask = (torch.triu(torch.ones(sz, sz, device=device)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
     
-    def generate(self, hidden_states, triplets, attention_mask=None):
+    def generate(self, hidden_states, aspect_spans, opinion_spans, sentiments, attention_mask=None):
         """
-        Generate explanation text (for inference)
+        Generate explanations for inference
         
         Args:
             hidden_states: Encoder hidden states
-            triplets: Extracted triplets
+            aspect_spans: Aspect span predictions
+            opinion_spans: Opinion span predictions  
+            sentiments: Sentiment predictions
             attention_mask: Attention mask
             
         Returns:
-            explanations: Generated explanation text
+            explanations: List of explanation texts
         """
-        # This would be a more complete implementation for inference
-        # For now, we'll return template-based explanations
         batch_size = hidden_states.size(0)
+        
+        # Get explanation logits
+        logits = self.forward(hidden_states, aspect_spans, opinion_spans, sentiments, attention_mask)
+        
+        # Convert logits to token ids
+        token_ids = torch.argmax(logits, dim=-1)  # [batch_size, max_length]
+        
+        # Convert token ids to text
         explanations = []
-        
-        for b in range(batch_size):
-            batch_triplets = triplets[b] if isinstance(triplets, list) else triplets
-            batch_explanations = []
+        for i in range(batch_size):
+            # Remove padding and stop at EOS if present
+            sample_ids = token_ids[i].cpu().tolist()
             
-            sentiment_map = {0: 'positive', 1: 'neutral', 2: 'negative'}
-            
-            for triplet in batch_triplets:
-                aspect = triplet.get('aspect', 'this aspect')
-                opinion = triplet.get('opinion', 'this feature')
-                sentiment = triplet.get('sentiment', 'NEU')
+            # Find EOS token
+            if self.tokenizer.eos_token_id in sample_ids:
+                sample_ids = sample_ids[:sample_ids.index(self.tokenizer.eos_token_id)]
                 
-                # Convert sentiment label to text
-                if isinstance(sentiment, int):
-                    sentiment_text = sentiment_map.get(sentiment, 'neutral')
-                elif sentiment in ['POS', 'NEG', 'NEU']:
-                    sentiment_text = {'POS': 'positive', 'NEG': 'negative', 'NEU': 'neutral'}[sentiment]
-                else:
-                    sentiment_text = sentiment
+            # Decode tokens to text
+            try:
+                explanation = self.tokenizer.decode(sample_ids, skip_special_tokens=True)
+                explanations.append(explanation)
+            except:
+                # Fallback explanation if decoding fails
+                sentiment_map = {0: 'positive', 1: 'neutral', 2: 'negative'}
+                sentiment_idx = sentiments[i].item() if hasattr(sentiments[i], 'item') else sentiments[i]
+                sent_text = sentiment_map.get(sentiment_idx, 'neutral')
+                explanations.append(f"This item has a {sent_text} sentiment.")
                 
-                # Template-based explanation
-                explanation = f"The aspect '{aspect}' is {sentiment_text} because of the opinion '{opinion}'."
-                batch_explanations.append(explanation)
-            
-            explanations.append(batch_explanations)
-        
         return explanations

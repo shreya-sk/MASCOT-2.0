@@ -3,24 +3,22 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 
 @dataclass
-# In src/utils/config.py - modify the config class
 class LLMABSAConfig:
-    # Model settings - Update hidden_size to match TinyLlama
+    # Model settings
     model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-    hidden_size: int = 2048  # Match TinyLlama's hidden size
+    hidden_size: int = 768  # Set to a value divisible by most common head counts
     num_layers: int = 2
     dropout: float = 0.1
-    num_attention_heads: int = 12
+    num_attention_heads: int = 12  # Should divide hidden_size evenly
     
     # Generation settings
     num_decoder_layers: int = 2
     vocab_size: int = 32000  # Match your tokenizer's vocab size
     max_generation_length: int = 64
     use_generation: bool = True
-        # Generative parameters
+    # Generative parameters
     generate_explanations: bool = True  # Set to True for training with generation
     generation_weight: float = 0.5  # Weight for generation loss
-    
     
     freeze_layers: bool = True 
     
@@ -83,3 +81,12 @@ class LLMABSAConfig:
                 "rest15": 1,  # Same domain as rest14
                 "rest16": 1,  # Same domain as rest14
             }
+        
+        # Ensure num_attention_heads divides hidden_size
+        if self.hidden_size % self.num_attention_heads != 0:
+            # Find closest number of heads that divides hidden_size
+            for heads in [12, 8, 6, 4, 3, 2, 1]:
+                if self.hidden_size % heads == 0:
+                    self.num_attention_heads = heads
+                    print(f"WARNING: Adjusted num_attention_heads to {heads} to be compatible with hidden_size={self.hidden_size}")
+                    break
