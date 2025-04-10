@@ -427,43 +427,209 @@ class MockPredictor:
         }
 
 def quick_test():
-    """Run a quick test without a trained model"""
-    print("Running quick test without a trained model")
+    """Run a quick test with our actual architecture"""
+    print("Running quick test with our model architecture")
     
     # Load config
     config = LLMABSAConfig()
     config.generate_explanations = True
     
-    # Create a model
-    model = GenerativeLLMABSA(config)
+    # Import the model class directly to avoid initialization errors
+    from src.models.absa import GenerativeLLMABSA
+    from src.models.classifier import AspectOpinionJointClassifier
     
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     
-    # Create a mock predictor
-    predictor = MockPredictor(model, tokenizer)
+    # Test the classifier initialization separately
+    try:
+        # The error is with AspectOpinionJointClassifier initialization
+        # Let's test it directly with the correct parameters
+        classifier = AspectOpinionJointClassifier(
+            input_dim=config.hidden_size,
+            hidden_dim=config.hidden_size,
+            dropout=config.dropout,
+            num_classes=3,
+            use_aspect_first=True
+        )
+        print("✓ AspectOpinionJointClassifier initialized successfully")
+    except Exception as e:
+        print(f"✗ AspectOpinionJointClassifier initialization failed: {e}")
     
-    # Sample texts
-    texts = [
-        "The food was delicious but the service was terrible.",
-        "Great atmosphere and friendly staff!",
-        "The pizza was overpriced and cold."
-    ]
+    # Now let's try to initialize the full model
+    try:
+        model = GenerativeLLMABSA(config)
+        print("✓ GenerativeLLMABSA model initialized successfully")
+        
+        # Test forward pass with dummy inputs
+        batch_size = 2
+        seq_len = 10
+        input_ids = torch.randint(0, 1000, (batch_size, seq_len))
+        attention_mask = torch.ones((batch_size, seq_len))
+        
+        outputs = model(input_ids, attention_mask, generate=True)
+        print("✓ Model forward pass successful")
+        print(f"Output keys: {outputs.keys()}")
+        
+        for key, value in outputs.items():
+            if isinstance(value, torch.Tensor):
+                print(f"  {key}: shape {value.shape}")
+    except Exception as e:
+        print(f"✗ Model initialization or forward pass failed: {e}")
+        import traceback
+        traceback.print_exc()
     
-    # Make predictions
-    for text in texts:
-        print(f"\nInput: {text}")
-        predictions = predictor.predict(text, generate=True)
+    # If we get this far, try simple predictions
+    try:
+        # Sample texts
+        texts = [
+            "The food was delicious but the service was terrible.",
+            "Great atmosphere and friendly staff!",
+            "The pizza was overpriced and cold."
+        ]
         
-        print("Triplets:")
-        for triplet in predictions['triplets']:
-            print(f"  Aspect: {triplet['aspect']}, Opinion: {triplet['opinion']}, Sentiment: {triplet['sentiment']} (Confidence: {triplet['confidence']:.2f})")
-        
-        if predictions.get('explanations'):
-            print("Explanations:")
-            for explanation in predictions['explanations']:
-                print(f"  {explanation}")
-
+        # Create a simple predictor using our model
+        class SimplePredictor:
+            def __init__(self, model, tokenizer):
+                self.model = model
+                self.tokenizer = tokenizer
+                
+            def predict(self, text, generate=False):
+                # Tokenize
+                inputs = self.tokenizer(text, return_tensors="pt")
+                
+                # Forward pass
+                with torch.no_grad():
+                    outputs = self.model(**inputs, generate=generate)
+                
+                # Process outputs
+                return self._process_outputs(outputs, text)
+                
+            def _process_outputs(self, outputs, text):
+                # Extract predictions
+                aspect_logits = outputs['aspect_logits'][0]
+                opinion_logits = outputs['opinion_logits'][0]
+                sentiment_logits = outputs['sentiment_logits'][0]
+                
+                # Get highest probability class
+                aspect_preds = aspect_logits.argmax(dim=-1).numpy()
+                opinion_preds = opinion_logits.argmax(dim=-1).numpy()
+                sentiment_pred = sentiment_logits.argmax(dim=-1).item()
+                
+                # Map sentiment
+                sentiment_map = {0: 'POS', 1: 'NEU', 2: 'NEG'}
+                sentiment = sentiment_map[sentiment_pred]
+                
+                # Extract words from text
+                words = text.split()
+                
+                # Find aspect and opinion spans
+                aspect_spans = []
+                current_span = []
+                for i, pred in enumerate(aspect_preds):
+                    if i >= len(words): break
+                    if pred == 1:  # B tag
+                        if current_span:
+                            aspect_spans.append(current_span)
+                        current_span = [i]
+                    elif pred == 2:  # I tag
+                        if current_span:
+                            current_span.append(i)
+                    else:  # O tag
+                        if current_span:
+                            aspect_spans.append(current_span)
+                            current_span = []
+                if current_span:
+                    aspect_spans.append(current_span)
+                
+                # Find opinion spans
+                opinion_spans = []
+                current_span = []
+                for i, pred in enumerate(opinion_preds):
+                    if i >= len(words): break
+                    if pred == 1:  # B tag
+                        if current_span:
+                            opinion_spans.append(current_span)
+                        current_span = [i]
+                    elif pred == 2:  # I tag
+                        if current_span:
+                            current_span.append(i)
+                    else:  # O tag
+                        if current_span:
+                            opinion_spans.append(current_span)
+                            current_span = []
+                if current_span:
+                    opinion_spans.append(current_span)
+                
+                # Create triplets
+                triplets = []
+                for asp_span in aspect_spans:
+                    for op_span in opinion_spans:
+                        aspect = ' '.join([words[i] for i in asp_span if i < len(words)])
+                        opinion = ' '.join([words[i] for i in op_span if i < len(words)])
+                        
+                        triplet = {
+                            'aspect': aspect,
+                            'aspect_indices': asp_span,
+                            'opinion': opinion,
+                            'opinion_indices': op_span,
+                            'sentiment': sentiment,
+                            'confidence': 0.8
+                        }
+                        triplets.append(triplet)
+                
+                # If no spans found, create a dummy triplet
+                if not triplets:
+                    triplets = [{
+                        'aspect': words[0] if words else 'item',
+                        'aspect_indices': [0],
+                        'opinion': words[-1] if words else 'quality',
+                        'opinion_indices': [len(words)-1 if words else 0],
+                        'sentiment': sentiment,
+                        'confidence': 0.5
+                    }]
+                
+                result = {
+                    'triplets': triplets,
+                }
+                
+                # Add explanations if generation was requested
+                if 'explanations' in outputs:
+                    explanations = []
+                    for triplet in triplets:
+                        explanation = f"The {triplet['aspect']} is {triplet['sentiment'].lower()} because of the {triplet['opinion']}."
+                        explanations.append(explanation)
+                    result['explanations'] = explanations
+                
+                return result
+                
+        # Test the predictor
+        try:
+            predictor = SimplePredictor(model, tokenizer)
+            
+            for text in texts:
+                print(f"\nInput: {text}")
+                predictions = predictor.predict(text, generate=True)
+                
+                print("Triplets:")
+                for triplet in predictions['triplets']:
+                    print(f"  Aspect: {triplet['aspect']}, Opinion: {triplet['opinion']}, Sentiment: {triplet['sentiment']} (Confidence: {triplet['confidence']:.2f})")
+                
+                if 'explanations' in predictions:
+                    print("Explanations:")
+                    for explanation in predictions['explanations']:
+                        print(f"  {explanation}")
+        except Exception as e:
+            print(f"✗ Prediction test failed: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    except Exception as e:
+        print(f"✗ Text prediction test failed: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print("\nQuick test completed!")
 if __name__ == "__main__":
     import argparse
     
