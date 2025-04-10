@@ -3,14 +3,25 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 
 @dataclass
+# In src/utils/config.py - modify the config class
 class LLMABSAConfig:
-    # Model settings - Use a model that definitely exists on HuggingFace
-    model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0" #"microsoft/phi-2"    # Fallback model that's guaranteed to exist
-    hidden_size: int = 768
+    # Model settings - Update hidden_size to match TinyLlama
+    model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    hidden_size: int = 2048  # Match TinyLlama's hidden size
     num_layers: int = 2
     dropout: float = 0.1
     num_attention_heads: int = 12
-
+    
+    # Generation settings
+    num_decoder_layers: int = 2
+    vocab_size: int = 32000  # Match your tokenizer's vocab size
+    max_generation_length: int = 64
+    use_generation: bool = True
+        # Generative parameters
+    generate_explanations: bool = True  # Set to True for training with generation
+    generation_weight: float = 0.5  # Weight for generation loss
+    
+    
     freeze_layers: bool = True 
     
     # Training settings

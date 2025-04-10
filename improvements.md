@@ -46,7 +46,7 @@ Review and adjust the configuration in `src/utils/config.py` based on your requi
 
 ```python
 @dataclass
-class StellaABSAConfig:
+class LLMABSAConfig:
     # Model settings
     model_name: str = "stanford-crfm/Stella-400M-v5"   # or "stanford-crfm/Stella-400M-v5"
     hidden_size: int = 768  # Adjust based on available GPU memory
@@ -133,7 +133,7 @@ Within the current framework, consider these performance improvements:
 Adjust the context window in the preprocessor to fine-tune span detection:
 ```python
 # In src/data/preprocessor.py
-preprocessor = StellaABSAPreprocessor(
+preprocessor = LLMABSAPreprocessor(
     tokenizer=tokenizer,
     max_length=config.max_seq_length,
     use_syntax=config.use_syntax,

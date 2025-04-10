@@ -6,23 +6,23 @@ import numpy as np
 import spacy # type: ignore
 from spacy.tokens import Doc # type: ignore
 
-from src.models.absa import StellaABSA
-from src.data.preprocessor import StellaABSAPreprocessor
-from src.utils.config import StellaABSAConfig
+from src.models.absa import LLMABSA
+from src.data.preprocessor import LLMABSAPreprocessor
+from src.utils.config import LLMABSAConfig
 
-class StellaABSAPredictor:
+class LLMABSAPredictor:
     """Inference pipeline for Stella-based ABSA prediction"""
     
     def __init__(
         self,
         model_path: str,
-        config: StellaABSAConfig = None,
+        config: LLMABSAConfig = None,
         device: str = None,
         tokenizer_path: str = None
     ):
         # Initialize config if not provided
         if config is None:
-            config = StellaABSAConfig()
+            config = LLMABSAConfig()
         self.config = config
         
         # Set device
@@ -39,14 +39,14 @@ class StellaABSAPredictor:
         )
         
         # Initialize preprocessor
-        self.preprocessor = StellaABSAPreprocessor(
+        self.preprocessor = LLMABSAPreprocessor(
             tokenizer=self.tokenizer,
             max_length=config.max_seq_length,
             use_syntax=config.use_syntax
         )
         
         # Load model
-        self.model = StellaABSA(config)
+        self.model = LLMABSA(config)
         state_dict = torch.load(model_path, map_location=self.device)
         self.model.load_state_dict(state_dict)
         self.model.to(self.device)

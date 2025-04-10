@@ -8,12 +8,12 @@ from torch.utils.data import DataLoader # type: ignore # type: ignore
 import wandb
 
 from src.data.dataset import ABSADataset
-from src.data.preprocessor import StellaABSAPreprocessor
-from src.models.absa import StellaABSA
-from src.utils.config import StellaABSAConfig
+from src.data.preprocessor import LLMABSAPreprocessor
+from src.models.absa import LLMABSA
+from src.utils.config import LLMABSAConfig
 from src.training.metrics import ABSAMetrics
 from transformers import AutoTokenizer
-from src.inference.predictor import StellaABSAPredictor
+from src.inference.predictor import LLMABSAPredictor
 
 def test_model(model, data_loader, device):
     """Test model on a data loader and return metrics"""
@@ -44,7 +44,7 @@ def main():
     args = parser.parse_args()
     
     # Load config
-    config = StellaABSAConfig()
+    config = LLMABSAConfig()
     
     # Set device
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -62,14 +62,14 @@ def main():
     )
     
     # Initialize preprocessor
-    preprocessor = StellaABSAPreprocessor(
+    preprocessor = LLMABSAPreprocessor(
         tokenizer=tokenizer,
         max_length=config.max_seq_length,
         use_syntax=config.use_syntax
     )
     
     # Load model
-    model = StellaABSA(config)
+    model = LLMABSA(config)
     model.load_state_dict(torch.load(args.model, map_location=device))
     model.to(device)
     model.eval()

@@ -5,8 +5,8 @@ import torch # type: ignore
 import json
 from transformers import AutoTokenizer
 
-from src.utils.config import StellaABSAConfig
-from src.inference.predictor import StellaABSAPredictor
+from src.utils.config import LLMABSAConfig
+from src.inference.predictor import LLMABSAPredictor
 
 def main():
     parser = argparse.ArgumentParser(description='Run Stella ABSA predictions')
@@ -27,10 +27,10 @@ def main():
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Load config and initialize predictor
-    config = StellaABSAConfig()
+    config = LLMABSAConfig()
     
     print(f"Loading model from {args.model}...")
-    predictor = StellaABSAPredictor(
+    predictor = LLMABSAPredictor(
         model_path=args.model,
         config=config,
         device=device
