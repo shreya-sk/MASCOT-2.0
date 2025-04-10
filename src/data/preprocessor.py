@@ -8,7 +8,7 @@ import numpy as np
 # Fix this import to include SpanLabel
 from src.data.utils import SENTIMENT_MAP, convert_to_bio_labels, SpanLabel
 
-class StellaABSAPreprocessor:
+class LLMABSAPreprocessor:
     """
     Enhanced preprocessor for ABSA data using Stella tokenization
     with syntax-aware features and span context enhancement

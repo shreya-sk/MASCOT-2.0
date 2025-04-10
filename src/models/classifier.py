@@ -58,64 +58,55 @@ class AspectOpinionJointClassifier(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
             nn.Sigmoid()
         )
-    
-    def forward(self, hidden_states, aspect_logits, opinion_logits, span_features, attention_mask=None):
-        batch_size, seq_len, _ = hidden_states.size()
-        
-        # Convert logits to attention weights
-        aspect_weights = F.softmax(aspect_logits[:, :, 1:], dim=1)  # Only use B-I tags
-        aspect_weights = aspect_weights.sum(dim=2, keepdim=True)
-        
-        opinion_weights = F.softmax(opinion_logits[:, :, 1:], dim=1)  # Only use B-I tags
-        opinion_weights = opinion_weights.sum(dim=2, keepdim=True)
-        
-        # Novel: Apply triple attention for complex interactions
-        aspect_attn, opinion_attn, context_attn = self.triple_attention(
-            hidden_states, 
-            aspect_weights, 
-            opinion_weights, 
-            attention_mask
-        )
-        
-        # Extract aspect and opinion representations using attention weights
-        aspect_repr = torch.bmm(aspect_weights.transpose(1, 2), hidden_states)  # [batch, 1, hidden]
-        opinion_repr = torch.bmm(opinion_weights.transpose(1, 2), hidden_states)  # [batch, 1, hidden]
-        
-        # Novel: Enhanced representations with triple attention
-        aspect_repr = aspect_repr + aspect_attn.mean(dim=1, keepdim=True)
-        opinion_repr = opinion_repr + opinion_attn.mean(dim=1, keepdim=True)
-        context_repr = context_attn.mean(dim=1, keepdim=True)
-        
-        # Adaptive fusion based on aspect-opinion interaction
-        fusion_input = torch.cat([aspect_repr, opinion_repr], dim=-1)
-        fusion_weights = self.fusion_gate(fusion_input)
-        
-        # Novel: Apply adaptive fusion weights
-        if self.use_aspect_first:
-            fused_repr = fusion_weights * aspect_repr + (1 - fusion_weights) * opinion_repr
-        else:
-            fused_repr = fusion_weights * opinion_repr + (1 - fusion_weights) * aspect_repr
-        
-        # Combine with context for final representation
-        final_repr = self.fusion(
-            torch.cat([fused_repr, aspect_repr, opinion_repr], dim=-1)
-        )
-        
-        # Consistency check between aspect and opinion polarities
-        consistency_score = self.consistency_check(
-            aspect_repr.squeeze(1), 
-            opinion_repr.squeeze(1)
-        )
-        
-        # Main sentiment classification
-        sentiment_logits = self.classifier(final_repr.squeeze(1))
-        
-        # Confidence estimation
-        confidence_scores = self.confidence_estimator(final_repr.squeeze(1))
-        
-        return sentiment_logits, confidence_scores
 
-
+    def forward(self, hidden_states, aspect_logits=None, opinion_logits=None, span_features=None, attention_mask=None):
+        """
+        Forward pass through the aspect-opinion joint classifier
+        
+        Args:
+            hidden_states: Hidden states from the encoder [batch_size, seq_length, hidden_dim]
+            aspect_logits: Aspect logits [batch_size, seq_length, 3]
+            opinion_logits: Opinion logits [batch_size, seq_length, 3]
+            span_features: Span features [batch_size, seq_length, hidden_dim]
+            attention_mask: Attention mask [batch_size, seq_length]
+        """
+        batch_size, seq_len = hidden_states.shape[:2]
+        
+        # Create aspect and opinion weights from logits
+        aspect_weights = torch.softmax(aspect_logits[:, :, 1:], dim=-1).sum(-1) if aspect_logits is not None else None
+        opinion_weights = torch.softmax(opinion_logits[:, :, 1:], dim=-1).sum(-1) if opinion_logits is not None else None
+        
+        # Get weighted representations using triple attention
+        try:
+            # Try using the triple attention if available
+            aspect_repr, opinion_repr, context_repr = self.triple_attention(
+                hidden_states, aspect_weights, opinion_weights, attention_mask
+            )
+        except:
+            # Fallback to a simple pooling if triple attention fails
+            print("Warning: Triple attention failed, using fallback pooling")
+            # Simple pooling - take mean of all non-masked tokens
+            pooled = hidden_states.mean(dim=1)
+            aspect_repr = opinion_repr = context_repr = pooled.unsqueeze(1)
+        
+        # Pool to get sentence-level representations
+        # Take mean of all tokens in the sequence
+        aspect_pooled = aspect_repr.mean(dim=1)
+        opinion_pooled = opinion_repr.mean(dim=1)
+        context_pooled = context_repr.mean(dim=1)
+        
+        # Concatenate all representations
+        fusion_input = torch.cat([aspect_pooled, opinion_pooled, context_pooled], dim=-1)
+        
+        # Apply fusion
+        fused = self.fusion(fusion_input)
+        
+        # Predict sentiment and confidence
+        logits = self.classifier(fused)
+        confidence = self.confidence_estimator(fused)
+        
+        return logits, confidence
+        
 class TripleAttention(nn.Module):
     """
     Novel triple attention mechanism for modeling complex interactions

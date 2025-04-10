@@ -2,7 +2,8 @@
 import torch # type: ignore
 import torch.nn as nn # type: ignore
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
+from transformers import AutoConfig
+from transformers import AutoModel
 class StellaEmbedding(nn.Module):
     """
     Stella v5 (400M) embedding layer for ABSA
@@ -14,15 +15,31 @@ class StellaEmbedding(nn.Module):
         super().__init__()
         
         # Load the Stella v5 model
-        self.model_name = "stanford-crfm/Stella-400M-v5"
+        self.model_name = config.model_name
         
         try:
             # Load model with appropriate configuration
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
-                torch_dtype=torch.float16 if config.use_fp16 else torch.float32,
-                device_map="auto"
-            )
+            # First, check if we're running on CPU
+
+            using_cpu = not torch.cuda.is_available()
+
+            if using_cpu:
+                # On CPU, don't use device_map which can cause offloading issues
+                model_config = AutoConfig.from_pretrained(config.model_name)
+                self.encoder = AutoModel.from_pretrained(
+                    config.model_name,
+                    config=model_config,
+                    low_cpu_mem_usage=True,
+                    device_map=None,  # Don't use device mapping on CPU
+                    torch_dtype=torch.float32  # Use float32 instead of float16 on CPU
+                )
+            else:
+                # On GPU, we can use device_map and fp16
+                self.encoder = AutoModel.from_pretrained(
+                    config.model_name,
+                    device_map="auto",
+                    torch_dtype=torch.float16
+                )
         except Exception as e:
             print(f"Error loading Stella model: {e}")
             raise
@@ -34,19 +51,19 @@ class StellaEmbedding(nn.Module):
         # Novel dual projection for aspect and opinion recognition
         # This creates separate specialized projections for aspect terms vs opinion terms
         self.aspect_projection = nn.Linear(
-            self.model.config.hidden_size,
+            self.encoder.config.hidden_size,
             config.hidden_size
         )
         
         self.opinion_projection = nn.Linear(
-            self.model.config.hidden_size,
+            self.encoder.config.hidden_size,
             config.hidden_size
         )
         
         # Novel: Cross-Domain Knowledge Adapter
         # This helps transfer knowledge between domains (e.g., restaurant to laptop)
         self.domain_adapter = nn.Sequential(
-            nn.Linear(self.model.config.hidden_size, config.hidden_size),
+            nn.Linear(self.encoder.config.hidden_size, config.hidden_size),
             nn.GELU(),
             nn.Linear(config.hidden_size, config.hidden_size)
         )
@@ -55,23 +72,45 @@ class StellaEmbedding(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         
         # Context pooling with learned weights
-        self.context_pool = nn.Parameter(torch.ones(1, 1, self.model.config.hidden_size))
+        self.context_pool = nn.Parameter(torch.ones(1, 1, self.encoder.config.hidden_size))
         
-    def _freeze_layers(self, num_frozen_layers):
-        """Freeze the first num_frozen_layers transformer blocks"""
-        if num_frozen_layers <= 0:
+    def _freeze_layers(self, freeze_layers):
+        if not freeze_layers:
             return
             
-        # Freeze embeddings
-        for param in self.model.get_input_embeddings().parameters():
-            param.requires_grad = False
-            
-        # Freeze the specified number of layers
-        for i, layer in enumerate(self.model.model.layers):
-            if i < num_frozen_layers:
-                for param in layer.parameters():
+        # Freeze embedding layers
+        if hasattr(self.encoder, 'get_input_embeddings'):
+            for param in self.encoder.get_input_embeddings().parameters():
+                param.requires_grad = False
+        
+        # Different models have different structures
+        # Try different attribute patterns based on model architecture
+        
+    # For BERT-like models
+        if hasattr(self.encoder, 'encoder') and hasattr(self.encoder.encoder, 'layer'):
+            layers = self.encoder.encoder.layer
+            num_layers = len(layers)
+            # Freeze bottom layers, keep top layers trainable
+            freeze_up_to = int(num_layers * 0.75)  # Freeze 75% of layers
+            for i in range(freeze_up_to):
+                for param in layers[i].parameters():
                     param.requires_grad = False
-    
+            print(f"Froze {freeze_up_to}/{num_layers} encoder layers")
+            
+        # For Phi-2, LlamaForCausalLM, etc.
+        elif hasattr(self.encoder, 'model') and hasattr(self.encoder.model, 'layers'):
+            layers = self.encoder.model.layers
+            num_layers = len(layers)
+            # Freeze bottom layers, keep top layers trainable
+            freeze_up_to = int(num_layers * 0.75)  # Freeze 75% of layers
+            for i in range(freeze_up_to):
+                for param in layers[i].parameters():
+                    param.requires_grad = False
+            print(f"Froze {freeze_up_to}/{num_layers} model layers")
+            
+        # For other model types
+        else:
+            print(f"Warning: Could not identify layer structure for {type(self.encoder)}. No layers frozen.")
     def forward(self, input_ids, attention_mask, domain_id=None):
         """
         Forward pass with novel hierarchical focal attention
@@ -83,7 +122,7 @@ class StellaEmbedding(nn.Module):
         """
         # Get base embeddings from Stella
         with torch.no_grad():
-            outputs = self.model(
+            outputs = self.encoder(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 output_hidden_states=True,
