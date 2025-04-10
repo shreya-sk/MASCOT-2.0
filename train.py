@@ -8,6 +8,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader # type: ignore
 from transformers import get_linear_schedule_with_warmup
+from src.data.dataset import custom_collate_fn
 
 # Import your custom modules
 from src.data.dataset import ABSADataset
@@ -62,23 +63,26 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
         max_length=config.max_seq_length,
         domain_id=domain_id
     )
-    
-    # Create dataloaders
+    # In train.py, update how you create the DataLoader
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
+        collate_fn=custom_collate_fn,  # Add this line
         pin_memory=True
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
+        collate_fn=custom_collate_fn,  # Add this line
         pin_memory=True
     )
+    
+    
     
     # Initialize model
     print(f"Initializing StellaABSAConfig model for dataset: {dataset_name}")
@@ -323,8 +327,12 @@ def evaluate(model, dataloader, loss_fn, device, metrics):
     
     return eval_metrics
 
+# Updated portion of train.py's main function to handle wandb issues
+
+# This should replace the beginning part of the main() function in train.py
+
 def main():
-    parser = argparse.ArgumentParser(description='Train LLAMA ABSA model')
+    parser = argparse.ArgumentParser(description='Train ABSA model')
     parser.add_argument('--config', type=str, default=None, help='Path to config file')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--dataset', type=str, default=None, help='Specific dataset to train on')
@@ -333,6 +341,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=None, help='Batch size')
     parser.add_argument('--hidden_size', type=int, default=None, help='Hidden size')
     parser.add_argument('--dropout', type=float, default=None, help='Dropout rate')
+    parser.add_argument('--model', type=str, default=None, help='Model to use (overrides config)')
+    parser.add_argument('--no_wandb', action='store_true', help='Disable wandb logging')
     args = parser.parse_args()
     
     # Set random seed
@@ -350,35 +360,43 @@ def main():
         config.hidden_size = args.hidden_size
     if args.dropout is not None:
         config.dropout = args.dropout
+    if args.model is not None:
+        config.model_name = args.model
     
-    # Initialize W&B logger
-    logger = WandbLogger(config)
+    # Create directories for outputs
+    os.makedirs('checkpoints', exist_ok=True)
+    os.makedirs('wandb_logs', exist_ok=True)
     
-    # Initialize tokenizer
+    # Initialize W&B logger with error handling
+    logger = WandbLogger(config, use_wandb=not args.no_wandb)
+    
+    # Initialize tokenizer with fallback options
     print(f"Loading tokenizer from: {config.model_name}")
-    try:
-        # First try loading from local model
-        if config.use_local:
-            model_path = config.model_name
-            print(f"Loading tokenizer from local path: {model_path}")
+    tokenizer = None
+    
+    # List of models to try in order
+    models_to_try = [
+        config.model_name,  # First try the configured model
+        "google/flan-t5-base",  # Then try a known good T5 model
+        "bert-base-uncased",   # Finally try BERT as a last resort
+    ]
+    
+    for model_name in models_to_try:
+        try:
+            print(f"Attempting to load tokenizer from {model_name}...")
             tokenizer = AutoTokenizer.from_pretrained(
-                model_path,
-                use_fast=True,
-                local_files_only=True
-            )
-        else:
-            # Try loading from Hugging Face
-            tokenizer = AutoTokenizer.from_pretrained(
-                config.model_name,
+                model_name,
                 use_fast=True
             )
-    except Exception as e:
-        print(f"Error loading tokenizer: {e}")
-        print("Falling back to default tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained(
-            "meta-llama/Llama-2-7b-hf",
-            use_fast=True
-        )
+            if tokenizer is not None:
+                print(f"Successfully loaded tokenizer from {model_name}")
+                config.model_name = model_name  # Update the config
+                break
+        except Exception as e:
+            print(f"Error loading tokenizer from {model_name}: {e}")
+    
+    if tokenizer is None:
+        raise RuntimeError("Failed to load any tokenizer. Cannot continue.")
     
     # Add special tokens if needed
     special_tokens = {}
@@ -394,25 +412,23 @@ def main():
     if special_tokens:
         tokenizer.add_special_tokens(special_tokens)
     
-    # Add task-specific tokens
-    task_tokens = {
-        "additional_special_tokens": ["[AT]", "[OT]", "[AC]", "[SP]"]
-    }
-    tokenizer.add_special_tokens(task_tokens)
+    # Add task-specific tokens if they don't exist
+    task_tokens = ["[AT]", "[OT]", "[AC]", "[SP]"]
+    tokens_to_add = [token for token in task_tokens if token not in tokenizer.get_vocab()]
+    if tokens_to_add:
+        tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
     
-    # Set device with mixed precision
+    # Set device
     if args.device:
         device = torch.device(args.device)
     elif torch.cuda.is_available():
         device = torch.device('cuda')
         print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-        # Print available GPU memory
-        if hasattr(torch.cuda, 'mem_get_info'):
-            free_memory, total_memory = torch.cuda.mem_get_info(0)
-            print(f"GPU Memory: {free_memory/1024**3:.2f}GB free / {total_memory/1024**3:.2f}GB total")
     else:
         device = torch.device('cpu')
         print("Using CPU - training will be very slow")
+
+    # Rest of the main function remains unchanged...
     
     # Train on each dataset or a specific one
     datasets = [args.dataset] if args.dataset else config.datasets
@@ -420,6 +436,7 @@ def main():
     
     for dataset_name in datasets:
         try:
+            print(f"\nTraining on dataset: {dataset_name}")
             best_f1 = train_dataset(config, tokenizer, logger, dataset_name, device)
             results[dataset_name] = best_f1
         except Exception as e:
@@ -433,39 +450,7 @@ def main():
     for dataset, f1 in results.items():
         print(f"{dataset}: Best F1 = {f1}")
     
-    # Test on specific examples
-    test_examples = [
-        "The food was delicious but the service was terrible.",
-        "Great atmosphere and friendly staff!",
-        "The battery life is poor but the screen quality is excellent."
-    ]
-    
-    # Initialize predictor with the best model
-    if datasets and any(isinstance(f1, (int, float)) for f1 in results.values()):
-        # Find best dataset with numerical F1 value
-        valid_results = {k: v for k, v in results.items() if isinstance(v, (int, float))}
-        if valid_results:
-            best_dataset = max(valid_results.items(), key=lambda x: x[1])[0]
-            try:
-                predictor = StellaABSAPredictor(
-                    model_path=f"checkpoints/{config.experiment_name}_{best_dataset}_best.pt",
-                    config=config,
-                    device=device,
-                    tokenizer_path=config.model_name
-                )
-                
-                print("\nTest Examples:")
-                for example in test_examples:
-                    predictions = predictor.predict(example)
-                    print(f"\nInput: {example}")
-                    print("Predictions:")
-                    for triplet in predictions['triplets']:
-                        print(f"  Aspect: {triplet['aspect']}, Opinion: {triplet['opinion']}, "
-                              f"Sentiment: {triplet['sentiment']} (Confidence: {triplet['confidence']:.2f})")
-            except Exception as e:
-                print(f"Error running predictions: {e}")
-    
-    # End W&B run
+    # End W&B run - this will handle any exceptions
     logger.finish()
 
 if __name__ == '__main__':

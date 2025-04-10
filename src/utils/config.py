@@ -1,106 +1,74 @@
 # src/utils/config.py
-from dataclasses import dataclass, field
-# src/utils/stella_config.py
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional
-import os
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any
 
 @dataclass
-class LlamaABSAConfig:
-    """Configuration for Llama-based ABSA model"""
-    
-    # Model settings
-    model_name: str = "Llama-3.3-70B-Instruct"  # Path or name of model
-    use_local: bool = True  # Use local model files
-    # Add these lines to LlamaABSAConfig class
-    use_online_model: bool = True
-    model_name: str = "meta-llama/Llama-3-8B-Instruct"  # A smaller model is more responsive
-    hf_api_token: str = os.environ.get("HF_TOKEN", None)
-class StellaABSAConfig:
-    """Configuration for Stella-based ABSA model"""
-    
-    # Model architecture
-    model_name: str = "stanford-crfm/Stella-400M-v5"
-    hidden_size: int = 1024
-    num_attention_heads: int = 16
-    num_layers: int = 3
+class LLMABSAConfig:
+    # Model settings - Use a model that definitely exists on HuggingFace
+    model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0" #"microsoft/phi-2"    # Fallback model that's guaranteed to exist
+    hidden_size: int = 768
+    num_layers: int = 2
     dropout: float = 0.1
-    max_seq_length: int = 512
+    num_attention_heads: int = 12
+
+    freeze_layers: bool = True 
     
-    # Novel architecture components
-    use_aspect_first: bool = True  # Whether to prioritize aspect over opinion in joint classification
-    use_syntax: bool = True  # Whether to use syntax-guided attention 
-    freeze_layers: int = 8  # Number of layers to freeze in the base model
-    
-    # Training hyperparameters
+    # Training settings
     learning_rate: float = 2e-5
     weight_decay: float = 0.01
-    warmup_steps: int = 1000
-    batch_size: int = 8  # Smaller batch size for large model
-    gradient_accumulation_steps: int = 4  # Gradient accumulation for larger effective batch
-    num_epochs: int = 10
     warmup_ratio: float = 0.1
     batch_size: int = 16
     num_epochs: int = 10
-    num_workers: int = 4
-    gradient_accumulation_steps: int = 2
-    max_grad_norm: float = 1.0
+    gradient_accumulation_steps: int = 1
     
-    # FP16 and optimization settings
-    use_fp16: bool = True
-    use_8bit: bool = False  # Whether to use 8-bit quantization (bitsandbytes)
-    use_gradient_checkpointing: bool = True
+    # Domain adaptation
+    domain_adaptation: bool = False
+    domain_mapping: Dict[str, int] = None  # Will be initialized in __post_init__
+    
+    # Data settings
+    max_seq_length: int = 128
+    datasets: List[str] = None  # Will be initialized in __post_init__
+    dataset_paths: Dict[str, str] = None  # Will be initialized in __post_init__
+    
+    # Architectual choices
+    use_syntax: bool = True
+    use_fp16: bool = False
+    confidence_threshold: float = 0.5
     
     # Loss weights
     aspect_loss_weight: float = 1.0
     opinion_loss_weight: float = 1.0
     sentiment_loss_weight: float = 1.0
-    consistency_loss_weight: float = 0.5  # Weight for aspect-opinion consistency
     
     # Logging settings
-    experiment_name: str = "llama-absa"
-    viz_interval: int = 5
     experiment_name: str = "stella-absa-v5"
-    log_interval: int = 100
-    save_interval: int = 1000
-    eval_interval: int = 500
+    viz_interval: int = 5
+    log_interval: int = 50
+    eval_interval: int = 200
+    save_interval: int = 500
     
-    # Data settings
-    datasets: List[str] = field(default_factory=lambda: ["laptop14", "rest14", "rest15", "rest16"])
-    dataset_paths: Optional[Dict[str, str]] = None
-    max_span_length: int = 128
-    data_dir: str = "Datasets/aste"
-    
-    # Domain adaptation settings
-    domain_adaptation: bool = True
-    domain_mapping: Dict[str, int] = field(default_factory=lambda: {
-        "laptop14": 0,
-        "rest14": 1,
-        "rest15": 1,
-        "rest16": 1
-    })
-    
-    # Inference settings
-    confidence_threshold: float = 0.7  # Threshold for prediction confidence
+    # Other settings
+    num_workers: int = 4
+    use_local: bool = False
+    max_grad_norm: float = 1.0
     
     def __post_init__(self):
-        """Initialize dataset paths and validate settings"""
-        # Initialize dataset paths
+        # Initialize default values for lists and dicts
+        if self.datasets is None:
+            self.datasets = ["laptop14", "rest14", "rest15", "rest16"]
+            
         if self.dataset_paths is None:
+            # Set default dataset paths
             self.dataset_paths = {
-                dataset: os.path.join(self.data_dir, dataset)
+                dataset: f"Datasets/aste/{dataset}" 
                 for dataset in self.datasets
             }
-        
-        # Validate settings
-        if self.hidden_size % self.num_attention_heads != 0:
-            raise ValueError(
-                f"hidden_size ({self.hidden_size}) must be divisible by num_attention_heads ({self.num_attention_heads})"
-            )
             
-        if self.batch_size > 32 and not self.use_8bit:
-            print("Warning: Large batch size without 8-bit quantization may cause OOM errors")
-            
-        if self.freeze_layers < 0:
-            print("Warning: Negative freeze_layers will train all parameters")
-            self.freeze_layers = 0
+        if self.domain_mapping is None:
+            # Set default domain mapping
+            self.domain_mapping = {
+                "laptop14": 0,
+                "rest14": 1,
+                "rest15": 1,  # Same domain as rest14
+                "rest16": 1,  # Same domain as rest14
+            }
