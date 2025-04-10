@@ -12,15 +12,15 @@ from src.data.dataset import custom_collate_fn
 
 # Import your custom modules
 from src.data.dataset import ABSADataset
-from src.data.preprocessor import StellaABSAPreprocessor
-from src.models.absa import StellaABSA # You need this file
+from src.data.preprocessor import LLMABSAPreprocessor
+from src.models.absa import LLMABSA # You need this file
 from src.training.losses import ABSALoss
 from src.training.trainer import ABSATrainer
 from src.training.metrics import ABSAMetrics
-from src.utils.config import StellaABSAConfig
+from src.utils.config import LLMABSAConfig
 from src.utils.logger import WandbLogger
 from src.utils.visualisation import AttentionVisualizer
-from src.inference.predictor import StellaABSAPredictor
+from src.inference.predictor import LLMABSAPredictor
 
 def set_seed(seed: int):
     """Set random seed for reproducibility"""
@@ -35,7 +35,7 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
     print(f"\nTraining on dataset: {dataset_name}")
     
     # Create preprocessor
-    preprocessor = StellaABSAPreprocessor(
+    preprocessor = LLMABSAPreprocessor(
         tokenizer=tokenizer,
         max_length=config.max_seq_length,
         use_syntax=config.use_syntax
@@ -85,8 +85,8 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
     
     
     # Initialize model
-    print(f"Initializing StellaABSAConfig model for dataset: {dataset_name}")
-    model = StellaABSA(config).to(device)
+    print(f"Initializing LLMABSAConfig model for dataset: {dataset_name}")
+    model = LLMABSA(config).to(device)
     
     # Set up gradient accumulation steps
     gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
@@ -312,9 +312,15 @@ def evaluate(model, dataloader, loss_fn, device, metrics):
             # Move batch to device
             batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
             
-            # Forward pass
-            outputs = model(**batch)
-            loss_dict = loss_fn(outputs, batch)
+            
+            # In train.py, update the forward pass to include generation
+            outputs = model(
+                **batch,
+                generate=config.generate_explanations
+            )
+
+            loss_dict = loss_fn(outputs, batch, generate=config.generate_explanations)
+                       
             
             # Update metrics
             metrics.update(outputs, batch)
@@ -349,7 +355,7 @@ def main():
     set_seed(args.seed)
     
     # Load config
-    config = StellaABSAConfig()
+    config = LLMABSAConfig()
     
     # Override config with command line arguments
     if args.learning_rate is not None:

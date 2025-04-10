@@ -21,38 +21,40 @@ class MultiHeadCrossAttention(nn.Module):
 
     def forward(self, aspect_hidden, opinion_hidden, attention_mask=None):
         batch_size = aspect_hidden.size(0)
-        seq_length = aspect_hidden.size(1)
         
         # Project queries, keys and values
         q = self.q_proj(aspect_hidden)
         k = self.k_proj(opinion_hidden)
         v = self.v_proj(opinion_hidden)
         
+        # Make sure everything has the same sequence length
+        seq_len = min(q.size(1), k.size(1), v.size(1))
+        q = q[:, :seq_len, :]
+        k = k[:, :seq_len, :]
+        v = v[:, :seq_len, :]
+        
         # Reshape for multi-head attention
-        q = q.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        head_dim = self.head_dim
+        q = q.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
         
         # Calculate attention scores
         attention_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         
-        # Debug info
-        print(f"aspect_hidden shape: {aspect_hidden.shape}")
-        print(f"opinion_hidden shape: {opinion_hidden.shape}")
-        print(f"attention_scores shape: {attention_scores.shape}")
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, :seq_len].unsqueeze(1).unsqueeze(2)
+            attention_scores = attention_scores.masked_fill(attention_mask == 0, -1e10)
         
-        # Calculate span scores (simpler version)
-        # Instead of using bilinear score which causes dimension issues,
-        # just use a simple additive attention
-        
-        # Add a simpler attention component that won't cause dimension issues
-        # This still maintains the novel cross-attention concept
+        # Calculate attention weights
         attention_probs = torch.softmax(attention_scores, dim=-1)
         
         # Apply attention
         context = torch.matmul(attention_probs, v)
-        context = context.transpose(1, 2).contiguous()
-        context = context.view(batch_size, -1, self.num_heads * self.head_dim)
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         
         # Output projection
-        return self.out_proj(context)
+        output = self.out_proj(context)
+        
+        return output

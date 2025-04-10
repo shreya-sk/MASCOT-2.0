@@ -13,10 +13,10 @@ from src.data.dataset import custom_collate_fn
 
 # Import your custom modules
 from src.data.dataset import ABSADataset
-from src.data.preprocessor import StellaABSAPreprocessor
-from src.models.absa import StellaABSA 
+from src.data.preprocessor import LLMABSAPreprocessor
+from src.models.absa import LLMABSA 
 from src.training.losses import ABSALoss
-from src.utils.config import StellaABSAConfig
+from src.utils.config import LLMABSAConfig
 from src.utils.logger import WandbLogger
 
 def set_seed(seed: int):
@@ -26,11 +26,11 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-# Add the missing _extract_hidden_states method to StellaABSA
+# Add the missing _extract_hidden_states method to LLMABSA
 def patch_absa_model():
-    """Patch the StellaABSA model to add any missing methods"""
-    if not hasattr(StellaABSA, '_extract_hidden_states'):
-        print("Adding missing _extract_hidden_states method to StellaABSA")
+    """Patch the LLMABSA model to add any missing methods"""
+    if not hasattr(LLMABSA, '_extract_hidden_states'):
+        print("Adding missing _extract_hidden_states method to LLMABSA")
         def _extract_hidden_states(self, embeddings_output):
             """Extract hidden states from embeddings output"""
             if isinstance(embeddings_output, dict):
@@ -44,7 +44,7 @@ def patch_absa_model():
                 return embeddings_output
                 
         # Add the method to the class
-        setattr(StellaABSA, '_extract_hidden_states', _extract_hidden_states)
+        setattr(LLMABSA, '_extract_hidden_states', _extract_hidden_states)
 
 def debug_train_dataset(config, tokenizer, logger, dataset_name, device, debug_samples=20):
     """Train model on a specific dataset in debug mode"""
@@ -55,7 +55,7 @@ def debug_train_dataset(config, tokenizer, logger, dataset_name, device, debug_s
     patch_absa_model()
     
     # Create preprocessor
-    preprocessor = StellaABSAPreprocessor(
+    preprocessor = LLMABSAPreprocessor(
         tokenizer=tokenizer,
         max_length=config.max_seq_length,
         use_syntax=config.use_syntax
@@ -112,7 +112,7 @@ def debug_train_dataset(config, tokenizer, logger, dataset_name, device, debug_s
     
     # Initialize model - using your actual model architecture
     print(f"Initializing GenerativeLLMABSA model for dataset: {dataset_name}")
-    model = StellaABSA(config).to(device)
+    model = LLMABSA(config).to(device)
     
     # Initialize optimizer
     optimizer = torch.optim.AdamW(
@@ -223,7 +223,7 @@ def main():
     set_seed(args.seed)
     
     # Load config
-    config = StellaABSAConfig()
+    config = LLMABSAConfig()
     
     # Override config with command line arguments
     if args.model:
@@ -275,6 +275,6 @@ if __name__ == '__main__':
 
 
 
-#     src/models/absa.py - Rename StellaABSA to GenerativeLLMABSA
-# src/data/preprocessor.py - Rename StellaABSAPreprocessor to LLMABSAPreprocessor
-# src/utils/config.py - Rename StellaABSAConfig to LLMABSAConfig
+#     src/models/absa.py - Rename LLMABSA to GenerativeLLMABSA
+# src/data/preprocessor.py - Rename LLMABSAPreprocessor to LLMABSAPreprocessor
+# src/utils/config.py - Rename LLMABSAConfig to LLMABSAConfig
