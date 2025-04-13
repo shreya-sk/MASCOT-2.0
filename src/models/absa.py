@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
 
 class LLMABSA(nn.Module):
     """
@@ -18,8 +19,16 @@ class LLMABSA(nn.Module):
         from src.models.classifier import AspectOpinionJointClassifier
         
         # Initialize components
+        self.config = config
+        self.hidden_size = config.hidden_size
+        
+        # Initialize embeddings
         self.embeddings = LLMEmbedding(config)
+        
+        # Initialize span detector for aspect and opinion extraction
         self.span_detector = SpanDetector(config)
+        
+        # Initialize sentiment classifier
         self.sentiment_classifier = AspectOpinionJointClassifier(
             input_dim=config.hidden_size,
             hidden_dim=config.hidden_size,
@@ -27,16 +36,16 @@ class LLMABSA(nn.Module):
             num_classes=3
         )
         
-        # Initialize weights safely
+        # Safe initialization of weights
         self._initialize_weights()
         
-        # Add gradient checkpointing for memory efficiency
-        self.use_gradient_checkpointing = getattr(config, 'use_gradient_checkpointing', True)
+        # Store configuration for saving/loading
+        self.config = config
         
     def _initialize_weights(self):
         """Initialize weights with safe initialization for different tensor dimensions"""
         for name, param in self.named_parameters():
-            if 'embeddings' not in name:  # Don't initialize pretrained weights
+            if 'embeddings.encoder' not in name:  # Don't initialize pretrained weights
                 if 'weight' in name and len(param.shape) >= 2:
                     # Use Xavier initialization only for 2D+ tensors
                     nn.init.xavier_normal_(param.data)
@@ -61,83 +70,32 @@ class LLMABSA(nn.Module):
             return embeddings_output
     
     def forward(self, input_ids, attention_mask, **kwargs):
-        """
-        Memory-efficient forward pass for triplet extraction
-        
-        Args:
-            input_ids: Input token IDs [batch_size, seq_len]
-            attention_mask: Attention mask [batch_size, seq_len]
-            **kwargs: Additional keyword arguments
-            
-        Returns:
-            Dictionary containing model outputs
-        """
+        """Forward pass for triplet extraction"""
         try:
             # Get embeddings
-            if self.use_gradient_checkpointing and self.training:
-                # Use gradient checkpointing to save memory during training
-                embeddings_output = torch.utils.checkpoint.checkpoint(
-                    self.embeddings,
-                    input_ids,
-                    attention_mask
-                )
-            else:
-                embeddings_output = self.embeddings(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask
-                )
+            embeddings_output = self.embeddings(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
             
             # Extract hidden states
             hidden_states = self._extract_hidden_states(embeddings_output)
             
-            # Create simple linear layers if needed for fallback
-            if not hasattr(self, 'aspect_linear'):
-                emb_size = hidden_states.size(-1)
-                self.aspect_linear = nn.Linear(emb_size, 3).to(hidden_states.device)
-                self.opinion_linear = nn.Linear(emb_size, 3).to(hidden_states.device)
-                self.pooler = nn.Linear(emb_size, emb_size).to(hidden_states.device)
-                self.sentiment_linear = nn.Linear(emb_size, 3).to(hidden_states.device)
-                
-                # Initialize these layers properly
-                nn.init.xavier_normal_(self.aspect_linear.weight)
-                nn.init.zeros_(self.aspect_linear.bias)
-                nn.init.xavier_normal_(self.opinion_linear.weight)
-                nn.init.zeros_(self.opinion_linear.bias)
-                nn.init.xavier_normal_(self.pooler.weight)
-                nn.init.zeros_(self.pooler.bias)
-                nn.init.xavier_normal_(self.sentiment_linear.weight)
-                nn.init.zeros_(self.sentiment_linear.bias)
+            # Get aspect and opinion spans
+            aspect_logits, opinion_logits, span_features, boundary_logits = self.span_detector(
+                hidden_states,
+                attention_mask
+            )
             
-            # Try using the span detector
-            try:
-                aspect_logits, opinion_logits, span_features, boundary_logits = self.span_detector(
-                    hidden_states,
-                    attention_mask
-                )
-            except Exception as e:
-                print(f"Span detector error, using fallback: {e}")
-                # Generate fallback outputs
-                aspect_logits = self.aspect_linear(hidden_states)
-                opinion_logits = self.opinion_linear(hidden_states)
-                span_features = hidden_states
-                boundary_logits = None
+            # Get sentiment and confidence
+            sentiment_logits, confidence_scores = self.sentiment_classifier(
+                hidden_states,
+                aspect_logits,
+                opinion_logits,
+                attention_mask
+            )
             
-            # Try using the sentiment classifier
-            try:
-                sentiment_logits, confidence_scores = self.sentiment_classifier(
-                    hidden_states,
-                    aspect_logits,
-                    opinion_logits,
-                    attention_mask
-                )
-            except Exception as e:
-                print(f"Sentiment classifier error, using fallback: {e}")
-                # Use fallback classification
-                pooled = torch.tanh(self.pooler(hidden_states.mean(dim=1)))
-                sentiment_logits = self.sentiment_linear(pooled)
-                confidence_scores = torch.ones(input_ids.size(0), 1, device=input_ids.device)
-            
-            # Prepare output dictionary
+            # Return all outputs
             outputs = {
                 'aspect_logits': aspect_logits,
                 'opinion_logits': opinion_logits,
@@ -159,7 +117,6 @@ class LLMABSA(nn.Module):
             # Create fallback outputs with correct shapes
             batch_size, seq_len = input_ids.size()
             device = input_ids.device
-            hidden_dim = getattr(self, 'hidden_size', 384)  # Default to 384 if not set
             
             # Return tensor placeholders with correct dimensions
             return {
@@ -169,18 +126,66 @@ class LLMABSA(nn.Module):
                 'confidence_scores': torch.ones(batch_size, 1, device=device)
             }
     
-    def extract_triplets(self, input_ids, attention_mask, tokenizer=None):
-        """
-        Extract aspect-opinion-sentiment triplets from text
+    def save(self, save_path):
+        """Save model with proper metadata"""
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
-        Args:
-            input_ids: Input token IDs [batch_size, seq_len]
-            attention_mask: Attention mask [batch_size, seq_len]
-            tokenizer: Optional tokenizer for decoding tokens
+        # Create a state dictionary with configuration
+        state_dict = {
+            'model_state_dict': self.state_dict(),
+            'config': {k: v for k, v in self.config.__dict__.items() 
+                      if not k.startswith('_') and not callable(v)}
+        }
+        
+        # Save to file
+        torch.save(state_dict, save_path)
+        print(f"Model saved to {save_path}")
+    
+    @classmethod
+    def load(cls, load_path, config=None, device='cpu'):
+        """Load model with proper configuration"""
+        if not os.path.exists(load_path):
+            print(f"Warning: Model file not found at {load_path}, initializing with default weights")
+            if config is None:
+                from src.utils.config import LLMABSAConfig
+                config = LLMABSAConfig()
+            return cls(config)
             
-        Returns:
-            List of triplets for each item in batch
-        """
+        # Load state dictionary with configuration
+        state_dict = torch.load(load_path, map_location=device)
+        
+        # Handle both formats (direct state dict or dict with model_state_dict)
+        if 'model_state_dict' in state_dict:
+            model_state = state_dict['model_state_dict']
+            # If config was loaded and not provided, use it
+            if config is None and 'config' in state_dict:
+                from src.utils.config import LLMABSAConfig
+                loaded_config = LLMABSAConfig()
+                for k, v in state_dict['config'].items():
+                    if hasattr(loaded_config, k):
+                        setattr(loaded_config, k, v)
+                config = loaded_config
+        else:
+            # Direct state dict
+            model_state = state_dict
+            
+        # Ensure config is provided
+        if config is None:
+            from src.utils.config import LLMABSAConfig
+            config = LLMABSAConfig()
+            
+        # Create model instance
+        model = cls(config)
+        
+        # Load state dictionary
+        # Use strict=False to allow missing keys, which may happen due to model changes
+        model.load_state_dict(model_state, strict=False)
+        
+        print(f"Model loaded from {load_path}")
+        return model
+        
+    def extract_triplets(self, input_ids, attention_mask, tokenizer=None):
+        """Extract triplets from model predictions"""
         # Get model predictions
         outputs = self.forward(input_ids, attention_mask)
         
@@ -220,7 +225,7 @@ class LLMABSA(nn.Module):
                 aspect_texts = [self._decode_span(input_ids[b], span, tokenizer) for span in aspect_spans]
                 opinion_texts = [self._decode_span(input_ids[b], span, tokenizer) for span in opinion_spans]
                 
-                # Create triplets
+                # Create triplets (all combinations of aspects and opinions)
                 for aspect_text, aspect_span in zip(aspect_texts, aspect_spans):
                     for opinion_text, opinion_span in zip(opinion_texts, opinion_spans):
                         triplets.append({

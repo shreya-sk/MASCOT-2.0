@@ -28,7 +28,25 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+# train.py - update the model saving logic
 
+# Find the section where the model is saved during training and replace it:
+def save_model(model, config, dataset_name, phase, best=True):
+    """Save model checkpoint with proper metadata"""
+    checkpoint_dir = "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Determine file path
+    if best:
+        file_path = f"{checkpoint_dir}/{config.experiment_name}_{dataset_name}_{phase}_best.pt"
+    else:
+        file_path = f"{checkpoint_dir}/{config.experiment_name}_{dataset_name}_{phase}_final.pt"
+    
+    # Save model with custom save method
+    model.save(file_path)
+    return file_path
+
+# And replace the model saving call in train_phase:
 def train_dataset(config, tokenizer, logger, dataset_name, device, two_phase=True):
     """
     Train model on a specific dataset with optional two-phase training
@@ -250,7 +268,8 @@ def train_phase(model, train_loader, val_loader, config, logger, device, dataset
             best_f1 = current_f1
             
             # Save best model
-            checkpoint_path = f"checkpoints/{config.experiment_name}_{dataset_name}_{phase}_best.pt"
+            checkpoint_path = save_model(model, config, dataset_name, phase, best=True)
+            print(f"New best {phase} model saved with F1 = {best_f1:.4f}")
             torch.save(
                 model.state_dict(),
                 checkpoint_path

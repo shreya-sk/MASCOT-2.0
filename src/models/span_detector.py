@@ -1,189 +1,178 @@
-# src/models/span_detector.py
+# src/models/span_detector.py - Simplified Rule-Based Detector
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-class EfficientSpanAttention(nn.Module):
-    """
-    Memory-efficient attention mechanism for span detection.
-    
-    This 2025 implementation uses advanced sparse attention patterns and 
-    quantization-aware computation to reduce memory footprint.
-    """
-    def __init__(self, hidden_dim, num_heads=4):
-        super().__init__()
-        
-        # Ensure number of heads divides hidden dimension
-        if hidden_dim % num_heads != 0:
-            # Find nearest divisible number of heads
-            for h in [8, 6, 4, 3, 2, 1]:
-                if hidden_dim % h == 0:
-                    num_heads = h
-                    break
-        
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        
-        # Efficient projections with reduced parameters
-        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)  # Remove bias for efficiency
-        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        
-        # Output projection with layer norm for stability
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.layer_norm = nn.LayerNorm(hidden_dim)
-        
-        # Gradient checkpointing flag for memory efficiency
-        self.use_gradient_checkpointing = True
-        
-    def forward(self, x, attention_mask=None):
-        """Forward pass with simplified attention computation"""
-        batch_size, seq_len, _ = x.shape
-        
-        # Apply projections
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-        
-        # Simple attention calculation without reshaping to multi-head
-        # This is less efficient but more robust
-        attn_scores = torch.bmm(q, k.transpose(1, 2)) * self.scale
-        
-        # Apply attention mask
-        if attention_mask is not None:
-            # Convert attention mask to proper shape
-            mask = attention_mask.unsqueeze(1)  # [batch, 1, seq_len]
-            attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
-        
-        # Apply softmax and compute context
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_output = torch.bmm(attn_weights, v)
-        
-        # Apply output projection
-        output = self.out_proj(attn_output)
-        
-        # Apply layer normalization for stability
-        output = self.layer_norm(output + x)  # Residual connection
-        
-        return output
+import re
 
 class SpanDetector(nn.Module):
-    """
-    Memory-efficient span detector using lightweight attention and BiLSTM/GRU
-    
-    This implementation is designed for 2025 resource-constrained environments
-    while maintaining state-of-the-art performance.
-    """
+    """Rule-enhanced span detector for restaurant reviews"""
     def __init__(self, config):
         super().__init__()
         
-        # Get configuration parameters
+        # Configuration
         self.hidden_dim = config.hidden_size
         self.dropout_rate = getattr(config, 'dropout', 0.1)
         
-        # Use GRU instead of LSTM for memory efficiency
-        self.use_gru = getattr(config, 'use_gru', True)
-        
-        # Recurrent layer for sequence modeling
-        if self.use_gru:
-            self.rnn = nn.GRU(
-                input_size=self.hidden_dim,
-                hidden_size=self.hidden_dim // 2,
-                num_layers=1,  # Single layer for efficiency
-                bidirectional=True,
-                batch_first=True,
-                dropout=0
-            )
-        else:
-            self.rnn = nn.LSTM(
-                input_size=self.hidden_dim,
-                hidden_size=self.hidden_dim // 2,
-                num_layers=1,  # Single layer for efficiency
-                bidirectional=True,
-                batch_first=True,
-                dropout=0
-            )
-        
-        # Simplified attention mechanism for stability
-        self.attention = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.Tanh(),
-            nn.Linear(self.hidden_dim, self.hidden_dim)
+        # Simple recurrent layer (GRU is more memory efficient)
+        self.rnn = nn.GRU(
+            input_size=self.hidden_dim,
+            hidden_size=self.hidden_dim // 2,
+            num_layers=1,
+            bidirectional=True,
+            batch_first=True,
+            dropout=0
         )
         
-        # Aspect boundary prediction
+        # Aspect classifier with strong bias for aspect detection
         self.aspect_classifier = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.GELU(),
             nn.Dropout(self.dropout_rate),
-            nn.Linear(self.hidden_dim // 2, 3)  # B-I-O tags
+            nn.Linear(self.hidden_dim, 3)  # B-I-O tags
         )
         
-        # Opinion boundary prediction
+        # Opinion classifier with strong bias for opinion detection
         self.opinion_classifier = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.GELU(),
             nn.Dropout(self.dropout_rate),
-            nn.Linear(self.hidden_dim // 2, 3)  # B-I-O tags
+            nn.Linear(self.hidden_dim, 3)  # B-I-O tags
         )
         
-        # Boundary refinement module (2025 addition)
-        self.boundary_refiner = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim // 2, 2)  # Start and end adjustments
-        )
+        # Initialize with strong bias for aspects and opinions
+        self._initialize_with_bias()
         
-        # Dropout for regularization
-        self.dropout = nn.Dropout(self.dropout_rate)
+        # Common food and restaurant terms for rule-based enhancement
+        self.food_terms = {'food', 'meal', 'dish', 'pizza', 'pasta', 'sushi', 'burger', 
+                          'salad', 'appetizer', 'dessert', 'lunch', 'dinner', 'breakfast', 
+                          'menu', 'restaurant', 'service', 'staff', 'waiter', 'waitress',
+                          'ambiance', 'atmosphere', 'price', 'value', 'taste', 'flavor'}
         
-    def forward(self, hidden_states, attention_mask=None):
-        """Forward pass detecting aspect and opinion spans"""
+        self.opinion_terms = {'good', 'great', 'excellent', 'amazing', 'wonderful', 'delicious',
+                             'tasty', 'fantastic', 'bad', 'terrible', 'awful', 'horrible',
+                             'poor', 'mediocre', 'disappointing', 'fresh', 'stale', 'expensive',
+                             'cheap', 'overpriced', 'reasonable', 'friendly', 'rude', 'slow',
+                             'fast', 'efficient', 'inefficient', 'clean', 'dirty'}
+        
+    def _initialize_with_bias(self):
+        """Initialize with strong bias for aspects and opinions"""
+        # Bias aspect classifier to detect more aspects
+        # B tag (index 1) gets a positive bias
+        self.aspect_classifier[-1].bias.data[1] = 0.5
+        
+        # Bias opinion classifier to detect more opinions
+        # B tag (index 1) gets a positive bias 
+        self.opinion_classifier[-1].bias.data[1] = 0.5
+    
+    def forward(self, hidden_states, attention_mask=None, texts=None):
+        """
+        Forward pass with rule-based enhancement
+        
+        Args:
+            hidden_states: Encoder hidden states [batch_size, seq_len, hidden_dim]
+            attention_mask: Attention mask [batch_size, seq_len]
+            texts: Optional raw text for rule-based enhancement
+            
+        Returns:
+            aspect_logits, opinion_logits, span_features, boundary_logits
+        """
         try:
-            batch_size, seq_len, hidden_dim = hidden_states.size()
+            batch_size, seq_len, hidden_dim = hidden_states.shape
             device = hidden_states.device
             
-            # Apply recurrent layer for sequence modeling
-            # Handle potential errors with RNN
-            try:
-                rnn_out, _ = self.rnn(hidden_states)
-                rnn_out = self.dropout(rnn_out)
-            except Exception as e:
-                print(f"RNN error, using input hidden states: {e}")
-                # Use input directly if RNN fails
-                rnn_out = self.dropout(hidden_states)
+            # Apply RNN for sequential context
+            rnn_out, _ = self.rnn(hidden_states)
             
-            # Apply simple attention mechanism
-            attended = self.attention(rnn_out) + rnn_out  # Residual connection
+            # Get base logits from neural network
+            aspect_logits = self.aspect_classifier(rnn_out)
+            opinion_logits = self.opinion_classifier(rnn_out)
             
-            # Predict aspect and opinion spans
-            aspect_logits = self.aspect_classifier(attended)
-            opinion_logits = self.opinion_classifier(attended)
+            # If texts are provided, enhance with rule-based detection
+            if texts is not None and isinstance(texts, list):
+                # Apply rule-based enhancement
+                for i, text in enumerate(texts):
+                    if i >= batch_size:
+                        break
+                        
+                    # Apply rule-based enhancement for this sample
+                    aspect_logits[i], opinion_logits[i] = self._apply_rules(
+                        text, aspect_logits[i], opinion_logits[i]
+                    )
             
-            # Boundary refinement
-            boundary_logits = self.boundary_refiner(attended)
+            # Apply attention mask
+            if attention_mask is not None:
+                mask = attention_mask.unsqueeze(-1)
+                aspect_logits = aspect_logits * mask
+                opinion_logits = opinion_logits * mask
+                
+                # Large negative for padding
+                padding_mask = (1 - mask) * -10000.0
+                aspect_logits = aspect_logits + padding_mask
+                opinion_logits = opinion_logits + padding_mask
             
-            # Generate span features for sentiment classification
-            # Simply use the attended features
-            span_features = attended
+            # Create boundary logits (just placeholders)
+            boundary_logits = torch.zeros(batch_size, seq_len, 2, device=device)
+            
+            # Use RNN output as span features
+            span_features = rnn_out
             
             return aspect_logits, opinion_logits, span_features, boundary_logits
-            
+        
         except Exception as e:
-            print(f"Error in span detector forward pass: {e}")
+            print(f"Error in span detector: {e}")
             import traceback
             traceback.print_exc()
             
-            # Return tensor placeholders with correct shapes
-            batch_size = hidden_states.size(0)
-            seq_len = hidden_states.size(1)
+            # Create fallback tensors
+            device = hidden_states.device
+            batch_size, seq_len = hidden_states.shape[:2]
             
-            # Create properly shaped outputs
-            aspect_logits = torch.zeros(batch_size, seq_len, 3, device=hidden_states.device)
-            opinion_logits = torch.zeros(batch_size, seq_len, 3, device=hidden_states.device)
+            aspect_logits = torch.zeros(batch_size, seq_len, 3, device=device)
+            opinion_logits = torch.zeros(batch_size, seq_len, 3, device=device)
             span_features = torch.zeros_like(hidden_states)
-            boundary_logits = torch.zeros(batch_size, seq_len, 2, device=hidden_states.device)
+            boundary_logits = torch.zeros(batch_size, seq_len, 2, device=device)
             
             return aspect_logits, opinion_logits, span_features, boundary_logits
+    
+    def _apply_rules(self, text, aspect_logits, opinion_logits):
+        """Apply rule-based enhancement to logits"""
+        # Split text into tokens
+        tokens = text.lower().split()
+        
+        # Don't modify if length mismatch
+        if len(tokens) > aspect_logits.size(0):
+            return aspect_logits, opinion_logits
+            
+        # Apply food/restaurant term rules for aspects
+        for i, token in enumerate(tokens):
+            if i >= aspect_logits.size(0):
+                break
+                
+            # Check if token is a food/restaurant term
+            if token in self.food_terms:
+                # Boost B tag for aspect (more than I and O tags)
+                aspect_logits[i, 1] += 2.0  # Big boost for B tag
+                
+            # Check if part of multi-word food item
+            if i < len(tokens) - 1:
+                bigram = f"{token} {tokens[i+1]}"
+                if any(term in bigram for term in self.food_terms):
+                    aspect_logits[i, 1] += 1.5  # Boost for B tag (beginning)
+                    if i+1 < aspect_logits.size(0):
+                        aspect_logits[i+1, 2] += 1.5  # Boost for I tag (inside)
+        
+        # Apply opinion term rules
+        for i, token in enumerate(tokens):
+            if i >= opinion_logits.size(0):
+                break
+                
+            # Check if token is an opinion term
+            if token in self.opinion_terms:
+                # Boost B tag for opinion
+                opinion_logits[i, 1] += 2.0
+                
+            # Boost adjectives and adverbs (simple pattern matching)
+            if token.endswith('ly') or token.endswith('ful') or token.endswith('ous'):
+                opinion_logits[i, 1] += 1.0
+        
+        return aspect_logits, opinion_logits
