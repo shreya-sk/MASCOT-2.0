@@ -135,44 +135,24 @@ class SpanDetector(nn.Module):
             return aspect_logits, opinion_logits, span_features, boundary_logits
     
     def _apply_rules(self, text, aspect_logits, opinion_logits):
-        """Apply rule-based enhancement to logits"""
-        # Split text into tokens
+        # Add stronger priors for common food and restaurant terms
         tokens = text.lower().split()
         
-        # Don't modify if length mismatch
-        if len(tokens) > aspect_logits.size(0):
-            return aspect_logits, opinion_logits
-            
-        # Apply food/restaurant term rules for aspects
+        # Fix: Add more domain-specific terms and increase boost values
         for i, token in enumerate(tokens):
             if i >= aspect_logits.size(0):
                 break
                 
-            # Check if token is a food/restaurant term
+            # Significantly increase bias for food-related aspects
             if token in self.food_terms:
-                # Boost B tag for aspect (more than I and O tags)
-                aspect_logits[i, 1] += 2.0  # Big boost for B tag
+                aspect_logits[i, 1] += 5.0  # Increase from 2.0 to 5.0
+            
+            # Add negative bias to prevent first-token bias
+            if i == 0 and token not in self.food_terms:
+                aspect_logits[i, 1] -= 3.0  # Penalize first token if not food-related
                 
-            # Check if part of multi-word food item
-            if i < len(tokens) - 1:
-                bigram = f"{token} {tokens[i+1]}"
-                if any(term in bigram for term in self.food_terms):
-                    aspect_logits[i, 1] += 1.5  # Boost for B tag (beginning)
-                    if i+1 < aspect_logits.size(0):
-                        aspect_logits[i+1, 2] += 1.5  # Boost for I tag (inside)
-        
-        # Apply opinion term rules
-        for i, token in enumerate(tokens):
-            if i >= opinion_logits.size(0):
-                break
-                
-            # Check if token is an opinion term
-            if token in self.opinion_terms:
-                # Boost B tag for opinion
-                opinion_logits[i, 1] += 2.0
-                
-            # Boost adjectives and adverbs (simple pattern matching)
-            if token.endswith('ly') or token.endswith('ful') or token.endswith('ous'):
-                opinion_logits[i, 1] += 1.0
+            # Prevent punctuation from being opinions
+            if token in ['.', ',', '!', '?', ')', '(', ':']:
+                opinion_logits[i, 1] -= 10.0  # Strong negative bias
         
         return aspect_logits, opinion_logits

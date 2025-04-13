@@ -42,8 +42,24 @@ def main():
     if args.text:
         # Process single text
         print(f"\nAnalyzing: {args.text}")
+       
+     
+        # Modify the prediction output code
         predictions = predictor.predict(args.text, domain_id=args.domain_id)
         
+        # Filter predictions with low confidence
+        confidence_threshold = 0.6
+        filtered_predictions = []
+        for triplet in predictions['triplets']:
+            if triplet['confidence'] > confidence_threshold:
+                filtered_predictions.append(triplet)
+        
+        # If no predictions pass threshold, take the highest confidence one
+        if not filtered_predictions and predictions['triplets']:
+            best_triplet = max(predictions['triplets'], key=lambda x: x['confidence'])
+            filtered_predictions.append(best_triplet)
+        
+        predictions['triplets'] = filtered_predictions
         # Print results
         print("\nPredictions:")
         for triplet in predictions['triplets']:

@@ -55,8 +55,21 @@ class AspectOpinionJointClassifier(nn.Module):
             nn.Sigmoid()
         )
         
+        # Word lists for rule-based sentiment detection
+        self.negative_words = set([
+            'bad', 'terrible', 'poor', 'awful', 'mediocre', 'disappointing', 
+            'horrible', 'disgusting', 'unpleasant', 'worst', 'cold', 'slow',
+            'overpriced', 'expensive', 'rude', 'unfriendly', 'dirty', 'noisy'
+        ])
+        
+        self.positive_words = set([
+            'good', 'great', 'excellent', 'amazing', 'fantastic', 'wonderful',
+            'delicious', 'tasty', 'fresh', 'friendly', 'helpful', 'nice',
+            'best', 'perfect', 'favorite', 'loved', 'enjoy', 'clean', 'quick'
+        ])
+        
     def forward(self, hidden_states, aspect_logits=None, opinion_logits=None, 
-                attention_mask=None, sentiment_labels=None):
+                attention_mask=None, sentiment_labels=None, input_ids=None):
         """
         Forward pass through the sentiment classifier
         
@@ -66,6 +79,7 @@ class AspectOpinionJointClassifier(nn.Module):
             opinion_logits: Opinion logits [batch_size, seq_len, 3]
             attention_mask: Attention mask [batch_size, seq_len]
             sentiment_labels: Optional sentiment labels
+            input_ids: Optional input token IDs for rule-based enhancement
             
         Returns:
             tuple: (sentiment_logits, confidence_scores)
@@ -128,10 +142,38 @@ class AspectOpinionJointClassifier(nn.Module):
             # Apply fusion
             fused = self.fusion(combined)  # [batch_size, hidden_dim]
             
-            # Check for common positive/negative words in opinion representation
-            # This helps balance sentiment predictions
-            # Simple rule-based heuristic to encourage proper sentiment classification
+            # Basic sentiment classification
             sentiment_logits = self.classifier(fused)  # [batch_size, num_classes]
+            
+            # Apply rule-based sentiment modification if input_ids are provided
+            if input_ids is not None and hasattr(self, 'tokenizer'):
+                for b in range(batch_size):
+                    # Analyze opinion tokens for sentiment cues
+                    opinion_indices = torch.where(opinion_weights[b, :, 0] > 0.1)[0]
+                    
+                    if len(opinion_indices) > 0:
+                        has_negative = False
+                        has_positive = False
+                        
+                        for idx in opinion_indices:
+                            if idx < input_ids.size(1):
+                                token_id = input_ids[b, idx].item()
+                                token = self.tokenizer.decode([token_id]).lower().strip()
+                                
+                                if token in self.negative_words:
+                                    has_negative = True
+                                if token in self.positive_words:
+                                    has_positive = True
+                        
+                        # Adjust sentiment logits based on detected terms
+                        if has_negative and not has_positive:
+                            sentiment_logits[b, 2] += 2.0  # Boost negative
+                        elif has_positive and not has_negative:
+                            sentiment_logits[b, 0] += 2.0  # Boost positive
+            
+            # Rule-based adjustment for common sentiment patterns even without tokenizer
+            # Look at the opinion representation for patterns that suggest sentiment
+            opinion_norm = F.normalize(opinion_repr, p=2, dim=1)
             
             # Compute confidence scores
             confidence = self.confidence_estimator(fused)  # [batch_size, 1]

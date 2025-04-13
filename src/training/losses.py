@@ -18,9 +18,10 @@ class ABSALoss(nn.Module):
         
         # Span detection loss with class weighting to handle imbalance
         # BIO tags are imbalanced (most tokens are O)
-        self.span_criterion = nn.CrossEntropyLoss(
-            ignore_index=-100,
-            weight=torch.tensor([0.2, 1.0, 1.0])  # Lower weight for O tag, higher for B and I tags
+        self.span_criterion = FocalLoss(
+        gamma=2.0,
+        alpha=torch.tensor([0.1, 0.45, 0.45]),  # Lower weight for O, higher for B and I
+        ignore_index=-100
         )
         
         # Standard sentiment classification loss
@@ -167,3 +168,29 @@ class ABSALoss(nn.Module):
                 'sentiment_loss': 0.0,
                 'boundary_loss': 0.0
             }
+class FocalLoss(nn.Module):
+    """Focal loss for addressing class imbalance"""
+    def __init__(self, gamma=2.0, alpha=None, ignore_index=-100):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.ignore_index = ignore_index
+        
+    def forward(self, logits, targets):
+        # Calculate standard CE loss
+        ce_loss = F.cross_entropy(
+            logits, targets, 
+            ignore_index=self.ignore_index,
+            reduction='none'
+        )
+        
+        # Apply focal scaling
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+        
+        # Apply alpha weighting if provided
+        if self.alpha is not None:
+            alpha = self.alpha.to(logits.device)
+            focal_loss = focal_loss * alpha[targets]
+            
+        return focal_loss.mean()

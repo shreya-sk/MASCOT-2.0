@@ -11,12 +11,14 @@ class LLMABSAConfig:
     such as older laptops or low-end cloud instances.
     """
     # Use tiny models
-    model_name: str = "prajjwal1/bert-tiny"  # 4.4M parameter model
-    hidden_size: int = 128  # Very small hidden size
-    num_layers: int = 1  # Single layer
-    dropout: float = 0.1
+    model_name: str = "prajjwal1/bert-small"  # Upgrade from bert-tiny
+    hidden_size: int = 256  # Double the hidden size
+    num_layers: int = 2  # Use at least 2 layers
+    dropout: float = 0.2  # Increase dropout slightly
     num_attention_heads: int = 4  # Should divide hidden_size evenly
-    
+     # Use better initialization
+    use_focal_loss: bool = True  # Enable focal loss
+    use_boundary_loss: bool = True  # Enable boundary refinement
     # No generation for maximum efficiency
     generate_explanations: bool = True  
     
@@ -33,11 +35,12 @@ class LLMABSAConfig:
     use_syntax: bool = False  # Skip syntax information
     
     # Training settings
-    learning_rate: float = 1e-4
+   
     weight_decay: float = 0.01
     warmup_ratio: float = 0.1
-    batch_size: int = 8  # Small batch size
-    num_epochs: int = 5
+    learning_rate: float = 5e-4  # Increase learning rate
+    batch_size: int = 16  # Increase batch size
+    num_epochs: int = 10  # Train for more epochs
     gradient_accumulation_steps: int = 4  # Use gradient accumulation
     
     # Simplify domain handling

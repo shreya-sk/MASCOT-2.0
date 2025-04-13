@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from src.utils.config import LLMABSAConfig
 from transformers import get_linear_schedule_with_warmup
 import traceback
-
+from src.data.augmentation import augment_dataset
 # Import modules
 from src.data.dataset import ABSADataset, custom_collate_fn
 from src.data.preprocessor import LLMABSAPreprocessor
@@ -84,7 +84,10 @@ def train_dataset(config, tokenizer, logger, dataset_name, device, two_phase=Tru
         max_length=config.max_seq_length,
         domain_id=domain_id
     )
-    
+    if getattr(config, 'use_augmentation', True):
+        train_dataset.data = augment_dataset(train_dataset.data, max_augmentations=2)
+        print(f"Augmented train dataset size: {len(train_dataset)}")
+        
     # Create validation dataset
     val_dataset = ABSADataset(
         data_dir=data_dir,
