@@ -5,7 +5,7 @@ import os
 import json
 from tqdm import tqdm
 from transformers import AutoTokenizer
-from src.models.absa import GenerativeLLMABSA
+from src.models.absa import LLMABSA
 from src.utils.config import LLMABSAConfig
 from src.inference.predictor import LLMABSAPredictor
 from sklearn.metrics import precision_recall_fscore_support
@@ -226,7 +226,7 @@ def evaluate_model(model_path=None, dataset_name="rest15", num_samples=20):
         print(f"Error loading model: {e}")
         # For quick testing without a trained model, use the model directly
         print("Creating untrained model for testing")
-        model = GenerativeLLMABSA(config)
+        model = LLMABSA(config)
         predictor = MockPredictor(model, tokenizer)
     
     # Load test data
@@ -435,7 +435,7 @@ def quick_test():
     config.generate_explanations = True
     
     # Import the model class directly to avoid initialization errors
-    from src.models.absa import GenerativeLLMABSA
+    from src.models.absa import LLMABSA
     from src.models.classifier import AspectOpinionJointClassifier
     
     # Initialize tokenizer
@@ -458,8 +458,8 @@ def quick_test():
     
     # Now let's try to initialize the full model
     try:
-        model = GenerativeLLMABSA(config)
-        print("✓ GenerativeLLMABSA model initialized successfully")
+        model = LLMABSA(config)
+        print("✓ LLMABSA model initialized successfully")
         
         # Test forward pass with dummy inputs
         batch_size = 2

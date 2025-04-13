@@ -111,7 +111,7 @@ def debug_train_dataset(config, tokenizer, logger, dataset_name, device, debug_s
     )
     
     # Initialize model - using your actual model architecture
-    print(f"Initializing GenerativeLLMABSA model for dataset: {dataset_name}")
+    print(f"Initializing LLMABSA model for dataset: {dataset_name}")
     model = LLMABSA(config).to(device)
     
     # Initialize optimizer
@@ -275,6 +275,6 @@ if __name__ == '__main__':
 
 
 
-#     src/models/absa.py - Rename LLMABSA to GenerativeLLMABSA
+#     src/models/absa.py - Rename LLMABSA to LLMABSA
 # src/data/preprocessor.py - Rename LLMABSAPreprocessor to LLMABSAPreprocessor
 # src/utils/config.py - Rename LLMABSAConfig to LLMABSAConfig

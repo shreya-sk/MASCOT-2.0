@@ -1,7 +1,7 @@
 # test_generation.py
 import torch
 from transformers import AutoTokenizer
-from src.models.absa import GenerativeLLMABSA
+from src.models.absa import LLMABSA
 from src.utils.config import LLMABSAConfig
 from src.inference.predictor import LLMABSAPredictor
 

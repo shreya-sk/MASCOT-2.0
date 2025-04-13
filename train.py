@@ -15,7 +15,8 @@ import traceback
 # Import modules
 from src.data.dataset import ABSADataset, custom_collate_fn
 from src.data.preprocessor import LLMABSAPreprocessor
-from src.models.absa import GenerativeLLMABSA
+from src.models.absa import LLMABSA
+
 from src.training.losses import ABSALoss
 from src.utils.config import LLMABSAConfig as con
 from src.utils.logger import WandbLogger
@@ -99,8 +100,8 @@ def train_dataset(config, tokenizer, logger, dataset_name, device, two_phase=Tru
     )
     
     # Initialize model
-    print(f"Initializing GenerativeLLMABSA model")
-    model = GenerativeLLMABSA(config).to(device)
+    print(f"Initializing LLMABSA model")
+    model = LLMABSA(config).to(device)
     
     # Print model size
     param_count = sum(p.numel() for p in model.parameters())
@@ -346,7 +347,7 @@ def evaluate(model, val_loader, loss_fn, device, generate=False):
     aspect_preds, opinion_preds, sentiment_preds = [], [], []
     aspect_labels, opinion_labels, sentiment_labels = [], [], []
     
-    with torch.cuda.amp.autocast(enabled=config.use_fp16):
+    with torch.cuda.amp.autocast(enabled=LLMABSAConfig.use_fp16):
         for batch in tqdm(val_loader, desc="Evaluating"):
             try:
                 # Move batch to device - only tensor values
