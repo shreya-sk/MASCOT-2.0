@@ -1,37 +1,45 @@
-# train.py
+#!/usr/bin/env python
+# train_absa.py - Training script for Generative ABSA model
 import os
 import argparse
-import torch # type: ignore # type: ignore
+import torch
 import random
 import numpy as np
 from tqdm import tqdm
 from transformers import AutoTokenizer
-from torch.utils.data import DataLoader # type: ignore
-from transformers import get_linear_schedule_with_warmup
-from src.data.dataset import custom_collate_fn
-
-# Import your custom modules
-from src.data.dataset import ABSADataset
-from src.data.preprocessor import LLMABSAPreprocessor
-from src.models.absa import LLMABSA # You need this file
-from src.training.losses import ABSALoss
-from src.training.trainer import ABSATrainer
-from src.training.metrics import ABSAMetrics
+from torch.utils.data import DataLoader
 from src.utils.config import LLMABSAConfig
+from transformers import get_linear_schedule_with_warmup
+import traceback
+
+# Import modules
+from src.data.dataset import ABSADataset, custom_collate_fn
+from src.data.preprocessor import LLMABSAPreprocessor
+from src.models.absa import GenerativeLLMABSA
+from src.training.losses import ABSALoss
+from src.utils.config import LLMABSAConfig as con
 from src.utils.logger import WandbLogger
-from src.utils.visualisation import AttentionVisualizer
-from src.inference.predictor import LLMABSAPredictor
 
 def set_seed(seed: int):
     """Set random seed for reproducibility"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-def train_dataset(config, tokenizer, logger, dataset_name, device):
-    """Train model on a specific dataset"""
+def train_dataset(config, tokenizer, logger, dataset_name, device, two_phase=True):
+    """
+    Train model on a specific dataset with optional two-phase training
     
+    Args:
+        config: Model configuration
+        tokenizer: Tokenizer for text encoding
+        logger: Logger for metrics
+        dataset_name: Name of the dataset to train on
+        device: Device to use for training
+        two_phase: Whether to use two-phase training (extraction then generation)
+    """
     print(f"\nTraining on dataset: {dataset_name}")
     
     # Create preprocessor
@@ -44,8 +52,12 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
     # Create datasets with domain id if using domain adaptation
     domain_id = config.domain_mapping.get(dataset_name, 0) if config.domain_adaptation else None
     
+    # Get data directory
+    data_dir = config.dataset_paths.get(dataset_name, f"Datasets/aste/{dataset_name}")
+    
+    # Create train dataset
     train_dataset = ABSADataset(
-        data_dir=config.dataset_paths[dataset_name],
+        data_dir=data_dir,
         tokenizer=tokenizer,
         preprocessor=preprocessor,
         split='train',
@@ -54,8 +66,9 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
         domain_id=domain_id
     )
     
+    # Create validation dataset
     val_dataset = ABSADataset(
-        data_dir=config.dataset_paths[dataset_name],
+        data_dir=data_dir,
         tokenizer=tokenizer,
         preprocessor=preprocessor,
         split='dev',
@@ -63,55 +76,115 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
         max_length=config.max_seq_length,
         domain_id=domain_id
     )
-    # In train.py, update how you create the DataLoader
+    
+    # Print dataset sizes
+    print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Validation dataset size: {len(val_dataset)}")
+    
+    # Create dataloaders with custom collate function
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=config.num_workers,
-        collate_fn=custom_collate_fn,  # Add this line
-        pin_memory=True
+        num_workers=0,  # Use 0 for debugging
+        collate_fn=custom_collate_fn
     )
-
+    
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=config.num_workers,
-        collate_fn=custom_collate_fn,  # Add this line
-        pin_memory=True
+        num_workers=0,  # Use 0 for debugging
+        collate_fn=custom_collate_fn
     )
     
-    
-    
     # Initialize model
-    print(f"Initializing LLMABSAConfig model for dataset: {dataset_name}")
-    model = LLMABSA(config).to(device)
+    print(f"Initializing GenerativeLLMABSA model")
+    model = GenerativeLLMABSA(config).to(device)
+    
+    # Print model size
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {param_count:,}")
     
     # Set up gradient accumulation steps
-    gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
-    print(f"Using gradient accumulation with {gradient_accumulation_steps} steps")
+    grad_accum_steps = getattr(config, 'gradient_accumulation_steps', 1)
+    print(f"Using gradient accumulation with {grad_accum_steps} steps")
     
-    # Initialize optimizer
-    # Separate learning rates for base model and new components
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if "embeddings" in n],
-            "lr": config.learning_rate / 10.0,  # Lower learning rate for pretrained parts
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if "embeddings" not in n],
-            "lr": config.learning_rate,
-        },
-    ]
+    # Two-phase training approach
+    best_overall_f1 = 0.0
+    
+    # Phase 1: Train extraction only if two_phase is True
+    if two_phase:
+        print("\n===== Phase 1: Training extraction components =====")
+        
+        # Save original generation flag and disable generation for phase 1
+        original_gen_flag = config.generate_explanations
+        config.generate_explanations = False
+        
+        # Phase 1 training
+        best_extraction_f1 = train_phase(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            config=config,
+            logger=logger,
+            device=device,
+            dataset_name=dataset_name,
+            phase="extraction",
+            generate=False,
+            epochs=config.num_epochs // 2  # Half of total epochs
+        )
+        
+        print(f"\nPhase 1 complete. Best extraction F1: {best_extraction_f1:.4f}")
+        
+        # Restore original generation flag
+        config.generate_explanations = original_gen_flag
+        
+        # Load best extraction model for phase 2
+        checkpoint_path = f"checkpoints/{config.experiment_name}_{dataset_name}_extraction_best.pt"
+        if os.path.exists(checkpoint_path):
+            model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+            print(f"Loaded best extraction model from {checkpoint_path}")
+    
+    # Phase 2: Train with generation (or single phase if two_phase is False)
+    phase_name = "generation" if two_phase else "single"
+    epochs = config.num_epochs // 2 if two_phase else config.num_epochs
+    
+    print(f"\n===== {'Phase 2: Training with generation' if two_phase else 'Training full model'} =====")
+    
+    # Train the model
+    best_overall_f1 = train_phase(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        config=config,
+        logger=logger,
+        device=device,
+        dataset_name=dataset_name,
+        phase=phase_name,
+        generate=config.generate_explanations,
+        epochs=epochs
+    )
+    
+    print(f"\nTraining complete. Best overall F1: {best_overall_f1:.4f}")
+    return best_overall_f1
+
+def train_phase(model, train_loader, val_loader, config, logger, device, dataset_name, phase, generate, epochs):
+    """Train model for a specific phase (extraction or generation)"""
+    # Initialize optimizer with appropriate learning rate
+    lr = config.learning_rate
+    if phase == "generation":
+        lr = lr / 2.0  # Lower learning rate for fine-tuning
     
     optimizer = torch.optim.AdamW(
-        optimizer_grouped_parameters,
+        model.parameters(),
+        lr=lr,
         weight_decay=config.weight_decay,
     )
     
-    # Calculate steps with gradient accumulation
-    num_training_steps = len(train_loader) // gradient_accumulation_steps * config.num_epochs
+    # Initialize scheduler
+    grad_accum_steps = getattr(config, 'gradient_accumulation_steps', 1)
+    num_training_steps = len(train_loader) // grad_accum_steps * epochs
     num_warmup_steps = int(num_training_steps * getattr(config, 'warmup_ratio', 0.1))
     
     scheduler = get_linear_schedule_with_warmup(
@@ -123,25 +196,6 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
     # Initialize loss function
     loss_fn = ABSALoss(config)
     
-    # Initialize metrics
-    metrics = ABSAMetrics()
-    
-    # Create trainer with gradient accumulation
-    trainer = ABSATrainer(
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        loss_fn=loss_fn,
-        device=device,
-        config=config
-    )
-    
-    # Initialize visualizer
-    visualizer = AttentionVisualizer(tokenizer)
-    
-    # Set up mixed precision training if enabled
-    scaler = torch.cuda.amp.GradScaler() if config.use_fp16 else None
-    
     # Create checkpoint directory
     os.makedirs('checkpoints', exist_ok=True)
     
@@ -149,196 +203,311 @@ def train_dataset(config, tokenizer, logger, dataset_name, device):
     best_f1 = 0.0
     global_step = 0
     
-    for epoch in range(config.num_epochs):
-        # Training
-        model.train()
-        train_loss = 0.0
-        train_steps = 0
+    for epoch in range(epochs):
+        # Training epoch
+        train_loss = train_epoch(
+            model=model,
+            train_loader=train_loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            loss_fn=loss_fn,
+            device=device,
+            config=config,
+            logger=logger,
+            global_step=global_step,
+            epoch=epoch,
+            dataset_name=dataset_name,
+            phase=phase,
+            generate=generate
+        )
+        global_step += len(train_loader)
         
-        train_iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs} (Train)")
+        # Evaluation
+        val_metrics = evaluate(
+            model=model,
+            val_loader=val_loader,
+            loss_fn=loss_fn,
+            device=device,
+            generate=generate
+        )
         
-        for batch_idx, batch in enumerate(train_iterator):
-            # Move batch to device
-            batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+        # Print evaluation results
+        print(f"\nEpoch {epoch+1}/{epochs} Evaluation ({phase}):")
+        for k, v in val_metrics.items():
+            print(f"  {k}: {v:.4f}")
             
-            # Forward pass with mixed precision if enabled
-            if config.use_fp16:
-                with torch.cuda.amp.autocast():
-                    outputs = model(**batch)
-                    loss_dict = loss_fn(outputs, batch)
-                    loss = loss_dict['loss'] / gradient_accumulation_steps
-                    
-                # Backward pass with gradient scaling
-                scaler.scale(loss).backward()
-                
-                # Only step optimizer after accumulating gradients
-                if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                    # Gradient clipping
-                    if hasattr(config, 'max_grad_norm') and config.max_grad_norm > 0:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                    
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-                    scheduler.step()
-                    global_step += 1
-            else:
-                # Standard forward and backward pass
-                outputs = model(**batch)
-                loss_dict = loss_fn(outputs, batch)
-                loss = loss_dict['loss'] / gradient_accumulation_steps
-                
-                loss.backward()
-                
-                # Only step optimizer after accumulating gradients
-                if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                    # Gradient clipping
-                    if hasattr(config, 'max_grad_norm') and config.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                    
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    scheduler.step()
-                    global_step += 1
-            
-            # Update metrics
-            train_loss += loss.item() * gradient_accumulation_steps
-            train_steps += 1
-            
-            # Update progress bar
-            train_iterator.set_postfix({
-                'loss': f"{loss.item():.4f}", 
-                'lr': f"{scheduler.get_last_lr()[0]:.7f}"
-            })
-            
-            # Log training metrics
-            if global_step > 0 and hasattr(config, 'log_interval') and global_step % config.log_interval == 0:
-                logger.log_metrics({
-                    'dataset': dataset_name,
-                    'epoch': epoch + 1,
-                    'train_loss': loss.item(),
-                    'learning_rate': scheduler.get_last_lr()[0]
-                }, global_step)
-            
-            # Evaluate model periodically
-            if global_step > 0 and hasattr(config, 'eval_interval') and global_step % config.eval_interval == 0:
-                val_metrics = evaluate(model, val_loader, loss_fn, device, metrics)
-                
-                # Log validation metrics
-                val_metrics['dataset'] = dataset_name
-                val_metrics['epoch'] = epoch + 1
-                logger.log_metrics(val_metrics, global_step)
-                
-                # Check if this is the best model
-                if val_metrics.get('overall_f1', 0) > best_f1:
-                    best_f1 = val_metrics.get('overall_f1', 0)
-                    
-                    # Save best model
-                    os.makedirs('checkpoints', exist_ok=True)
-                    torch.save(
-                        model.state_dict(), 
-                        f"checkpoints/{config.experiment_name}_{dataset_name}_best.pt"
-                    )
-                    
-                    logger.log_model(model, {
-                        'dataset': dataset_name,
-                        **val_metrics
-                    })
-                    
-                    print(f"New best model saved with F1 = {best_f1:.4f}")
-                
-                # Back to training mode
-                model.train()
-            
-            # Save model periodically
-            if global_step > 0 and hasattr(config, 'save_interval') and global_step % config.save_interval == 0:
-                os.makedirs('checkpoints', exist_ok=True)
-                torch.save(
-                    model.state_dict(), 
-                    f"checkpoints/{config.experiment_name}_{dataset_name}_last.pt"
-                )
-        
-        # End of epoch evaluation
-        val_metrics = evaluate(model, val_loader, loss_fn, device, metrics)
-        
-        # Log end of epoch metrics
+        # Log metrics
         val_metrics['dataset'] = dataset_name
         val_metrics['epoch'] = epoch + 1
-        val_metrics['train_loss'] = train_loss / train_steps
+        val_metrics['train_loss'] = train_loss
+        val_metrics['phase'] = phase
         logger.log_metrics(val_metrics, global_step)
         
-        # Visualize attention if needed and available
-        if epoch % config.viz_interval == 0:
-            try:
-                attention_weights = trainer.get_attention_weights(val_loader)
-                if attention_weights is not None:
-                    # Create visualizations directory if it doesn't exist
-                    os.makedirs('visualizations', exist_ok=True)
-                    
-                    visualizer.plot_attention(
-                        attention_weights,
-                        tokens=tokenizer.convert_ids_to_tokens(val_loader.dataset[0]['input_ids']),
-                        save_path=f'visualizations/{dataset_name}_attention_epoch_{epoch}.png'
-                    )
-            except Exception as e:
-                print(f"Warning: Could not visualize attention: {e}")
-        
-        # Print end of epoch summary
-        print(f"Epoch {epoch+1}/{config.num_epochs}:")
-        print(f"  Train Loss: {train_loss/train_steps:.4f}")
-        print(f"  Val Loss: {val_metrics.get('loss', 0):.4f}")
-        print(f"  Val F1: {val_metrics.get('overall_f1', 0):.4f}")
-        print(f"  Best F1: {best_f1:.4f}")
-        
-        # Save model at the end of each epoch
-        torch.save(
-            model.state_dict(), 
-            f"checkpoints/{config.experiment_name}_{dataset_name}_last.pt"
-        )
+        # Check for best model
+        current_f1 = val_metrics.get('overall_f1', 0)
+        if current_f1 > best_f1:
+            best_f1 = current_f1
+            
+            # Save best model
+            checkpoint_path = f"checkpoints/{config.experiment_name}_{dataset_name}_{phase}_best.pt"
+            torch.save(
+                model.state_dict(),
+                checkpoint_path
+            )
+            
+            print(f"New best {phase} model saved with F1 = {best_f1:.4f}")
+    
+    # Save final model
+    torch.save(
+        model.state_dict(),
+        f"checkpoints/{config.experiment_name}_{dataset_name}_{phase}_final.pt"
+    )
     
     return best_f1
 
-def evaluate(model, dataloader, loss_fn, device, metrics):
-    """Evaluate model on a dataloader"""
-    model.eval()
-    metrics.reset()
-    
+def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, config, 
+               logger, global_step, epoch, dataset_name, phase, generate):
+    """Train for one epoch"""
+    model.train()
     total_loss = 0.0
     num_batches = 0
     
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            # Move batch to device
-            batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+    # Use tqdm for progress bar
+    progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1} ({phase})")
+    
+    for batch_idx, batch in enumerate(progress_bar):
+        try:
+            # Move batch to device - only tensor values
+            batch_on_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                             for k, v in batch.items()}
             
+            # Forward pass
+            outputs = model(**batch_on_device, generate=generate)
             
-            # In train.py, update the forward pass to include generation
-            outputs = model(
-                **batch,
-                generate=config.generate_explanations
-            )
-
-            loss_dict = loss_fn(outputs, batch, generate=config.generate_explanations)
-                       
+            # Calculate loss
+            loss_dict = loss_fn(outputs, batch_on_device, generate=generate)
+            loss = loss_dict['loss']
+            
+            # Backward pass and optimize
+            loss.backward()
+            
+            # Gradient accumulation
+            if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
+                # Gradient clipping
+                if hasattr(config, 'max_grad_norm') and config.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                
+                # Update parameters
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
             
             # Update metrics
-            metrics.update(outputs, batch)
-            total_loss += loss_dict['loss'].item()
+            total_loss += loss.item()
             num_batches += 1
+            
+            # Update progress bar
+            progress_bar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'lr': f"{scheduler.get_last_lr()[0]:.7f}"
+            })
+            
+            # Log metrics periodically
+            if batch_idx % config.log_interval == 0:
+                step = global_step + batch_idx
+                logger.log_metrics({
+                    'dataset': dataset_name,
+                    'phase': phase,
+                    'epoch': epoch + 1,
+                    'batch': batch_idx,
+                    'train_batch_loss': loss.item(),
+                    'train_aspect_loss': loss_dict.get('aspect_loss', 0.0),
+                    'train_opinion_loss': loss_dict.get('opinion_loss', 0.0),
+                    'train_sentiment_loss': loss_dict.get('sentiment_loss', 0.0),
+                    'learning_rate': scheduler.get_last_lr()[0],
+                    'generate': generate
+                }, step)
+                
+        except Exception as e:
+            print(f"Error in batch {batch_idx}: {e}")
+            traceback.print_exc()
+            continue
     
-    # Compute metrics
-    eval_metrics = metrics.compute()
-    eval_metrics['loss'] = total_loss / num_batches
+    # Return average loss
+    return total_loss / max(1, num_batches)
+
+def evaluate(model, val_loader, loss_fn, device, generate=False):
+    """Evaluate model on validation data"""
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
     
-    return eval_metrics
+    # Metrics tracking
+    aspect_preds, opinion_preds, sentiment_preds = [], [], []
+    aspect_labels, opinion_labels, sentiment_labels = [], [], []
+    
+    with torch.cuda.amp.autocast(enabled=config.use_fp16):
+        for batch in tqdm(val_loader, desc="Evaluating"):
+            try:
+                # Move batch to device - only tensor values
+                batch_on_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                                for k, v in batch.items()}
+                
+   
+                # Forward pass
+                outputs = model(**batch_on_device, generate=generate)
+                
+                # Calculate loss
+                loss_dict = loss_fn(outputs, batch_on_device, generate=generate)
+                
+                # Update metrics
+                total_loss += loss_dict['loss'].item()
+                num_batches += 1
+                
+                # Get predictions and labels for metrics
+                # Flatten aspect and opinion logits to get the predictions
+                aspect_pred = outputs['aspect_logits'].argmax(dim=-1).cpu()
+                opinion_pred = outputs['opinion_logits'].argmax(dim=-1).cpu()
+                sentiment_pred = outputs['sentiment_logits'].argmax(dim=-1).cpu()
+                
+                # Get labels - handle multi-span case
+                aspect_label = batch['aspect_labels'].cpu()
+                if len(aspect_label.shape) == 3 and aspect_label.size(1) > 0:
+                    aspect_label = aspect_label[:, 0]  # Use first span
+                    
+                opinion_label = batch['opinion_labels'].cpu()
+                if len(opinion_label.shape) == 3 and opinion_label.size(1) > 0:
+                    opinion_label = opinion_label[:, 0]  # Use first span
+                    
+                sentiment_label = batch['sentiment_labels'].cpu()
+                if len(sentiment_label.shape) > 1 and sentiment_label.size(1) > 0:
+                    sentiment_label = sentiment_label[:, 0]  # Use first span
+                
+                # Store predictions and labels
+                aspect_preds.append(aspect_pred)
+                opinion_preds.append(opinion_pred)
+                sentiment_preds.append(sentiment_pred)
+                
+                aspect_labels.append(aspect_label)
+                opinion_labels.append(opinion_label)
+                sentiment_labels.append(sentiment_label)
+                
+            except Exception as e:
+                print(f"Error in evaluation batch: {e}")
+                traceback.print_exc()
+                continue
+    
+    # Calculate metrics
+    metrics = calculate_metrics(
+        aspect_preds, opinion_preds, sentiment_preds,
+        aspect_labels, opinion_labels, sentiment_labels
+    )
+    
+    # Add loss
+    metrics['loss'] = total_loss / max(1, num_batches)
+    
+    return metrics
 
-# Updated portion of train.py's main function to handle wandb issues
+def calculate_metrics(aspect_preds, opinion_preds, sentiment_preds,
+                     aspect_labels, opinion_labels, sentiment_labels):
+    """Calculate metrics for evaluation"""
+    try:
+        metrics = {}
+        
+        # Calculate aspect metrics
+        aspect_precision, aspect_recall, aspect_f1 = calculate_span_metrics(
+            aspect_preds, aspect_labels, 'aspect'
+        )
+        
+        # Calculate opinion metrics
+        opinion_precision, opinion_recall, opinion_f1 = calculate_span_metrics(
+            opinion_preds, opinion_labels, 'opinion'
+        )
+        
+        # Calculate sentiment metrics
+        sentiment_accuracy = calculate_sentiment_metrics(
+            sentiment_preds, sentiment_labels
+        )
+        
+        # Add all metrics to dict
+        metrics.update({
+            'aspect_precision': aspect_precision,
+            'aspect_recall': aspect_recall,
+            'aspect_f1': aspect_f1,
+            'opinion_precision': opinion_precision,
+            'opinion_recall': opinion_recall,
+            'opinion_f1': opinion_f1,
+            'sentiment_accuracy': sentiment_accuracy,
+            'sentiment_f1': sentiment_accuracy  # For consistency
+        })
+        
+        # Calculate overall F1
+        metrics['overall_f1'] = (aspect_f1 + opinion_f1 + sentiment_accuracy) / 3
+        
+        return metrics
+    except Exception as e:
+        print(f"Error calculating metrics: {e}")
+        traceback.print_exc()
+        # Return default metrics
+        return {
+            'aspect_precision': 0.0,
+            'aspect_recall': 0.0,
+            'aspect_f1': 0.0,
+            'opinion_precision': 0.0,
+            'opinion_recall': 0.0,
+            'opinion_f1': 0.0,
+            'sentiment_accuracy': 0.0,
+            'sentiment_f1': 0.0,
+            'overall_f1': 0.0
+        }
 
-# This should replace the beginning part of the main() function in train.py
+def calculate_span_metrics(preds, labels, prefix):
+    """Calculate precision, recall, F1 for span detection"""
+    tp, fp, fn = 0, 0, 0
+    
+    for batch_preds, batch_labels in zip(preds, labels):
+        # Only consider valid tokens (not padding)
+        valid_mask = batch_labels != -100
+        
+        # Get predictions and labels for valid tokens
+        batch_preds = batch_preds[valid_mask]
+        batch_labels = batch_labels[valid_mask]
+        
+        # Calculate true positives, false positives, false negatives
+        tp += ((batch_preds > 0) & (batch_labels > 0)).sum().item()
+        fp += ((batch_preds > 0) & (batch_labels == 0)).sum().item()
+        fn += ((batch_preds == 0) & (batch_labels > 0)).sum().item()
+    
+    # Calculate metrics
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    
+    return precision, recall, f1
+
+def calculate_sentiment_metrics(preds, labels):
+    """Calculate accuracy for sentiment classification"""
+    correct = 0
+    total = 0
+    
+    for batch_preds, batch_labels in zip(preds, labels):
+        # Only consider valid labels (not padding)
+        valid_mask = batch_labels != -100
+        
+        # Get predictions and labels for valid items
+        batch_preds = batch_preds[valid_mask]
+        batch_labels = batch_labels[valid_mask]
+        
+        # Calculate correct predictions
+        correct += (batch_preds == batch_labels).sum().item()
+        total += batch_labels.numel()
+    
+    # Calculate accuracy
+    accuracy = correct / total if total > 0 else 0
+    return accuracy
 
 def main():
-    parser = argparse.ArgumentParser(description='Train ABSA model')
+    parser = argparse.ArgumentParser(description='Train Generative ABSA Model')
     parser.add_argument('--config', type=str, default=None, help='Path to config file')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--dataset', type=str, default=None, help='Specific dataset to train on')
@@ -346,9 +515,12 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=None, help='Learning rate')
     parser.add_argument('--batch_size', type=int, default=None, help='Batch size')
     parser.add_argument('--hidden_size', type=int, default=None, help='Hidden size')
-    parser.add_argument('--dropout', type=float, default=None, help='Dropout rate')
     parser.add_argument('--model', type=str, default=None, help='Model to use (overrides config)')
     parser.add_argument('--no_wandb', action='store_true', help='Disable wandb logging')
+    parser.add_argument('--single_phase', action='store_true', help='Use single phase training (no separate extraction phase)')
+    parser.add_argument('--debug', action='store_true', help='Run in debug mode with fewer samples')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Gradient accumulation steps')
+    parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm for clipping')
     args = parser.parse_args()
     
     # Set random seed
@@ -364,45 +536,34 @@ def main():
         config.batch_size = args.batch_size
     if args.hidden_size is not None:
         config.hidden_size = args.hidden_size
-    if args.dropout is not None:
-        config.dropout = args.dropout
     if args.model is not None:
         config.model_name = args.model
     
+    # Debug mode settings
+    if args.debug:
+        config.num_epochs = 1
+        config.batch_size = min(4, config.batch_size)
+        config.log_interval = 1
+    
     # Create directories for outputs
     os.makedirs('checkpoints', exist_ok=True)
-    os.makedirs('wandb_logs', exist_ok=True)
+    os.makedirs('logs', exist_ok=True)
     
-    # Initialize W&B logger with error handling
+    # Initialize W&B logger
     logger = WandbLogger(config, use_wandb=not args.no_wandb)
     
-    # Initialize tokenizer with fallback options
+    # Initialize tokenizer
     print(f"Loading tokenizer from: {config.model_name}")
-    tokenizer = None
-    
-    # List of models to try in order
-    models_to_try = [
-        config.model_name,  # First try the configured model
-        "google/flan-t5-base",  # Then try a known good T5 model
-        "bert-base-uncased",   # Finally try BERT as a last resort
-    ]
-    
-    for model_name in models_to_try:
-        try:
-            print(f"Attempting to load tokenizer from {model_name}...")
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
-                use_fast=True
-            )
-            if tokenizer is not None:
-                print(f"Successfully loaded tokenizer from {model_name}")
-                config.model_name = model_name  # Update the config
-                break
-        except Exception as e:
-            print(f"Error loading tokenizer from {model_name}: {e}")
-    
-    if tokenizer is None:
-        raise RuntimeError("Failed to load any tokenizer. Cannot continue.")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model_name,
+            use_fast=True
+        )
+        print(f"Successfully loaded tokenizer from {config.model_name}")
+    except Exception as e:
+        print(f"Error loading tokenizer from {config.model_name}: {e}")
+        print("Falling back to bert-base-uncased tokenizer")
+        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     
     # Add special tokens if needed
     special_tokens = {}
@@ -418,12 +579,6 @@ def main():
     if special_tokens:
         tokenizer.add_special_tokens(special_tokens)
     
-    # Add task-specific tokens if they don't exist
-    task_tokens = ["[AT]", "[OT]", "[AC]", "[SP]"]
-    tokens_to_add = [token for token in task_tokens if token not in tokenizer.get_vocab()]
-    if tokens_to_add:
-        tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
-    
     # Set device
     if args.device:
         device = torch.device(args.device)
@@ -432,9 +587,7 @@ def main():
         print(f"Using GPU: {torch.cuda.get_device_name(0)}")
     else:
         device = torch.device('cpu')
-        print("Using CPU - training will be very slow")
-
-    # Rest of the main function remains unchanged...
+        print("Using CPU for training (this will be slow)")
     
     # Train on each dataset or a specific one
     datasets = [args.dataset] if args.dataset else config.datasets
@@ -443,11 +596,17 @@ def main():
     for dataset_name in datasets:
         try:
             print(f"\nTraining on dataset: {dataset_name}")
-            best_f1 = train_dataset(config, tokenizer, logger, dataset_name, device)
+            best_f1 = train_dataset(
+                config=config, 
+                tokenizer=tokenizer, 
+                logger=logger, 
+                dataset_name=dataset_name, 
+                device=device,
+                two_phase=not args.single_phase
+            )
             results[dataset_name] = best_f1
         except Exception as e:
             print(f"Error training on {dataset_name}: {e}")
-            import traceback
             traceback.print_exc()
             results[dataset_name] = "Failed"
     
@@ -456,7 +615,7 @@ def main():
     for dataset, f1 in results.items():
         print(f"{dataset}: Best F1 = {f1}")
     
-    # End W&B run - this will handle any exceptions
+    # End W&B run
     logger.finish()
 
 if __name__ == '__main__':

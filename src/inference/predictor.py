@@ -1,5 +1,5 @@
 # src/inference/stella_predictor.py
-import torch # type: ignore
+import torch
 from typing import List, Dict, Any, Union, Tuple
 from transformers import AutoTokenizer
 import numpy as np
@@ -50,13 +50,28 @@ class LLMABSAPredictor:
         self.model.to(self.device)
         self.model.eval()
     
-    def predict(self, text: str, domain_id: int = None) -> Dict[str, Any]:
+    def filter_triplets(self, triplets, confidence_threshold=0.6):
+        """Filter low-confidence triplets to improve generation quality"""
+        filtered = [t for t in triplets if t["confidence"] > confidence_threshold]
+        # Always return at least one triplet (the highest confidence one)
+        if not filtered and triplets:
+            filtered = [max(triplets, key=lambda t: t["confidence"])]
+        return filtered
+    
+    def compute_summary_confidence(self, triplets):
+        """Compute overall confidence score for the summary"""
+        if not triplets:
+            return 0.0
+        return sum(t['confidence'] for t in triplets) / len(triplets)
+    
+    def predict(self, text: str, domain_id: int = None, generate=False) -> Dict[str, Any]:
         """
         Predict aspects, opinions and sentiments for input text
         
         Args:
             text: Input text
             domain_id: Optional domain identifier for domain adaptation
+            generate: Whether to generate explanations
             
         Returns:
             Dictionary with predicted aspects, opinions, sentiments, and confidence scores
@@ -71,10 +86,37 @@ class LLMABSAPredictor:
         
         # Get predictions
         with torch.no_grad():
-            outputs = self.model(**inputs)
+            # Store hidden states if we're generating explanations
+            if generate:
+                # Pass generate flag to model
+                outputs = self.model(**inputs, generate=True)
+            else:
+                outputs = self.model(**inputs)
             
         # Post-process outputs
         predictions = self._post_process(outputs, text)
+        
+        # Add summary confidence score
+        predictions['summary_confidence'] = self.compute_summary_confidence(predictions['triplets'])
+        
+        # Generate explanations if requested
+        if generate and hasattr(self.model, 'explanation_generator'):
+            # Filter triplets to improve generation quality
+            filtered_triplets = self.filter_triplets(predictions['triplets'])
+            
+            # Use filtered triplets for explanation generation
+            try:
+                # Re-run with filtered triplets to get explanations
+                with torch.no_grad():
+                    explanation_outputs = self.model(**inputs, 
+                                                   filtered_triplets=filtered_triplets,
+                                                   generate=True)
+                
+                # Add explanations to predictions
+                if 'explanations' in explanation_outputs:
+                    predictions['explanations'] = explanation_outputs['explanations']
+            except Exception as e:
+                print(f"Error generating explanations: {e}")
         
         return predictions
     
@@ -118,13 +160,22 @@ class LLMABSAPredictor:
                 'confidence': float(confidence)
             })
         
-        return {
+        # Get explanations if present in outputs
+        explanations = outputs.get('explanations', None)
+        
+        result = {
             'triplets': triplets,
             'aspects': aspect_spans,
             'opinions': opinion_spans,
             'sentiments': sentiments,
             'confidence': conf_values.tolist() if isinstance(conf_values, np.ndarray) else conf_values
         }
+        
+        # Add explanations if available
+        if explanations is not None:
+            result['explanations'] = explanations
+            
+        return result
     
     def _extract_spans(self, logits: torch.Tensor, text: str) -> List[Tuple[str, List[int]]]:
         """Extract text spans from logits using BIO tags"""

@@ -1,7 +1,14 @@
+<<<<<<< Updated upstream
 # src/models/aspect_opinion_joint_classifier.py
 import torch # type: ignore
 import torch.nn as nn # type: ignore
 import torch.nn.functional as F # type: ignore
+=======
+# src/models/classifier.py
+import torch #type: ignore
+import torch.nn as nn #type: ignore
+import torch.nn.functional as F  #type: ignore
+>>>>>>> Stashed changes
 
 class AspectOpinionJointClassifier(nn.Module):
     """
@@ -59,7 +66,23 @@ class AspectOpinionJointClassifier(nn.Module):
             nn.Sigmoid()
         )
 
-    def forward(self, hidden_states, aspect_logits=None, opinion_logits=None, span_features=None, attention_mask=None):
+    def contrastive_loss(self, features, labels):
+        """Compute contrastive loss to improve sentiment separation"""
+        # Normalize features
+        features = F.normalize(features, p=2, dim=1)
+        # Compute similarity matrix
+        sim_matrix = torch.matmul(features, features.transpose(0, 1))
+        # Create label matrix where 1 means same sentiment
+        label_matrix = (labels.unsqueeze(1) == labels.unsqueeze(0)).float()
+        # Compute contrastive loss with temperature
+        temperature = 0.1
+        sim_matrix = sim_matrix / temperature
+        pos_loss = -torch.log(torch.sigmoid(sim_matrix)).masked_select(label_matrix.bool()).mean()
+        neg_loss = -torch.log(1 - torch.sigmoid(sim_matrix)).masked_select(~label_matrix.bool()).mean()
+        return pos_loss + neg_loss
+
+    def forward(self, hidden_states, aspect_logits=None, opinion_logits=None, span_features=None, 
+                attention_mask=None, sentiment_labels=None):
         """
         Forward pass through the aspect-opinion joint classifier
         
@@ -69,6 +92,14 @@ class AspectOpinionJointClassifier(nn.Module):
             opinion_logits: Opinion logits [batch_size, seq_length, 3]
             span_features: Span features [batch_size, seq_length, hidden_dim]
             attention_mask: Attention mask [batch_size, seq_length]
+<<<<<<< Updated upstream
+=======
+            sentiment_labels: Optional sentiment labels for contrastive learning
+            
+        Returns:
+            tuple: (sentiment_logits, confidence_scores) or 
+                  (sentiment_logits, confidence_scores, contrastive_loss)
+>>>>>>> Stashed changes
         """
         batch_size, seq_len = hidden_states.shape[:2]
         
@@ -78,6 +109,7 @@ class AspectOpinionJointClassifier(nn.Module):
         
         # Get weighted representations using triple attention
         try:
+<<<<<<< Updated upstream
             # Try using the triple attention if available
             aspect_repr, opinion_repr, context_repr = self.triple_attention(
                 hidden_states, aspect_weights, opinion_weights, attention_mask
@@ -228,3 +260,71 @@ class TripleAttention(nn.Module):
         context_output = self.context_out(context_context)
         
         return aspect_output, opinion_output, context_output
+=======
+            batch_size, seq_len, hidden_dim = hidden_states.shape
+            device = hidden_states.device
+            
+            # Create aspect and opinion weights from logits
+            if aspect_logits is not None:
+                # Only consider B and I tags (indices 1 and 2)
+                aspect_weights = torch.softmax(aspect_logits[:, :, 1:], dim=-1).sum(-1)  # [batch_size, seq_len]
+            else:
+                # Use attention if logits not available
+                aspect_attn = self.aspect_attention(hidden_states).squeeze(-1)  # [batch_size, seq_len]
+                if attention_mask is not None:
+                    aspect_attn = aspect_attn.masked_fill(attention_mask == 0, -1e10)
+                aspect_weights = F.softmax(aspect_attn, dim=-1)
+            
+            if opinion_logits is not None:
+                opinion_weights = torch.softmax(opinion_logits[:, :, 1:], dim=-1).sum(-1)
+            else:
+                opinion_attn = self.opinion_attention(hidden_states).squeeze(-1)
+                if attention_mask is not None:
+                    opinion_attn = opinion_attn.masked_fill(attention_mask == 0, -1e10)
+                opinion_weights = F.softmax(opinion_attn, dim=-1)
+            
+            # Apply weights to get span representations
+            aspect_weights = aspect_weights.unsqueeze(-1)  # [batch_size, seq_len, 1]
+            opinion_weights = opinion_weights.unsqueeze(-1)  # [batch_size, seq_len, 1]
+            
+            # Weight hidden states with attention weights
+            aspect_repr = (hidden_states * aspect_weights).sum(dim=1)  # [batch_size, hidden_dim]
+            opinion_repr = (hidden_states * opinion_weights).sum(dim=1)  # [batch_size, hidden_dim]
+            
+            # Use aspect-first ordering if specified
+            if self.use_aspect_first:
+                combined = torch.cat([aspect_repr, opinion_repr], dim=-1)
+            else:
+                combined = torch.cat([opinion_repr, aspect_repr], dim=-1)
+            
+            # Apply fusion
+            fused = self.fusion(combined)  # [batch_size, hidden_dim]
+            
+            # Model relation between aspect and opinion
+            relation = self.relation(aspect_repr, opinion_repr)  # [batch_size, hidden_dim]
+            
+            # Combine fused and relation representations
+            final_repr = torch.cat([fused, relation], dim=-1)  # [batch_size, hidden_dim*2]
+            
+            # Predict sentiment and confidence
+            sentiment_logits = self.classifier(final_repr)  # [batch_size, num_classes]
+            confidence = self.confidence_estimator(final_repr)  # [batch_size, 1]
+            
+            # Add contrastive learning if labels are provided
+            if sentiment_labels is not None:
+                contrastive = self.contrastive_loss(final_repr, sentiment_labels)
+                return sentiment_logits, confidence, contrastive
+            else:
+                return sentiment_logits, confidence
+            
+        except Exception as e:
+            print(f"Error in classifier forward pass: {e}")
+            # Create fallback outputs with correct dimensions
+            sentiment_logits = torch.zeros(batch_size, self.num_classes, device=device)
+            confidence = torch.ones(batch_size, 1, device=device) * 0.5
+            
+            if sentiment_labels is not None:
+                return sentiment_logits, confidence, torch.tensor(0.0, device=device)
+            else:
+                return sentiment_logits, confidence
+>>>>>>> Stashed changes

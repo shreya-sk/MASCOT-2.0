@@ -155,10 +155,10 @@ class GenerativeLLMABSA(nn.Module):
             
             # Use the span detector if possible, otherwise create dummy outputs
             try:
-                aspect_logits, opinion_logits, span_features = self.span_detector(
-                    hidden_states=hidden_states, 
-                    attention_mask=attention_mask
-                )
+                aspect_logits, opinion_logits, span_features, boundary_logits = self.span_detector(...)
+                
+                outputs['boundary_logits'] = boundary_logits
+                
             except Exception as e:
                 print(f"Error in span detector forward pass: {e}")
                 # Create dummy logits

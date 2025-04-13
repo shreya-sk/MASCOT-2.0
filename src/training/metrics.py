@@ -162,3 +162,18 @@ class ABSAMetrics:
             f'{prefix}_recall': float(recall),
             f'{prefix}_f1': float(f1)
         }
+    # Add to metrics.py
+    def compute_faithfulness_score(triplets, generated_summary):
+        """Compute faithfulness score between triplets and generated summary"""
+        # Create reference text from triplets
+        reference = ""
+        for t in triplets:
+            aspect = t['aspect']
+            opinion = t['opinion']
+            sentiment = {"POS": "positive", "NEU": "neutral", "NEG": "negative"}[t['sentiment']]
+            reference += f"The {aspect} is {sentiment} because of the {opinion}. "
+        
+        # Use BERTScore to compute similarity
+        from bert_score import score
+        P, R, F1 = score([generated_summary], [reference], lang="en", return_hash=False)
+        return F1.item()  # Return F1 as faithfulness score
