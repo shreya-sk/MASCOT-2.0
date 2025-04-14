@@ -25,6 +25,21 @@ class LLMABSA(nn.Module):
         # Initialize embeddings
         self.embeddings = LLMEmbedding(config)
         
+        # Get the actual embedding output dimension
+        embedding_size = getattr(self.embeddings, 'model_hidden_size', config.hidden_size)
+        
+        # Set the embedding size in config for other components to use
+        config.embedding_size = embedding_size
+        
+        # Update hidden size to match embedding size - IMPORTANT!
+        config.hidden_size = embedding_size
+        self.hidden_size = embedding_size
+        
+        print(f"Using embedding size {embedding_size} as the hidden size")
+        
+        # No dimension adapter needed anymore
+        self.dim_adapter = None
+        
         # Initialize span detector for aspect and opinion extraction
         self.span_detector = SpanDetector(config)
         
@@ -35,7 +50,6 @@ class LLMABSA(nn.Module):
             dropout=config.dropout,
             num_classes=3
         )
-        
         # Safe initialization of weights
         self._initialize_weights()
         
@@ -81,6 +95,8 @@ class LLMABSA(nn.Module):
             # Extract hidden states
             hidden_states = self._extract_hidden_states(embeddings_output)
             
+            # No dimension adapter needed
+            
             # Get aspect and opinion spans
             aspect_logits, opinion_logits, span_features, boundary_logits = self.span_detector(
                 hidden_states,
@@ -92,7 +108,8 @@ class LLMABSA(nn.Module):
                 hidden_states,
                 aspect_logits,
                 opinion_logits,
-                attention_mask
+                attention_mask,
+                input_ids=input_ids  # Pass input_ids for additional rule-based processing
             )
             
             # Return all outputs
@@ -125,7 +142,6 @@ class LLMABSA(nn.Module):
                 'sentiment_logits': torch.zeros(batch_size, 3, device=device),
                 'confidence_scores': torch.ones(batch_size, 1, device=device)
             }
-    
     def save(self, save_path):
         """Save model with proper metadata"""
         os.makedirs(os.path.dirname(save_path), exist_ok=True)

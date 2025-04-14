@@ -21,7 +21,11 @@ class LLMEmbedding(nn.Module):
             # Use new 2025 optimized loading techniques with advanced quantization
             model_config = AutoConfig.from_pretrained(self.model_name)
             
-            # 4-bit quantization with improved stability (2025 technique)
+            # Store the model's actual hidden size
+            self.model_hidden_size = model_config.hidden_size
+            print(f"Loaded model with hidden size: {self.model_hidden_size}")
+            
+       
             if getattr(config, 'use_quantization', True):
                 print(f"Loading {self.model_name} with 4-bit quantization")
                 

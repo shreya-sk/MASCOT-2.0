@@ -28,13 +28,13 @@ class AspectOpinionJointClassifier(nn.Module):
             nn.Linear(input_dim // 2, 1)
         )
         
-        # Feature fusion
+        # Feature fusion - adapt to the actual input dimensions
         self.fusion = nn.Sequential(
-            nn.Linear(input_dim * 2, hidden_dim),
+            nn.Linear(input_dim * 2, hidden_dim),  # This handles combining the two vectors
             nn.GELU(),
             nn.Dropout(dropout)
         )
-        
+            
         # Sentiment classifier with balanced initialization
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),

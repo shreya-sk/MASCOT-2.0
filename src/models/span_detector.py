@@ -13,15 +13,21 @@ class SpanDetector(nn.Module):
         self.hidden_dim = config.hidden_size
         self.dropout_rate = getattr(config, 'dropout', 0.1)
         
+        # Get the actual input dimension - this is crucial
+        # Use embedding_size if available, otherwise use hidden_size
+        input_size = getattr(config, 'embedding_size', self.hidden_dim)
+        
         # Simple recurrent layer (GRU is more memory efficient)
         self.rnn = nn.GRU(
-            input_size=self.hidden_dim,
+            input_size=input_size,  # Changed to use the actual embedding size
             hidden_size=self.hidden_dim // 2,
             num_layers=1,
             bidirectional=True,
             batch_first=True,
             dropout=0
         )
+        
+        print(f"SpanDetector RNN input size: {input_size}, output size: {self.hidden_dim}")
         
         # Aspect classifier with strong bias for aspect detection
         self.aspect_classifier = nn.Sequential(
@@ -38,7 +44,6 @@ class SpanDetector(nn.Module):
             nn.Dropout(self.dropout_rate),
             nn.Linear(self.hidden_dim, 3)  # B-I-O tags
         )
-        
         # Initialize with strong bias for aspects and opinions
         self._initialize_with_bias()
         
