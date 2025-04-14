@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 class AspectOpinionJointClassifier(nn.Module):
     """
-    Improved aspect-opinion joint classifier with balanced sentiment prediction
+    Improved aspect-opinion joint classifier with context-aware sentiment prediction
     """
     def __init__(self, input_dim, hidden_dim, dropout=0.1, num_classes=3):
         super().__init__()
@@ -14,14 +14,14 @@ class AspectOpinionJointClassifier(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_classes = num_classes
         
-        # Attention for aspects
+        # Enhanced attention for aspects
         self.aspect_attention = nn.Sequential(
             nn.Linear(input_dim, input_dim // 2),
             nn.Tanh(),
             nn.Linear(input_dim // 2, 1)
         )
         
-        # Attention for opinions
+        # Enhanced attention for opinions
         self.opinion_attention = nn.Sequential(
             nn.Linear(input_dim, input_dim // 2),
             nn.Tanh(),
@@ -43,8 +43,13 @@ class AspectOpinionJointClassifier(nn.Module):
             nn.Linear(hidden_dim // 2, num_classes)
         )
         
-        # Initialize sentiment classifier with no bias toward any class
-        self.classifier[-1].bias.data.zero_()
+        # Initialize sentiment classifier with balanced class bias
+        # Small positive bias for positive sentiment (index 0)
+        self.classifier[-1].bias.data[0] = 0.2
+        # Zero bias for neutral sentiment (index 1)
+        self.classifier[-1].bias.data[1] = 0.0
+        # Small negative bias for negative sentiment (index 2)
+        self.classifier[-1].bias.data[2] = -0.1
         
         # Confidence estimator
         self.confidence_estimator = nn.Sequential(
@@ -59,19 +64,52 @@ class AspectOpinionJointClassifier(nn.Module):
         self.negative_words = set([
             'bad', 'terrible', 'poor', 'awful', 'mediocre', 'disappointing', 
             'horrible', 'disgusting', 'unpleasant', 'worst', 'cold', 'slow',
-            'overpriced', 'expensive', 'rude', 'unfriendly', 'dirty', 'noisy'
+            'overpriced', 'expensive', 'rude', 'unfriendly', 'dirty', 'noisy',
+            'bland', 'tasteless', 'burnt', 'bitter', 'stale', 'greasy', 'salty',
+            'tough', 'dry', 'chewy', 'undercooked', 'overcooked', 'lukewarm',
+            'small', 'tiny', 'skimpy', 'messy', 'chaotic', 'crowded', 'loud',
+            'mistake', 'error', 'wrong', 'unhappy', 'upset', 'annoyed', 'angry',
+            'waste', 'pricey', 'steep', 'outrageous', 'ridiculous', 'absurd',
+            'avoid', 'never', 'skip', 'pass', 'problem', 'issue', 'complaint'
         ])
         
         self.positive_words = set([
             'good', 'great', 'excellent', 'amazing', 'fantastic', 'wonderful',
             'delicious', 'tasty', 'fresh', 'friendly', 'helpful', 'nice',
-            'best', 'perfect', 'favorite', 'loved', 'enjoy', 'clean', 'quick'
+            'best', 'perfect', 'favorite', 'loved', 'enjoy', 'clean', 'quick',
+            'outstanding', 'superb', 'exceptional', 'stellar', 'divine', 'heavenly',
+            'delightful', 'sublime', 'impressive', 'extraordinary', 'phenomenal',
+            'remarkable', 'splendid', 'marvelous', 'exquisite', 'delectable',
+            'flavorful', 'savory', 'juicy', 'tender', 'succulent', 'authentic',
+            'generous', 'huge', 'large', 'massive', 'ample', 'abundant', 'plentiful',
+            'attentive', 'courteous', 'professional', 'knowledgeable', 'prompt',
+            'efficient', 'speedy', 'fast', 'quick', 'reasonable', 'affordable',
+            'worth', 'value', 'bargain', 'deal', 'recommend', 'return', 'satisfied'
         ])
         
+        # Negation words that can flip sentiment
+        self.negation_words = set([
+            'not', 'no', 'never', 'none', 'neither', 'nor', "n't", 'without',
+            'barely', 'hardly', 'rarely', 'seldom', 'cannot', "can't", "didn't",
+            "doesn't", "don't", "wasn't", "weren't", "wouldn't", "couldn't",
+            "shouldn't", "isn't", "aren't", "hasn't", "haven't", "won't"
+        ])
+        
+        # Intensifiers that can strengthen sentiment
+        self.intensifiers = set([
+            'very', 'really', 'extremely', 'incredibly', 'absolutely', 'truly',
+            'completely', 'totally', 'utterly', 'particularly', 'especially',
+            'exceptionally', 'remarkably', 'notably', 'decidedly', 'genuinely',
+            'thoroughly', 'entirely', 'fully', 'highly', 'greatly', 'immensely',
+            'intensely', 'exceedingly', 'supremely', 'terribly', 'awfully',
+            'insanely', 'super', 'so', 'too', 'quite', 'rather', 'pretty'
+        ])
+        
+# Update this in src/models/classifier.py
     def forward(self, hidden_states, aspect_logits=None, opinion_logits=None, 
-                attention_mask=None, sentiment_labels=None, input_ids=None):
+                attention_mask=None, sentiment_labels=None, input_ids=None, tokenizer=None):
         """
-        Forward pass through the sentiment classifier
+        Forward pass through the sentiment classifier with enhanced error handling
         
         Args:
             hidden_states: Encoder hidden states [batch_size, seq_len, hidden_dim]
@@ -80,13 +118,25 @@ class AspectOpinionJointClassifier(nn.Module):
             attention_mask: Attention mask [batch_size, seq_len]
             sentiment_labels: Optional sentiment labels
             input_ids: Optional input token IDs for rule-based enhancement
+            tokenizer: Optional tokenizer for decoding token IDs
             
         Returns:
             tuple: (sentiment_logits, confidence_scores)
         """
         try:
+            # Verify input dimensions
+            if hidden_states is None:
+                raise ValueError("hidden_states is None")
+                
             batch_size, seq_len, hidden_dim = hidden_states.shape
             device = hidden_states.device
+            
+            # Print debug info
+            # print(f"Hidden states shape: {hidden_states.shape}")
+            # if aspect_logits is not None:
+            #     print(f"Aspect logits shape: {aspect_logits.shape}")
+            # if opinion_logits is not None:
+            #     print(f"Opinion logits shape: {opinion_logits.shape}")
             
             # Create aspect and opinion weights from logits or attention
             # For aspect weights
@@ -136,57 +186,111 @@ class AspectOpinionJointClassifier(nn.Module):
             aspect_repr = (hidden_states * aspect_weights).sum(dim=1)  # [batch_size, hidden_dim]
             opinion_repr = (hidden_states * opinion_weights).sum(dim=1)  # [batch_size, hidden_dim]
             
-            # Combine aspect and opinion representations
-            combined = torch.cat([aspect_repr, opinion_repr], dim=-1)
-            
-            # Apply fusion
-            fused = self.fusion(combined)  # [batch_size, hidden_dim]
-            
-            # Basic sentiment classification
-            sentiment_logits = self.classifier(fused)  # [batch_size, num_classes]
-            
-            # Apply rule-based sentiment modification if input_ids are provided
-            if input_ids is not None and hasattr(self, 'tokenizer'):
-                for b in range(batch_size):
-                    # Analyze opinion tokens for sentiment cues
-                    opinion_indices = torch.where(opinion_weights[b, :, 0] > 0.1)[0]
+            # Check input dimensions
+            if hidden_dim != self.input_dim:
+                print(f"Warning: Hidden dim {hidden_dim} doesn't match expected input dim {self.input_dim}")
+                if hidden_dim > self.input_dim:
+                    # Truncate to expected size
+                    aspect_repr = aspect_repr[:, :self.input_dim]
+                    opinion_repr = opinion_repr[:, :self.input_dim]
+                else:
+                    # Pad to expected size
+                    aspect_pad = torch.zeros(batch_size, self.input_dim - hidden_dim, device=device)
+                    opinion_pad = torch.zeros(batch_size, self.input_dim - hidden_dim, device=device)
+                    aspect_repr = torch.cat([aspect_repr, aspect_pad], dim=1)
+                    opinion_repr = torch.cat([opinion_repr, opinion_pad], dim=1)
                     
-                    if len(opinion_indices) > 0:
-                        has_negative = False
-                        has_positive = False
-                        
-                        for idx in opinion_indices:
-                            if idx < input_ids.size(1):
-                                token_id = input_ids[b, idx].item()
-                                token = self.tokenizer.decode([token_id]).lower().strip()
-                                
-                                if token in self.negative_words:
-                                    has_negative = True
-                                if token in self.positive_words:
-                                    has_positive = True
-                        
-                        # Adjust sentiment logits based on detected terms
-                        if has_negative and not has_positive:
-                            sentiment_logits[b, 2] += 2.0  # Boost negative
-                        elif has_positive and not has_negative:
-                            sentiment_logits[b, 0] += 2.0  # Boost positive
+            # Ensure no NaN or Inf values in representations
+            aspect_repr = torch.nan_to_num(aspect_repr)
+            opinion_repr = torch.nan_to_num(opinion_repr)
             
-            # Rule-based adjustment for common sentiment patterns even without tokenizer
-            # Look at the opinion representation for patterns that suggest sentiment
-            opinion_norm = F.normalize(opinion_repr, p=2, dim=1)
-            
-            # Compute confidence scores
-            confidence = self.confidence_estimator(fused)  # [batch_size, 1]
-            
-            return sentiment_logits, confidence
-            
+            # Combine aspect and opinion representations
+            try:
+                combined = torch.cat([aspect_repr, opinion_repr], dim=-1)
+                
+                # Apply fusion
+                fused = self.fusion(combined)  # [batch_size, hidden_dim]
+                
+                # Basic sentiment classification
+                sentiment_logits = self.classifier(fused)  # [batch_size, num_classes]
+                
+                # Apply rule-based sentiment analysis if input_ids and tokenizer are available
+                if input_ids is not None and tokenizer is not None:
+                    sentiment_logits = self._apply_sentiment_rules(
+                        input_ids, tokenizer, aspect_weights, opinion_weights, sentiment_logits
+                    )
+                
+                # Compute confidence scores
+                confidence = self.confidence_estimator(fused)  # [batch_size, 1]
+                
+                return sentiment_logits, confidence
+            except Exception as e:
+                print(f"Error in sentiment classification: {e}")
+                # Create fallback sentiment logits (balanced)
+                sentiment_logits = torch.ones(batch_size, self.num_classes, device=device) / self.num_classes
+                confidence = torch.ones(batch_size, 1, device=device) * 0.5
+                
+                return sentiment_logits, confidence
+                
         except Exception as e:
-            print(f"Error in classifier forward pass: {e}")
+            print(f"Critical error in classifier forward pass: {e}")
             import traceback
             traceback.print_exc()
             
             # Create fallback outputs with correct dimensions
-            sentiment_logits = torch.zeros(batch_size, self.num_classes, device=device)
+            batch_size = hidden_states.size(0)
+            device = hidden_states.device
+            
+            # Create fallback sentiment logits (balanced)
+            sentiment_logits = torch.ones(batch_size, self.num_classes, device=device) / self.num_classes
             confidence = torch.ones(batch_size, 1, device=device) * 0.5
             
             return sentiment_logits, confidence
+    def _apply_sentiment_rules(self, input_ids, tokenizer, aspect_weights, opinion_weights, sentiment_logits):
+        """Apply enhanced rule-based sentiment analysis"""
+        batch_size = input_ids.size(0)
+        device = input_ids.device
+        
+        for b in range(batch_size):
+            # Get the tokens for this example
+            tokens = [tokenizer.decode([id_val.item()]).lower().strip() for id_val in input_ids[b]]
+            
+            # Find opinion words in this example
+            opinion_indices = torch.where(opinion_weights[b, :, 0] > 0.1)[0].cpu().tolist()
+            
+            # Count positive and negative terms
+            pos_count = 0
+            neg_count = 0
+            
+            # Track negation
+            has_negation = False
+            
+            # Check each opinion token
+            for idx in opinion_indices:
+                if idx < len(tokens):
+                    token = tokens[idx]
+                    
+                    # Check for negation words before this opinion
+                    for prev_idx in range(max(0, idx-3), idx):
+                        if prev_idx < len(tokens) and tokens[prev_idx] in self.negation_words:
+                            has_negation = True
+                            break
+                    
+                    # Adjust sentiment counts based on token and negation
+                    if token in self.positive_words:
+                        if has_negation:
+                            neg_count += 1
+                        else:
+                            pos_count += 1
+                    
+                    if token in self.negative_words:
+                        if has_negation:
+                            pos_count += 1
+                        else:
+                            neg_count += 1
+                    
+                    # Check for intensifiers before this opinion
+                    for prev_idx in range(max(0, idx-2), idx):
+                        if prev_idx < len(tokens) and tokens[prev_idx] in self.intensifiers:
+                            if token in self.positive_words and not has_negation:
+                                pos_count += 1  # Extra weight

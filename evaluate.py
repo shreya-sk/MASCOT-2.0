@@ -1,463 +1,332 @@
+#!/usr/bin/env python
 # evaluate.py
+import argparse
 import torch
-import numpy as np
-import os
 import json
+import os
+import numpy as np
 from tqdm import tqdm
 from transformers import AutoTokenizer
-from src.models.absa import LLMABSA
+from nltk.translate.bleu_score import sentence_bleu
+from rouge import Rouge
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+
 from src.utils.config import LLMABSAConfig
 from src.inference.predictor import LLMABSAPredictor
-from sklearn.metrics import precision_recall_fscore_support
-from nltk.translate.bleu_score import sentence_bleu
-from nltk.translate.bleu_score import SmoothingFunction
-from rouge import Rouge
-import nltk
-from src.data.dataset import ABSADataset
-from src.data.preprocessor import LLMABSAPreprocessor
 
-# Ensure NLTK resources are available
-try:
-    nltk.download('punkt', quiet=True)
-except:
-    print("NLTK download failed, but continuing anyway")
-
-# In evaluate.py, update the load_model function:
-
-def load_model(args, config, device):
-    """Load model from checkpoint or create a new one"""
-    if args.model:
-        # Try alternate paths
-        model_path = args.model
-        if not os.path.exists(model_path):
-            # List of potential paths to try
-            alt_paths = [
-                f"checkpoints/ultra-lightweight-absa_{args.dataset}_generation_best.pt",
-                f"checkpoints/ultra_lightweight_absa_{args.dataset}_generation_best.pt",
-                f"checkpoints/ultra-lightweight-absa_{args.dataset}_generation_final.pt",
-                f"checkpoints/ultra_lightweight_absa_{args.dataset}_generation_final.pt"
-            ]
-            
-            for alt_path in alt_paths:
-                if os.path.exists(alt_path):
-                    model_path = alt_path
-                    print(f"Found model at alternate path: {model_path}")
-                    break
-        
-        if os.path.exists(model_path):
-            print(f"Loading model from {model_path}")
-            try:
-                model = LLMABSA(config)  # Create the model first
-                # Use strict=False to ignore missing/unexpected keys
-                model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
-                model.to(device)
-                print("Model loaded successfully with strict=False (ignoring architecture differences)")
-                return model
-            except Exception as e:
-                print(f"Error loading model: {e}")
-                import traceback
-                traceback.print_exc()
+def calculate_span_metrics(pred_spans, gold_spans):
+    """Calculate precision, recall, F1 for span extraction"""
+    # Convert gold spans to lowercase text for matching
+    gold_spans_text = [span.lower() for span in gold_spans if span]
+    pred_spans_text = [span.lower() for span in pred_spans if span]
     
-    # Create new model as fallback
-    print("Creating untrained model for testing")
-    model = LLMABSA(config)
-    model.to(device)
-    return model
-
-def load_test_data(dataset_name="rest15", num_samples=None):
-    """
-    Load test data from the dataset
-    
-    Args:
-        dataset_name: Name of the dataset to load
-        num_samples: Number of samples to load (None for all)
-    """
-    # Initialize config
-    config = LLMABSAConfig()
-    
-    # Initialize tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    
-    # Initialize preprocessor
-    preprocessor = LLMABSAPreprocessor(
-        tokenizer=tokenizer,
-        max_length=config.max_seq_length,
-        use_syntax=False  # Disable syntax for faster loading
-    )
-    
-    # Load test dataset
-    dataset_path = config.dataset_paths.get(dataset_name)
-    if not dataset_path:
-        raise ValueError(f"Dataset {dataset_name} not found in config.")
-    
-    test_dataset = ABSADataset(
-        data_dir=dataset_path,
-        tokenizer=tokenizer,
-        preprocessor=preprocessor,
-        split='test',
-        dataset_name=dataset_name,
-        max_length=config.max_seq_length
-    )
-    
-    # Convert dataset to list for easy processing
-    test_data = []
-    for i in range(len(test_dataset)):
-        if num_samples is not None and i >= num_samples:
-            break
-            
-        sample = test_dataset[i]
-        
-        # Get the original text
-        text = sample.get('text', "")
-        
-        # Prepare labels
-        aspect_labels = sample['aspect_labels']
-        opinion_labels = sample['opinion_labels']
-        sentiment_labels = sample['sentiment_labels']
-        
-        # Create a sample dict
-        sample_dict = {
-            'text': text,
-            'aspect_labels': aspect_labels,
-            'opinion_labels': opinion_labels,
-            'sentiment_labels': sentiment_labels,
-            'input_ids': sample['input_ids'],
-            'attention_mask': sample['attention_mask']
-        }
-        
-        test_data.append(sample_dict)
-    
-    print(f"Loaded {len(test_data)} test samples from {dataset_name}")
-    return test_data
-
-def extract_spans(logits):
-    """
-    Extract spans from logits
-    
-    Args:
-        logits: Token classification logits [seq_len, 3]
-        
-    Returns:
-        spans: List of extracted spans
-    """
-    # Get predictions (B-I-O)
-    preds = logits.argmax(dim=-1)  # [seq_len]
-    
-    # Extract spans
-    spans = []
-    current_span = []
-    
-    for i, pred in enumerate(preds):
-        pred_item = pred.item() if isinstance(pred, torch.Tensor) else pred
-        
-        if pred_item == 1:  # B tag
-            if current_span:
-                spans.append(current_span)
-            current_span = [i]
-        elif pred_item == 2:  # I tag
-            if current_span:
-                current_span.append(i)
-        else:  # O tag
-            if current_span:
-                spans.append(current_span)
-                current_span = []
-    
-    # Don't forget the last span
-    if current_span:
-        spans.append(current_span)
-        
-    return spans
-
-def compute_bleu_score(reference, candidate):
-    """
-    Compute BLEU score between reference and candidate
-    
-    Args:
-        reference: Reference text (ground truth)
-        candidate: Candidate text (generated)
-        
-    Returns:
-        bleu_score: BLEU score
-    """
-    # Tokenize
-    ref_tokens = nltk.word_tokenize(reference.lower())
-    cand_tokens = nltk.word_tokenize(candidate.lower())
-    
-    # Compute BLEU
-    smoothing = SmoothingFunction().method1
-    
-    try:
-        bleu_score = sentence_bleu([ref_tokens], cand_tokens, smoothing_function=smoothing)
-    except:
-        bleu_score = 0.0
-        
-    return bleu_score
-
-def compute_rouge_score(reference, candidate):
-    """
-    Compute ROUGE score between reference and candidate
-    
-    Args:
-        reference: Reference text (ground truth)
-        candidate: Candidate text (generated)
-        
-    Returns:
-        rouge_scores: Dict with ROUGE scores
-    """
-    rouge = Rouge()
-    
-    try:
-        # Ensure there's content to compare
-        if not reference or not candidate:
-            return {'rouge-1': {'f': 0.0}, 'rouge-2': {'f': 0.0}, 'rouge-l': {'f': 0.0}}
-            
-        scores = rouge.get_scores(candidate, reference)[0]
-    except Exception as e:
-        print(f"Error computing ROUGE: {e}")
-        scores = {'rouge-1': {'f': 0.0}, 'rouge-2': {'f': 0.0}, 'rouge-l': {'f': 0.0}}
-        
-    return scores
-
-def evaluate_model(args):
-    """
-    Evaluate model on test data
-    
-    Args:
-        args: Command line arguments
-        
-    Returns:
-        results: Dict with evaluation results
-    """
-    model_path = args.model
-    dataset_name = args.dataset
-    mode = args.mode
-    num_samples = args.samples
-    
-    print(f"Evaluating on {dataset_name} dataset")
-    
-    # Load config and initialize model
-    config = LLMABSAConfig()
-    config.effective_batch_size = config.batch_size * config.gradient_accumulation_steps
-    print(f"Effective batch size: {config.effective_batch_size}")
-    
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Load model
-    model = load_model(args, config, device)
-    
-    # Initialize tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    
-    # Load test data
-    test_data = load_test_data(dataset_name, num_samples)
-    
-    # Evaluation metrics
-    aspect_tp, aspect_fp, aspect_fn = 0, 0, 0
-    opinion_tp, opinion_fp, opinion_fn = 0, 0, 0
-    sentiment_correct, sentiment_total = 0, 0
-    
-    # Generation quality metrics
-    bleu_scores = []
-    rouge1_scores = []
-    rouge2_scores = []
-    rougel_scores = []
-    
-    # Predictions for saving
-    all_predictions = []
-    
-    # Process each sample
-    for sample in tqdm(test_data, desc="Evaluating"):
-        text = sample['text']
-        input_ids = sample['input_ids'].unsqueeze(0).to(device)
-        attention_mask = sample['attention_mask'].unsqueeze(0).to(device)
-        
-        # Forward pass
-        with torch.no_grad():
-            outputs = model(input_ids, attention_mask, generate=True)
-        
-        # Extract predictions
-        aspect_logits = outputs['aspect_logits'][0].cpu()
-        opinion_logits = outputs['opinion_logits'][0].cpu()
-        sentiment_logits = outputs['sentiment_logits'][0].cpu()
-        
-        # Extract spans
-        aspect_spans = extract_spans(aspect_logits)
-        opinion_spans = extract_spans(opinion_logits)
-        
-        # Get sentiment prediction
-        sentiment_pred = sentiment_logits.argmax(dim=-1).item()
-        
-        # Map sentiment to text
-        sentiment_map = {0: 'POS', 1: 'NEU', 2: 'NEG'}
-        sentiment = sentiment_map.get(sentiment_pred, 'NEU')
-        
-        # Create triplets
-        triplets = []
-        for asp_span in aspect_spans:
-            for op_span in opinion_spans:
-                # Decode spans
-                try:
-                    aspect_ids = input_ids[0, asp_span].cpu()
-                    opinion_ids = input_ids[0, op_span].cpu()
-                    
-                    aspect_text = tokenizer.decode(aspect_ids, skip_special_tokens=True)
-                    opinion_text = tokenizer.decode(opinion_ids, skip_special_tokens=True)
-                    
-                    triplet = {
-                        'aspect': aspect_text,
-                        'aspect_indices': asp_span,
-                        'opinion': opinion_text,
-                        'opinion_indices': op_span,
-                        'sentiment': sentiment,
-                        'confidence': 0.8  # Default confidence
-                    }
-                    
-                    triplets.append(triplet)
-                except Exception as e:
-                    print(f"Error decoding span: {e}")
-        
-        # If no triplets were found, create a dummy one
-        if not triplets:
-            words = text.split()
-            triplets = [{
-                'aspect': words[0] if words else "item",
-                'aspect_indices': [0],
-                'opinion': words[-1] if words else "quality",
-                'opinion_indices': [len(words)-1] if words else [0],
-                'sentiment': sentiment,
-                'confidence': 0.5
-            }]
-        
-        # Generate explanation
-        explanations = [f"The {t['aspect']} is {t['sentiment'].lower()} because of the {t['opinion']}." for t in triplets]
-        
-        # Store prediction
-        prediction = {
-            'text': text,
-            'triplets': triplets,
-            'explanations': explanations
-        }
-        all_predictions.append(prediction)
-        
-        # Evaluate against ground truth (simplified for now)
-        # In a real evaluation, we'd compare to actual ground truth labels
-        
-        # For now, we'll just count exact matches as correct
-        for triplet in triplets:
-            aspect = triplet['aspect']
-            opinion = triplet['opinion']
-            
-            # Check aspect (simple exact match for now)
-            if aspect.lower() in text.lower():
-                aspect_tp += 1
-            else:
-                aspect_fp += 1
-                
-            # Ground truth aspects would be counted here
-            aspect_fn += 1
-            
-            # Check opinion (simple exact match for now)
-            if opinion.lower() in text.lower():
-                opinion_tp += 1
-            else:
-                opinion_fp += 1
-                
-            # Ground truth opinions would be counted here
-            opinion_fn += 1
-            
-            # Simple sentiment evaluation
-            sentiment_total += 1
-            if "good" in text.lower() and sentiment == "POS" or "bad" in text.lower() and sentiment == "NEG":
-                sentiment_correct += 1
-        
-        # Evaluate explanation quality
-        for triplet, explanation in zip(triplets, explanations):
-            # Mock reference for now (in reality, we'd have ground truth)
-            reference = f"The {triplet['aspect']} is {triplet['sentiment'].lower()} because of the {triplet['opinion']}."
-            
-            # Compute BLEU
-            bleu = compute_bleu_score(reference, explanation)
-            bleu_scores.append(bleu)
-            
-            # Compute ROUGE
-            rouge_scores = compute_rouge_score(reference, explanation)
-            rouge1_scores.append(rouge_scores['rouge-1']['f'])
-            rouge2_scores.append(rouge_scores['rouge-2']['f'])
-            rougel_scores.append(rouge_scores['rouge-l']['f'])
+    # Calculate matches (true positives)
+    tp = sum(1 for span in pred_spans_text if span in gold_spans_text)
     
     # Calculate metrics
-    aspect_precision = aspect_tp / max(1, aspect_tp + aspect_fp)
-    aspect_recall = aspect_tp / max(1, aspect_tp + aspect_fn)
-    aspect_f1 = 2 * (aspect_precision * aspect_recall) / max(1, aspect_precision + aspect_recall)
+    precision = tp / len(pred_spans_text) if pred_spans_text else 0.0
+    recall = tp / len(gold_spans_text) if gold_spans_text else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
     
-    opinion_precision = opinion_tp / max(1, opinion_tp + opinion_fp)
-    opinion_recall = opinion_tp / max(1, opinion_tp + opinion_fn)
-    opinion_f1 = 2 * (opinion_precision * opinion_recall) / max(1, opinion_precision + opinion_recall)
-    
-    sentiment_accuracy = sentiment_correct / max(1, sentiment_total)
-    
-    # Average generation quality metrics
-    avg_bleu = np.mean(bleu_scores) if bleu_scores else 0
-    avg_rouge1 = np.mean(rouge1_scores) if rouge1_scores else 0
-    avg_rouge2 = np.mean(rouge2_scores) if rouge2_scores else 0
-    avg_rougel = np.mean(rougel_scores) if rougel_scores else 0
-    
-    # Print results
-    print("\nEvaluation Results:")
-    print(f"Aspect Extraction: Precision={aspect_precision:.4f}, Recall={aspect_recall:.4f}, F1={aspect_f1:.4f}")
-    print(f"Opinion Extraction: Precision={opinion_precision:.4f}, Recall={opinion_recall:.4f}, F1={opinion_f1:.4f}")
-    print(f"Sentiment Classification: Accuracy={sentiment_accuracy:.4f}")
-    
-    print("\nExplanation Quality:")
-    print(f"BLEU Score: {avg_bleu:.4f}")
-    print(f"ROUGE-1 F1: {avg_rouge1:.4f}")
-    print(f"ROUGE-2 F1: {avg_rouge2:.4f}")
-    print(f"ROUGE-L F1: {avg_rougel:.4f}")
-    
-    # Save predictions for analysis
-    try:
-        os.makedirs("results", exist_ok=True)
-        with open(f"results/predictions_{dataset_name}.json", 'w') as f:
-            json.dump(all_predictions, f, indent=2)
-        print(f"\nPredictions saved to results/predictions_{dataset_name}.json")
-    except Exception as e:
-        print(f"Error saving predictions: {e}")
-    
-    # Return results
-    results = {
-        'aspect_extraction': {
-            'precision': aspect_precision,
-            'recall': aspect_recall,
-            'f1': aspect_f1
-        },
-        'opinion_extraction': {
-            'precision': opinion_precision,
-            'recall': opinion_recall,
-            'f1': opinion_f1
-        },
-        'sentiment_classification': {
-            'accuracy': sentiment_accuracy
-        },
-        'explanation_quality': {
-            'bleu': avg_bleu,
-            'rouge-1': avg_rouge1,
-            'rouge-2': avg_rouge2,
-            'rouge-l': avg_rougel
+    return precision, recall, f1
+
+def calculate_explanation_metrics(generated_explanations, reference_explanations):
+    """Calculate BLEU and ROUGE scores for generated explanations"""
+    if not generated_explanations or not reference_explanations:
+        return {
+            'bleu': 0.0,
+            'rouge-1': 0.0,
+            'rouge-2': 0.0,
+            'rouge-l': 0.0
         }
+    
+    # Calculate BLEU score (unigram to 4-gram)
+    bleu_scores = []
+    for gen, ref in zip(generated_explanations, reference_explanations):
+        gen_tokens = gen.lower().split()
+        ref_tokens = [ref.lower().split()]
+        bleu = sentence_bleu(ref_tokens, gen_tokens, weights=(0.25, 0.25, 0.25, 0.25))
+        bleu_scores.append(bleu)
+    
+    # Calculate ROUGE scores
+    rouge = Rouge()
+    rouge_scores = {'rouge-1': 0.0, 'rouge-2': 0.0, 'rouge-l': 0.0}
+    
+    try:
+        for gen, ref in zip(generated_explanations, reference_explanations):
+            scores = rouge.get_scores(gen, ref)[0]
+            rouge_scores['rouge-1'] += scores['rouge-1']['f']
+            rouge_scores['rouge-2'] += scores['rouge-2']['f']
+            rouge_scores['rouge-l'] += scores['rouge-l']['f']
+    except Exception as e:
+        print(f"Warning: Rouge calculation failed: {e}")
+    
+    # Average scores
+    avg_bleu = sum(bleu_scores) / len(bleu_scores) if bleu_scores else 0.0
+    
+    avg_rouge_1 = rouge_scores['rouge-1'] / len(generated_explanations) if generated_explanations else 0.0
+    avg_rouge_2 = rouge_scores['rouge-2'] / len(generated_explanations) if generated_explanations else 0.0
+    avg_rouge_l = rouge_scores['rouge-l'] / len(generated_explanations) if generated_explanations else 0.0
+    
+    return {
+        'bleu': avg_bleu,
+        'rouge-1': avg_rouge_1,
+        'rouge-2': avg_rouge_2,
+        'rouge-l': avg_rouge_l
     }
+
+def evaluate_absa(model_path, dataset_name, mode='all', batch_size=16):
+    """Evaluate ABSA model on test set"""
+    print(f"Evaluating on {dataset_name} dataset")
+    
+    # Load configuration
+    config = LLMABSAConfig()
+    config.batch_size = batch_size
+    print(f"Effective batch size: {config.batch_size}")
+    
+    # Initialize predictor
+    predictor = LLMABSAPredictor(
+        model_path=model_path,
+        config=config
+    )
+    
+    # Load test data
+    dataset_path = os.path.join('Datasets', 'aste', dataset_name, 'test.txt')
+    if not os.path.exists(dataset_path):
+        print(f"Test data not found at {dataset_path}")
+        return
+    
+    # Import utils to read data
+    from src.data.utils import read_aste_data
+    
+    # Read test data
+    test_data = read_aste_data(dataset_path)
+    print(f"Loaded {len(test_data)} test samples from {dataset_name}")
+    
+    # Set evaluation mode based on input
+    evaluate_extraction = mode in ['all', 'extraction']
+    evaluate_generation = mode in ['all', 'generation']
+    
+    # Lists to store evaluation results
+    all_aspect_pred = []
+    all_aspect_gold = []
+    all_opinion_pred = []
+    all_opinion_gold = []
+    all_sentiment_pred = []
+    all_sentiment_gold = []
+    
+    all_generated_explanations = []
+    all_reference_explanations = []  # For simulation, use template-based references
+    
+    all_predictions = []
+    
+    # Process test data in batches
+    for i, (text, spans) in enumerate(tqdm(test_data, desc="Evaluating")):
+        # Get predictor result
+        result = predictor.predict(text, generate=evaluate_generation)
+        all_predictions.append(result)
+        
+        # Extract triplets
+        triplets = result.get('triplets', [])
+        
+        # Extract gold standard data
+        gold_aspects = []
+        gold_opinions = []
+        gold_sentiments = []
+        
+        for span_label in spans:
+            # Extract span texts from indices
+            aspect_indices = span_label.aspect_indices
+            opinion_indices = span_label.opinion_indices
+            sentiment = span_label.sentiment
+            
+            # Convert indices to text spans (simple approach by splitting text)
+            tokens = text.split()
+            aspect_text = ' '.join([tokens[idx] for idx in aspect_indices if idx < len(tokens)])
+            opinion_text = ' '.join([tokens[idx] for idx in opinion_indices if idx < len(tokens)])
+            
+            gold_aspects.append(aspect_text)
+            gold_opinions.append(opinion_text)
+            gold_sentiments.append(sentiment)
+        
+        # Extract predicted data
+        pred_aspects = [t.get('aspect', '') for t in triplets]
+        pred_opinions = [t.get('opinion', '') for t in triplets]
+        pred_sentiments = [t.get('sentiment', 'NEU') for t in triplets]
+        
+        # Add to evaluation lists
+        all_aspect_pred.extend(pred_aspects)
+        all_aspect_gold.extend(gold_aspects)
+        all_opinion_pred.extend(pred_opinions)
+        all_opinion_gold.extend(gold_opinions)
+        all_sentiment_pred.extend(pred_sentiments)
+        all_sentiment_gold.extend(gold_sentiments)
+        
+        # For explanation evaluation, use template-based approach
+        if evaluate_generation and 'explanations' in result:
+            explanation = result['explanations'][0] if result['explanations'] else ""
+            all_generated_explanations.append(explanation)
+            
+            # Generate reference explanation using gold standard data
+            # Create a simple reference explanation from gold data
+            reference = ""
+            if gold_aspects and gold_opinions and gold_sentiments:
+                reference_parts = []
+                for aspect, opinion, sentiment in zip(gold_aspects[:min(3, len(gold_aspects))], 
+                                                     gold_opinions[:min(3, len(gold_opinions))], 
+                                                     gold_sentiments[:min(3, len(gold_sentiments))]):
+                    sentiment_text = "positive" if sentiment == "POS" else "negative" if sentiment == "NEG" else "neutral"
+                    reference_parts.append(f"The {aspect} is {sentiment_text} because of its {opinion}.")
+                reference = " ".join(reference_parts)
+            else:
+                reference = "No aspects detected."
+                
+            all_reference_explanations.append(reference)
+    
+    # Calculate metrics for extraction
+    if evaluate_extraction:
+        aspect_precision, aspect_recall, aspect_f1 = calculate_span_metrics(all_aspect_pred, all_aspect_gold)
+        opinion_precision, opinion_recall, opinion_f1 = calculate_span_metrics(all_opinion_pred, all_opinion_gold)
+        
+        # Calculate sentiment accuracy (only for matching spans)
+        matching_sentiments = 0
+        total_sentiments = 0
+        
+        # Convert sentiment list for easier matching
+        sentiment_gold_map = {}
+        for aspect, sentiment in zip(all_aspect_gold, all_sentiment_gold):
+            if aspect:
+                sentiment_gold_map[aspect.lower()] = sentiment
+        
+        # Count matching sentiments
+        for aspect, sentiment in zip(all_aspect_pred, all_sentiment_pred):
+            if aspect and aspect.lower() in sentiment_gold_map:
+                total_sentiments += 1
+                if sentiment == sentiment_gold_map[aspect.lower()]:
+                    matching_sentiments += 1
+        
+        sentiment_accuracy = matching_sentiments / total_sentiments if total_sentiments > 0 else 0.0
+        
+        print("Evaluation Results:")
+        print(f"Aspect Extraction: Precision={aspect_precision:.4f}, Recall={aspect_recall:.4f}, F1={aspect_f1:.4f}")
+        print(f"Opinion Extraction: Precision={opinion_precision:.4f}, Recall={opinion_recall:.4f}, F1={opinion_f1:.4f}")
+        print(f"Sentiment Classification: Accuracy={sentiment_accuracy:.4f}")
+    
+    # Calculate metrics for generation
+    if evaluate_generation and all_generated_explanations:
+        explanation_metrics = calculate_explanation_metrics(all_generated_explanations, all_reference_explanations)
+        
+        print("Explanation Quality:")
+        print(f"BLEU Score: {explanation_metrics['bleu']:.4f}")
+        print(f"ROUGE-1 F1: {explanation_metrics['rouge-1']:.4f}")
+        print(f"ROUGE-2 F1: {explanation_metrics['rouge-2']:.4f}")
+        print(f"ROUGE-L F1: {explanation_metrics['rouge-l']:.4f}")
+    
+    # Save predictions to file
+    os.makedirs('results', exist_ok=True)
+    output_path = f"results/predictions_{dataset_name}.json"
+    
+    # Convert predictions to JSON-serializable format
+    json_predictions = []
+    for i, (text, _) in enumerate(test_data):
+        if i < len(all_predictions):
+            prediction = all_predictions[i]
+            # Convert tensor values to Python types if needed
+            for triplet in prediction.get('triplets', []):
+                # Convert aspect and opinion indices to lists if they're tensors
+                if 'aspect_indices' in triplet and hasattr(triplet['aspect_indices'], 'tolist'):
+                    triplet['aspect_indices'] = triplet['aspect_indices'].tolist()
+                if 'opinion_indices' in triplet and hasattr(triplet['opinion_indices'], 'tolist'):
+                    triplet['opinion_indices'] = triplet['opinion_indices'].tolist()
+                # Convert confidence to float if it's a tensor
+                if 'confidence' in triplet and hasattr(triplet['confidence'], 'item'):
+                    triplet['confidence'] = triplet['confidence'].item()
+            json_predictions.append(prediction)
+    
+    # Save to file
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(json_predictions, f, indent=2, ensure_ascii=False)
+    
+    print(f"Predictions saved to {output_path}")
+    
+    # Return metrics
+    results = {}
+    if evaluate_extraction:
+        results.update({
+            'aspect_precision': aspect_precision,
+            'aspect_recall': aspect_recall,
+            'aspect_f1': aspect_f1,
+            'opinion_precision': opinion_precision,
+            'opinion_recall': opinion_recall,
+            'opinion_f1': opinion_f1,
+            'sentiment_accuracy': sentiment_accuracy
+        })
+    
+    if evaluate_generation and all_generated_explanations:
+        results.update(explanation_metrics)
     
     return results
 
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Evaluate ABSA model")
-    parser.add_argument("--model", type=str, default=None, help="Path to model checkpoint")
-    parser.add_argument("--dataset", type=str, default="rest15", help="Dataset to evaluate on")
-    parser.add_argument("--samples", type=int, default=20, help="Number of samples to evaluate")
-    parser.add_argument("--mode", type=str, default="all", help="Evaluation mode (all, extraction, generation)")
-    
+def main():
+    parser = argparse.ArgumentParser(description='Evaluate ABSA model')
+    parser.add_argument('--model', type=str, required=True, help='Path to model checkpoint')
+    parser.add_argument('--dataset', type=str, default='rest15', help='Dataset to evaluate on')
+    parser.add_argument('--mode', type=str, choices=['all', 'extraction', 'generation'], default='all', help='Evaluation mode')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for evaluation')
+    parser.add_argument('--output', type=str, default=None, help='Path to save evaluation results')
+    parser.add_argument('--visualize', action='store_true', help='Generate visualizations for predictions')
     args = parser.parse_args()
     
-    evaluate_model(args)
+    # Run evaluation
+    results = evaluate_absa(args.model, args.dataset, args.mode, args.batch_size)
+    
+    # Save results if output path is specified
+    if args.output and results:
+        os.makedirs(os.path.dirname(args.output), exist_ok=True)
+        with open(args.output, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"Evaluation results saved to {args.output}")
+    
+    # Generate visualizations if requested
+    if args.visualize:
+        visualization_dir = os.path.join('results', 'visualizations', args.dataset)
+        os.makedirs(visualization_dir, exist_ok=True)
+        
+        # Load predictions
+        predictions_path = f"results/predictions_{args.dataset}.json"
+        if os.path.exists(predictions_path):
+            with open(predictions_path, 'r', encoding='utf-8') as f:
+                predictions = json.load(f)
+            
+            # Initialize predictor
+            predictor = LLMABSAPredictor(
+                model_path=args.model,
+                config=LLMABSAConfig()
+            )
+            
+            # Generate visualizations
+            print(f"Generating visualizations for {len(predictions)} examples...")
+            for i, pred in enumerate(predictions):
+                text = pred.get('text', '')
+                html = predictor.visualize(text, pred)
+                
+                # Save HTML to file
+                with open(os.path.join(visualization_dir, f"example_{i}.html"), 'w', encoding='utf-8') as f:
+                    f.write(html)
+            
+            print(f"Visualizations saved to {visualization_dir}")
+
+if __name__ == '__main__':
+    # Set up for ROUGE score calculation
+    try:
+        import nltk
+        nltk.download('punkt', quiet=True)
+    except:
+        print("Warning: NLTK punkt not installed. BLEU scores may be affected.")
+    
+    try:
+        from rouge import Rouge
+    except ImportError:
+        print("Warning: Rouge package not installed. ROUGE scores will not be calculated.")
+        
+    main()
