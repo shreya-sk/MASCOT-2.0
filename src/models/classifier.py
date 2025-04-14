@@ -35,7 +35,7 @@ class AspectOpinionJointClassifier(nn.Module):
             nn.Dropout(dropout)
         )
             
-        # Sentiment classifier with balanced initialization
+        # Sentiment classifier with BALANCED initialization
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
@@ -43,13 +43,11 @@ class AspectOpinionJointClassifier(nn.Module):
             nn.Linear(hidden_dim // 2, num_classes)
         )
         
-        # Initialize sentiment classifier with balanced class bias
-        # Small positive bias for positive sentiment (index 0)
-        self.classifier[-1].bias.data[0] = 0.2
-        # Zero bias for neutral sentiment (index 1)
-        self.classifier[-1].bias.data[1] = 0.0
-        # Small negative bias for negative sentiment (index 2)
-        self.classifier[-1].bias.data[2] = -0.1
+        # FIXED: Initialize sentiment classifier with truly balanced class bias
+        # Equal bias for all sentiment classes (no bias toward negative)
+        self.classifier[-1].bias.data[0] = 0.1  # Positive sentiment (was 0.2)
+        self.classifier[-1].bias.data[1] = 0.1  # Neutral sentiment (was 0.0)
+        self.classifier[-1].bias.data[2] = 0.1  # Negative sentiment (was -0.1)
         
         # Confidence estimator
         self.confidence_estimator = nn.Sequential(
@@ -105,7 +103,6 @@ class AspectOpinionJointClassifier(nn.Module):
             'insanely', 'super', 'so', 'too', 'quite', 'rather', 'pretty'
         ])
         
-# Update this in src/models/classifier.py
     def forward(self, hidden_states, aspect_logits=None, opinion_logits=None, 
                 attention_mask=None, sentiment_labels=None, input_ids=None, tokenizer=None):
         """
@@ -130,13 +127,6 @@ class AspectOpinionJointClassifier(nn.Module):
                 
             batch_size, seq_len, hidden_dim = hidden_states.shape
             device = hidden_states.device
-            
-            # Print debug info
-            # print(f"Hidden states shape: {hidden_states.shape}")
-            # if aspect_logits is not None:
-            #     print(f"Aspect logits shape: {aspect_logits.shape}")
-            # if opinion_logits is not None:
-            #     print(f"Opinion logits shape: {opinion_logits.shape}")
             
             # Create aspect and opinion weights from logits or attention
             # For aspect weights
@@ -214,7 +204,7 @@ class AspectOpinionJointClassifier(nn.Module):
                 # Basic sentiment classification
                 sentiment_logits = self.classifier(fused)  # [batch_size, num_classes]
                 
-                # Apply rule-based sentiment analysis if input_ids and tokenizer are available
+                # FIXED: Apply rule-based sentiment analysis if input_ids and tokenizer are available
                 if input_ids is not None and tokenizer is not None:
                     sentiment_logits = self._apply_sentiment_rules(
                         input_ids, tokenizer, aspect_weights, opinion_weights, sentiment_logits
@@ -246,14 +236,21 @@ class AspectOpinionJointClassifier(nn.Module):
             confidence = torch.ones(batch_size, 1, device=device) * 0.5
             
             return sentiment_logits, confidence
+            
     def _apply_sentiment_rules(self, input_ids, tokenizer, aspect_weights, opinion_weights, sentiment_logits):
         """Apply enhanced rule-based sentiment analysis"""
         batch_size = input_ids.size(0)
         device = input_ids.device
         
+        # Create a copy of sentiment_logits to modify
+        modified_logits = sentiment_logits.clone()
+        
         for b in range(batch_size):
             # Get the tokens for this example
             tokens = [tokenizer.decode([id_val.item()]).lower().strip() for id_val in input_ids[b]]
+            
+            # Find aspect words in this example (ADDED: also check aspect words)
+            aspect_indices = torch.where(aspect_weights[b, :, 0] > 0.1)[0].cpu().tolist()
             
             # Find opinion words in this example
             opinion_indices = torch.where(opinion_weights[b, :, 0] > 0.1)[0].cpu().tolist()
@@ -262,15 +259,13 @@ class AspectOpinionJointClassifier(nn.Module):
             pos_count = 0
             neg_count = 0
             
-            # Track negation
-            has_negation = False
-            
             # Check each opinion token
             for idx in opinion_indices:
                 if idx < len(tokens):
                     token = tokens[idx]
                     
                     # Check for negation words before this opinion
+                    has_negation = False
                     for prev_idx in range(max(0, idx-3), idx):
                         if prev_idx < len(tokens) and tokens[prev_idx] in self.negation_words:
                             has_negation = True
@@ -292,5 +287,64 @@ class AspectOpinionJointClassifier(nn.Module):
                     # Check for intensifiers before this opinion
                     for prev_idx in range(max(0, idx-2), idx):
                         if prev_idx < len(tokens) and tokens[prev_idx] in self.intensifiers:
+                            # Add extra weight for intensified opinions
                             if token in self.positive_words and not has_negation:
-                                pos_count += 1  # Extra weight
+                                pos_count += 0.5
+                            elif token in self.negative_words and not has_negation:  
+                                neg_count += 0.5
+                            elif token in self.positive_words and has_negation:
+                                neg_count += 0.5
+                            elif token in self.negative_words and has_negation:
+                                pos_count += 0.5
+            
+            # FIXED: Better rule-based sentiment adjustment
+            # Determine the dominant sentiment based on counts
+            if pos_count > neg_count:
+                # Positive sentiment dominates
+                # Boost positive (index 0), but don't completely override the model
+                modified_logits[b, 0] += min(pos_count, 2.0)  # Cap the boost
+                # Slightly reduce negative
+                modified_logits[b, 2] -= min(pos_count * 0.5, 1.0)
+            elif neg_count > pos_count:
+                # Negative sentiment dominates 
+                # Boost negative (index 2)
+                modified_logits[b, 2] += min(neg_count, 2.0)
+                # Slightly reduce positive
+                modified_logits[b, 0] -= min(neg_count * 0.5, 1.0)
+            else:
+                # No clear dominance, slightly boost neutral (index 1)
+                modified_logits[b, 1] += 0.5
+            
+            # ADDED: Detect specific sentiment patterns
+            # Check for common expressions that strongly indicate sentiment
+            text = " ".join(tokens).lower()
+            
+            # Strong positive indicators
+            if any(phrase in text for phrase in ["highly recommend", "loved", "excellent", "favorite", "best"]):
+                modified_logits[b, 0] += 1.5  # Strong positive boost
+            
+            # Strong negative indicators
+            if any(phrase in text for phrase in ["terrible", "worst", "awful", "avoid", "never again"]):
+                modified_logits[b, 2] += 1.5  # Strong negative boost
+            
+            # Neutral/mixed indicators
+            if any(phrase in text for phrase in ["average", "okay", "mixed", "but", "however"]):
+                modified_logits[b, 1] += 1.0  # Boost neutral sentiment
+                
+        return modified_logits
+
+    def _decode_span(self, input_ids, span_indices, tokenizer):
+        """Helper method to decode token spans to text"""
+        try:
+            if not span_indices:
+                return ""
+                
+            # Get token IDs for this span
+            span_token_ids = [input_ids[i].item() for i in span_indices if i < len(input_ids)]
+            
+            # Decode to text
+            text = tokenizer.decode(span_token_ids, skip_special_tokens=True)
+            return text.strip()
+        except Exception as e:
+            print(f"Error decoding span: {e}")
+            return ""
