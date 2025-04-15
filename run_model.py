@@ -21,39 +21,37 @@ logging.basicConfig(
 )
 
 def run_command(cmd, description=None):
-    """Run a command and log its output"""
     if description:
         logging.info(f"TASK: {description}")
     
     logging.info(f"Running command: {cmd}")
     start_time = time.time()
     
-    process = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    # Use Popen for real-time output
+    process = subprocess.Popen(
+        cmd, 
+        shell=True, 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1  # Line buffered
+    )
+    
+    # Process output in real-time
+    for line in process.stdout:
+        line = line.strip()
+        if line:
+            logging.info(f"  {line}")
+            print(line)
+    
+    # Wait for process to complete
+    process.wait()
     
     duration = time.time() - start_time
     duration_str = f"{duration:.2f} seconds" if duration < 300 else f"{duration/60:.2f} minutes"
     
     logging.info(f"Command completed in {duration_str} with status {process.returncode}")
-    
-    # Log stdout if there's any output
-    if process.stdout:
-        logging.info("STDOUT OUTPUT:")
-        for line in process.stdout.splitlines():
-            # Only log lines with useful information (skip empty lines)
-            if line.strip():
-                logging.info(f"  {line}")
-    
-    # Log stderr only if there were errors
-    if process.stderr:
-        logging.info("STDERR OUTPUT:")
-        for line in process.stderr.splitlines():
-            if line.strip():
-                logging.info(f"  {line}")
-    
-    logging.info("-" * 80)
-    return process.returncode == 0  # Return True if command succeeded
-
-
+    return process.returncode == 0
 # =====================================================================
 # BLOCK 1: MEMORY CONSTRAINED MODEL (Commented out by default)
 # =====================================================================
