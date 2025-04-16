@@ -35,6 +35,15 @@ class ABSATrainer:
         self.model.train()
         total_loss = 0
         
+        # Implement scheduled dropout to reduce overfitting gradually
+        base_dropout = self.config.dropout
+        if epoch > self.config.num_epochs // 2:
+            # Increase dropout rate in later epochs to combat overfitting
+            adjusted_dropout = min(base_dropout * 1.5, 0.5)
+            for module in self.model.modules():
+                if isinstance(module, nn.Dropout):
+                    module.p = adjusted_dropout
+
         train_iterator = tqdm(train_loader, desc=f"Training Epoch {epoch}")
         
         for batch_idx, batch in enumerate(train_iterator):

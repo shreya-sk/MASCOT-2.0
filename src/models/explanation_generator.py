@@ -115,6 +115,17 @@ class ExplanationGenerator:
             'NEG': ['disappointing', 'poor', 'subpar', 'problematic', 'unsatisfactory', 'lacking'],
             'NEU': ['adequate', 'acceptable', 'standard', 'average', 'ordinary', 'typical']
         }
+     
+        self.negation_mappings = [
+            {'pattern': 'not good', 'replacement': 'lacking quality'},
+            {'pattern': 'not great', 'replacement': 'disappointing'},
+            {'pattern': 'not tasty', 'replacement': 'unappetizing'},
+            {'pattern': 'not fresh', 'replacement': 'stale'},
+            {'pattern': 'not clean', 'replacement': 'dirty'},
+            {'pattern': 'not friendly', 'replacement': 'unfriendly'},
+            {'pattern': "n't like", 'replacement': 'disliked'},
+            {'pattern': 'never good', 'replacement': 'consistently poor'},
+        ]
     
     def generate_explanation(self, triplets):
         """
@@ -174,10 +185,9 @@ class ExplanationGenerator:
             return " ".join(explanations)
     
     def _generate_single_explanation(self, triplet):
-        """Generate explanation for a single triplet"""
-        aspect = triplet.get('aspect', '').strip()
-        opinion = triplet.get('opinion', '').strip()
-        sentiment = triplet.get('sentiment', 'NEU')
+        """Generate explanation for a single triplet with improved quality"""
+        # Preprocess the triplet for better explanation
+        aspect, opinion, sentiment = self._preprocess_triplet(triplet)
         
         # Handle empty fields
         if not aspect:
@@ -186,24 +196,19 @@ class ExplanationGenerator:
         # If opinion is empty, use aspect-only template
         if not opinion:
             templates = self.aspect_only_templates.get(sentiment, self.aspect_only_templates['NEU'])
-            template_idx = hash(aspect) % len(templates)  # Use hash for consistent but varied selection
+            template_idx = hash(aspect) % len(templates)
             template = templates[template_idx]
-            return template.format(aspect=aspect)
-        
-        # Select template based on sentiment
-        if sentiment == 'POS':
-            templates = self.positive_templates
-        elif sentiment == 'NEG':
-            templates = self.negative_templates
+            explanation = template.format(aspect=aspect)
         else:
-            templates = self.neutral_templates
+            # Select the best template using linguistic features
+            template = self._select_best_template(aspect, opinion, sentiment)
+            explanation = template.format(aspect=aspect, opinion=opinion)
         
-        # Select template based on hash of aspect for variety but consistency
-        template_idx = hash(aspect + opinion) % len(templates)
-        template = templates[template_idx]
+        # Simplify and add diversity to the explanation
+        explanation = self.simplify_explanation(explanation)
+        explanation = self.add_diversity(explanation)
         
-        # Format template with aspect and opinion
-        return template.format(aspect=aspect, opinion=opinion)
+        return explanation
     
     def _generate_multi_aspect_explanation(self, aspect_groups):
         """Generate explanation focusing on multiple aspects"""
@@ -378,3 +383,132 @@ class ExplanationGenerator:
         if len(items) == 2:
             return f"{items[0]} and {items[1]}"
         return ", ".join(items[:-1]) + f", and {items[-1]}"
+    
+    def _preprocess_triplet(self, triplet):
+        """Clean and normalize triplet data for better explanation generation"""
+        aspect = triplet.get('aspect', '').strip()
+        opinion = triplet.get('opinion', '').strip()
+        sentiment = triplet.get('sentiment', 'NEU')
+        
+        # Handle empty fields
+        if not aspect:
+            aspect = "this"
+        
+        # Normalize opinion text
+        if opinion:
+            # Remove common prefixes that make sentences awkward
+            for prefix in ['very ', 'so ', 'really ', 'quite ', 'extremely ']:
+                if opinion.startswith(prefix):
+                    opinion = opinion[len(prefix):]
+                    break
+                    
+            # Remove tokenizer artifacts
+            opinion = opinion.replace('##', '').replace(' ##', '')
+            
+            # Handle negation better
+            if any(neg in opinion for neg in ['not ', "n't", 'never']):
+                # Process negation to make it flow better in templates
+                # For example: "not good" -> "lack of quality"
+                for neg_map in self.negation_mappings:
+                    if neg_map['pattern'] in opinion:
+                        opinion = opinion.replace(neg_map['pattern'], neg_map['replacement'])
+        
+        return aspect, opinion, sentiment
+    
+    def _select_best_template(self, aspect, opinion, sentiment):
+        """Select the most appropriate template based on linguistic features"""
+        templates = []
+        
+        if sentiment == 'POS':
+            templates = self.positive_templates
+        elif sentiment == 'NEG':
+            templates = self.negative_templates
+        else:
+            templates = self.neutral_templates
+        
+        # Score templates for better fit
+        scored_templates = []
+        for template in templates:
+            score = 0
+            
+            # Check if template mentions any words in aspect
+            if any(word in template for word in aspect.split()):
+                score += 1
+                
+            # Check if template handles opinion length appropriately
+            if len(opinion.split()) > 3 and "{opinion}" in template:
+                score += 1
+            elif len(opinion.split()) <= 3 and "{opinion}" in template:
+                score += 2
+                
+            # Check for grammatical compatibility
+            if aspect.endswith('s') and "are" in template:
+                score += 1
+            elif not aspect.endswith('s') and "is" in template:
+                score += 1
+                
+            scored_templates.append((template, score))
+        
+        # Get template with highest score, or random if tie
+        best_templates = [t for t, s in sorted(scored_templates, key=lambda x: x[1], reverse=True)]
+        if not best_templates:
+            # Fallback template
+            return "The {aspect} is {sentiment} because of its {opinion}."
+        
+        # Take top 3 templates and choose randomly for variety
+        top_templates = best_templates[:min(3, len(best_templates))]
+        return random.choice(top_templates)
+    
+    def simplify_explanation(self, explanation):
+        """Simplify and clean generated explanations for better readability"""
+        # Remove redundant phrases
+        redundant_phrases = [
+            "it can be said that", 
+            "it is worth noting that",
+            "it should be mentioned that",
+            "it is important to note that"
+        ]
+        
+        for phrase in redundant_phrases:
+            explanation = explanation.replace(phrase, "")
+        
+        # Fix common grammatical issues
+        explanation = explanation.replace("the the", "the")
+        explanation = explanation.replace(" ,", ",")
+        explanation = explanation.replace(" .", ".")
+        
+        # Ensure proper capitalization
+        sentences = explanation.split('. ')
+        sentences = [s[0].upper() + s[1:] if s else "" for s in sentences]
+        explanation = '. '.join(sentences)
+        
+        # Remove repeated sentences
+        unique_sentences = []
+        for sentence in explanation.split('. '):
+            if sentence and sentence not in unique_sentences:
+                unique_sentences.append(sentence)
+        
+        explanation = '. '.join(unique_sentences)
+        if not explanation.endswith('.'):
+            explanation += '.'
+            
+        return explanation
+    
+    def add_diversity(self, explanation):
+        """Use paraphrasing techniques to improve explanation quality"""
+        # Simple word substitution-based diversity
+        paraphrase_maps = {
+            "great": ["excellent", "outstanding", "superb", "wonderful"],
+            "good": ["nice", "fine", "quality", "pleasant", "satisfactory"],
+            "bad": ["poor", "subpar", "disappointing", "unsatisfactory", "inadequate"],
+            "terrible": ["awful", "horrible", "dreadful", "atrocious", "dismal"],
+            "like": ["enjoy", "appreciate", "favor", "prefer"],
+            "dislike": ["disapprove of", "object to", "take issue with", "am not fond of"]
+        }
+        
+        for word, alternatives in paraphrase_maps.items():
+            if f" {word} " in explanation:
+                replacement = random.choice(alternatives)
+                explanation = explanation.replace(f" {word} ", f" {replacement} ")
+        
+        return explanation

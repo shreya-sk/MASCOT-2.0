@@ -21,6 +21,29 @@ from src.training.losses import ABSALoss
 from src.utils.config import LLMABSAConfig as con
 from src.utils.logger import WandbLogger
 
+class EarlyStopping:
+    """Early stopping to prevent overfitting"""
+    def __init__(self, patience=3, min_delta=0.0, mode='max'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.mode = mode  # 'max' for metrics like F1, 'min' for losses
+        
+    def __call__(self, val_score):
+        if self.best_score is None:
+            self.best_score = val_score
+        elif (self.mode == 'max' and val_score <= self.best_score + self.min_delta) or \
+             (self.mode == 'min' and val_score >= self.best_score - self.min_delta):
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = val_score
+            self.counter = 0
+            
+
 def set_seed(seed: int):
     """Set random seed for reproducibility"""
     random.seed(seed)
@@ -198,6 +221,7 @@ def train_phase(model, train_loader, val_loader, config, logger, device, dataset
     if phase == "generation":
         lr = lr / 2.0  # Lower learning rate for fine-tuning
     
+    early_stopping = EarlyStopping(patience=3, mode='max')  # For F1 score, higher is better
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=lr,
@@ -252,6 +276,13 @@ def train_phase(model, train_loader, val_loader, config, logger, device, dataset
             device=device,
             generate=generate
         )
+        # Then in train_phase function:
+ 
+        # After evaluation:
+        early_stopping(val_metrics.get('overall_f1', 0))
+        if early_stopping.early_stop:
+            print(f"Early stopping triggered after epoch {epoch+1}")
+            break
         
         # Print evaluation results
         print(f"\nEpoch {epoch+1}/{epochs} Evaluation ({phase}):")
@@ -304,6 +335,12 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, conf
             batch_on_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
                              for k, v in batch.items()}
             
+            # Apply mixup if configured
+            if getattr(config, 'use_mixup', False) and random.random() < 0.5:  # 50% chance
+                from src.data.dataset import mixup_batch
+                batch_on_device = mixup_batch(batch_on_device, alpha=config.mixup_alpha)
+                
+            # Rest of your function...
             # Forward pass
             outputs = model(**batch_on_device, generate=generate)
             
@@ -640,6 +677,8 @@ def main():
     
     # End W&B run
     logger.finish()
+
+
 
 if __name__ == '__main__':
     main()

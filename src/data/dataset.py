@@ -3,6 +3,7 @@ import os
 from torch.utils.data import Dataset # type: ignore # type: ignore
 from typing import Optional, Dict, Any
 import torch # type: ignore
+import numpy as np # type: ignore
 
 class ABSADataset(Dataset):
     """ABSA dataset class supporting multiple datasets with preprocessor"""
@@ -123,3 +124,27 @@ def custom_collate_fn(batch):
                 merged_batch[key] = [item[key] for item in batch]
     
     return merged_batch
+
+def mixup_batch(batch, alpha=0.2):
+    """Apply mixup augmentation to a batch to improve generalization"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = batch['input_ids'].size(0)
+    index = torch.randperm(batch_size)
+    
+    mixed_input_ids = lam * batch['input_ids'] + (1 - lam) * batch['input_ids'][index]
+    mixed_attention_mask = batch['attention_mask']  # Keep attention mask the same
+    
+    # Mix labels - for soft labels based on mixup
+    batch['mixed_aspect_labels'] = lam * batch['aspect_labels'] + (1 - lam) * batch['aspect_labels'][index]
+    batch['mixed_opinion_labels'] = lam * batch['opinion_labels'] + (1 - lam) * batch['opinion_labels'][index]
+    batch['mixed_sentiment_labels'] = lam * batch.get('sentiment_labels', 0) + (1 - lam) * batch.get('sentiment_labels', 0)[index]
+    
+    batch['input_ids'] = mixed_input_ids
+    batch['mixup_lambda'] = lam
+    batch['mixup_index'] = index
+    
+    return batch

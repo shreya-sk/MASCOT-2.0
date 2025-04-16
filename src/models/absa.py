@@ -564,3 +564,21 @@ class LLMABSA(nn.Module):
         except Exception as e:
             print(f"Error in _decode_span: {e}")
             return ""
+        
+    def _initialize_weights(self):
+        """Enhanced initialization with better regularization"""
+        for name, param in self.named_parameters():
+            if 'embeddings.encoder' not in name:  # Don't initialize pretrained weights
+                if 'weight' in name and len(param.shape) >= 2:
+                    # Use Kaiming initialization for better convergence
+                    nn.init.kaiming_normal_(param.data, nonlinearity='relu')
+                elif 'bias' in name or len(param.shape) < 2:
+                    # Use zeros initialization for biases and 1D tensors
+                    nn.init.zeros_(param.data)
+                    
+        # Add spectral normalization to critical layers for better generalization
+        if hasattr(self, 'span_detector') and hasattr(self.span_detector, 'aspect_classifier'):
+            for module in [self.span_detector.aspect_classifier, self.span_detector.opinion_classifier]:
+                for i, layer in enumerate(module):
+                    if isinstance(layer, nn.Linear) and i < len(module) - 1:  # Apply to all but the last layer
+                        module[i] = nn.utils.spectral_norm(layer)
