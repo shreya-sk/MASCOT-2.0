@@ -5,7 +5,8 @@ import torch.nn.functional as F
 
 class ABSALoss(nn.Module):
     """
-    Improved ABSA loss function with robust error handling and consistent tensor processing
+    Improved ABSA loss function with robust error handling, consistent tensor processing,
+    and instruction-following support (2024-2025 breakthrough)
     """
     def __init__(self, config):
         super().__init__()
@@ -15,6 +16,10 @@ class ABSALoss(nn.Module):
         self.opinion_weight = getattr(config, 'opinion_loss_weight', 2.0)
         self.sentiment_weight = getattr(config, 'sentiment_loss_weight', 1.0)
         self.boundary_weight = getattr(config, 'boundary_weight', 0.5)
+        
+        # Instruction-following weights (2024-2025 breakthrough)
+        self.extraction_weight = getattr(config, 'extraction_weight', 1.0)
+        self.generation_weight = getattr(config, 'generation_weight', 0.5)
         
         # Label smoothing for better generalization
         self.label_smoothing = getattr(config, 'label_smoothing', 0.1)
@@ -63,12 +68,12 @@ class ABSALoss(nn.Module):
         
     def forward(self, outputs, targets, generate=False):
         """
-        Compute combined loss for ABSA with robust tensor handling
+        Compute combined loss for ABSA with robust tensor handling and instruction-following support
         
         Args:
             outputs: Model output dictionary
             targets: Target dictionary
-            generate: Whether to include generation loss (not implemented yet)
+            generate: Whether to include generation loss
             
         Returns:
             Dictionary with loss components
@@ -98,6 +103,7 @@ class ABSALoss(nn.Module):
             opinion_loss = torch.tensor(0.0, device=device, requires_grad=True)
             sentiment_loss = torch.tensor(0.0, device=device, requires_grad=True)
             boundary_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            generation_loss = torch.tensor(0.0, device=device, requires_grad=True)
             
             # Process aspect loss
             aspect_loss = self._compute_span_loss(
@@ -120,12 +126,26 @@ class ABSALoss(nn.Module):
                     outputs['boundary_logits'], aspect_labels, opinion_labels
                 )
             
-            # Combine all losses
-            total_loss = (
+            # ============================================================================
+            # INSTRUCTION-FOLLOWING LOSS (2024-2025 BREAKTHROUGH)
+            # ============================================================================
+            
+            # Process generation loss if available (instruction-following)
+            if 'generation_loss' in outputs:
+                generation_loss = outputs['generation_loss']
+                print(f"Generation loss: {generation_loss.item():.4f}")
+            
+            # Combine all losses with weighted approach
+            extraction_total = (
                 self.aspect_weight * aspect_loss +
                 self.opinion_weight * opinion_loss +
                 self.sentiment_weight * sentiment_loss +
                 self.boundary_weight * boundary_loss
+            )
+            
+            total_loss = (
+                self.extraction_weight * extraction_total +
+                self.generation_weight * generation_loss
             )
             
             # Ensure total_loss requires gradients
@@ -141,6 +161,8 @@ class ABSALoss(nn.Module):
                 'opinion_loss': opinion_loss.detach().item() if isinstance(opinion_loss, torch.Tensor) else opinion_loss,
                 'sentiment_loss': sentiment_loss.detach().item() if isinstance(sentiment_loss, torch.Tensor) else sentiment_loss,
                 'boundary_loss': boundary_loss.detach().item() if isinstance(boundary_loss, torch.Tensor) else boundary_loss,
+                'generation_loss': generation_loss.detach().item() if isinstance(generation_loss, torch.Tensor) else generation_loss,
+                'extraction_loss': extraction_total.detach().item() if isinstance(extraction_total, torch.Tensor) else extraction_total,
             }
             
         except Exception as e:
@@ -162,6 +184,8 @@ class ABSALoss(nn.Module):
                 'opinion_loss': 0.0,
                 'sentiment_loss': 0.0,
                 'boundary_loss': 0.0,
+                'generation_loss': 0.0,
+                'extraction_loss': 0.0,
             }
     
     def _compute_span_loss(self, logits, labels, criterion, loss_name):

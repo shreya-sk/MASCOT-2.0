@@ -62,6 +62,24 @@ class LLMABSAConfig:
     # Memory optimization
     use_fp16: bool = False  # Disabled for stability
     use_gradient_checkpointing: bool = True  # Save memory
+
+    # ============================================================================
+    # INSTRUCTION-FOLLOWING CONFIGURATION (2024-2025 BREAKTHROUGH)
+    # ============================================================================
+
+    # Enable instruction-following paradigm
+    use_instruction_following: bool = True
+    instruction_model: str = "t5-small"  # Start small for testing
+    max_instruction_length: int = 512
+    max_generation_length: int = 256
+
+    # Generation settings
+    num_beams: int = 3
+    early_stopping: bool = True
+
+    # Training weights for unified framework
+    extraction_weight: float = 1.0  # Weight for your existing model
+    generation_weight: float = 0.5  # Weight for instruction following
     
     # ============================================================================
     # LOSS FUNCTION CONFIGURATION

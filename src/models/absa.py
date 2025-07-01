@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
+from transformers import T5ForConditionalGeneration, T5Tokenizer
 
 class LLMABSA(nn.Module):
     """
@@ -15,6 +16,48 @@ class LLMABSA(nn.Module):
         from src.models.embedding import LLMEmbedding
         from src.models.span_detector import SpanDetector
         from src.models.classifier import AspectOpinionJointClassifier
+
+        # ============================================================================
+        # INSTRUCTION-FOLLOWING COMPONENTS (2024-2025 BREAKTHROUGH)
+        # ============================================================================
+
+        # Add instruction-following capabilities
+        self.use_instruction_following = getattr(config, 'use_instruction_following', True)
+
+        if self.use_instruction_following:
+            # Initialize T5 for instruction following
+            instruction_model = getattr(config, 'instruction_model', 't5-small')
+            try:
+                self.t5_model = T5ForConditionalGeneration.from_pretrained(instruction_model)
+                self.instruction_tokenizer = T5Tokenizer.from_pretrained(instruction_model)
+                
+                # Feature bridge from your backbone to T5
+                self.feature_bridge = nn.Linear(config.hidden_size, self.t5_model.config.d_model)
+                
+                # Instruction templates (CORE 2024-2025 INNOVATION)
+                self.instruction_templates = {
+                    'triplet_extraction': "Extract aspect-opinion-sentiment triplets from: {text}",
+                    'implicit_detection': "Find implicit aspects and opinions in: {text}",
+                    'quadruple_extraction': "Extract aspect-category-opinion-sentiment from: {text}",
+                    'few_shot_adaptation': "Given examples {examples}, extract triplets from: {text}"
+                }
+                
+                # Add special tokens for structured output
+                special_tokens = ["<triplet>", "</triplet>", "<aspect>", "</aspect>", 
+                                "<opinion>", "</opinion>", "<sentiment>", "</sentiment>",
+                                "<implicit>", "</implicit>", "<POS>", "<NEG>", "<NEU>"]
+                self.instruction_tokenizer.add_tokens(special_tokens)
+                self.t5_model.resize_token_embeddings(len(self.instruction_tokenizer))
+                
+                print(f"✓ Instruction-following enabled with {instruction_model}")
+                
+            except Exception as e:
+                print(f"Warning: Failed to load instruction model {instruction_model}: {e}")
+                self.use_instruction_following = False
+                
+        # Unified training weights
+        self.extraction_weight = getattr(config, 'extraction_weight', 1.0)
+        self.generation_weight = getattr(config, 'generation_weight', 0.5)
         
         # Initialize components
         self.config = config
@@ -112,7 +155,7 @@ class LLMABSA(nn.Module):
             }
         }
         
-    def forward(self, input_ids, attention_mask, texts=None, **kwargs):
+    def forward(self, input_ids, attention_mask, texts=None, task_type='triplet_extraction', target_text=None, **kwargs):
         """Forward pass for triplet extraction with enhanced error handling and improved outputs"""
         try:
             # Get embeddings - Try different approaches to handle the error
@@ -224,6 +267,13 @@ class LLMABSA(nn.Module):
                 'boundary_logits': boundary_logits if boundary_logits is not None else None
             }
             
+            if self.use_instruction_following and texts is not None:
+                instruction_outputs = self._process_instruction_following(
+                    input_ids, attention_mask, texts, hidden_states, 
+                    task_type, target_text, outputs
+                )
+                outputs.update(instruction_outputs)
+
             return outputs
             
         except Exception as e:
@@ -246,6 +296,96 @@ class LLMABSA(nn.Module):
             except:
                 # Complete failure - return None and let extract_triplets handle it
                 return None
+    def _process_instruction_following(self, input_ids, attention_mask, texts, hidden_states, 
+                                 task_type, target_text, extraction_outputs):
+        """Process instruction-following for unified ABSA (2024-2025 breakthrough)"""
+        try:
+            if not self.use_instruction_following:
+                return {}
+            
+            # Convert first text to instruction format
+            text = texts[0] if isinstance(texts, list) else texts
+            
+            # IMPROVED: Create better instruction with examples
+            if task_type == 'triplet_extraction':
+                instruction = f"""Extract aspect-opinion-sentiment triplets from the following restaurant review. Format as: <triplet><aspect>ASPECT</aspect><opinion>OPINION</opinion><sentiment>POS/NEG/NEU</sentiment></triplet>
+
+    Review: {text}
+
+    Triplets:"""
+            else:
+                instruction = self.instruction_templates[task_type].format(text=text)
+            
+            # Tokenize instruction
+            instruction_inputs = self.instruction_tokenizer(
+                instruction, 
+                return_tensors='pt', 
+                max_length=512, 
+                truncation=True, 
+                padding=True
+            ).to(input_ids.device)
+            
+            instruction_outputs = {}
+            
+            if target_text is not None:  # Training mode
+                # Tokenize target text
+                target_inputs = self.instruction_tokenizer(
+                    target_text if isinstance(target_text, str) else target_text[0],
+                    return_tensors='pt',
+                    max_length=256,
+                    truncation=True,
+                    padding=True
+                ).to(input_ids.device)
+                
+                # T5 forward pass with labels
+                t5_outputs = self.t5_model(
+                    input_ids=instruction_inputs.input_ids,
+                    attention_mask=instruction_inputs.attention_mask,
+                    labels=target_inputs.input_ids
+                )
+                
+                instruction_outputs.update({
+                    'generation_loss': t5_outputs.loss,
+                    'generation_logits': t5_outputs.logits
+                })
+                
+            else:  # Inference mode
+                # IMPROVED: Better generation parameters
+                generated_ids = self.t5_model.generate(
+                    input_ids=instruction_inputs.input_ids,
+                    attention_mask=instruction_inputs.attention_mask,
+                    max_length=128,  # Reduced from 256
+                    min_length=10,   # Added minimum length
+                    num_beams=2,     # Reduced from 3 for faster generation
+                    early_stopping=True,
+                    do_sample=False,
+                    temperature=1.0,
+                    pad_token_id=self.instruction_tokenizer.pad_token_id,
+                    eos_token_id=self.instruction_tokenizer.eos_token_id,
+                    repetition_penalty=1.2  # Prevent repetition
+                )
+                
+                generated_text = self.instruction_tokenizer.decode(
+                    generated_ids[0], skip_special_tokens=True
+                )
+                
+                # IMPROVED: Clean up generated text
+                generated_text = generated_text.replace(instruction, "").strip()
+                if not generated_text:
+                    generated_text = "No triplets generated"
+                
+                instruction_outputs.update({
+                    'generated_text': generated_text,
+                    'generated_ids': generated_ids
+                })
+            
+            return instruction_outputs
+            
+        except Exception as e:
+            print(f"Error in instruction following: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
                 
     def save(self, save_path):
         """Save model with proper metadata"""
