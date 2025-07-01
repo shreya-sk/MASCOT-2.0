@@ -135,16 +135,31 @@ def mixup_batch(batch, alpha=0.2):
     batch_size = batch['input_ids'].size(0)
     index = torch.randperm(batch_size)
     
-    mixed_input_ids = lam * batch['input_ids'] + (1 - lam) * batch['input_ids'][index]
+    # FIXED: Don't apply mixup to input_ids because embeddings need integer inputs
+    # Instead, we'll apply mixup at the embedding level in the forward pass
+    mixed_input_ids = batch['input_ids']  # Keep input_ids as integers
     mixed_attention_mask = batch['attention_mask']  # Keep attention mask the same
     
-    # Mix labels - for soft labels based on mixup
-    batch['mixed_aspect_labels'] = lam * batch['aspect_labels'] + (1 - lam) * batch['aspect_labels'][index]
-    batch['mixed_opinion_labels'] = lam * batch['opinion_labels'] + (1 - lam) * batch['opinion_labels'][index]
-    batch['mixed_sentiment_labels'] = lam * batch.get('sentiment_labels', 0) + (1 - lam) * batch.get('sentiment_labels', 0)[index]
-    
-    batch['input_ids'] = mixed_input_ids
+    # Store mixup information for the model to use
     batch['mixup_lambda'] = lam
     batch['mixup_index'] = index
+    
+    # Mix labels for soft labels based on mixup (these will still be handled in loss calculation)
+    batch['mixed_aspect_labels'] = torch.zeros_like(batch['aspect_labels'], dtype=torch.float)
+    for b in range(batch_size):
+        batch['mixed_aspect_labels'][b] = lam * F.one_hot(batch['aspect_labels'][b], num_classes=3) + \
+                                        (1 - lam) * F.one_hot(batch['aspect_labels'][index[b]], num_classes=3)
+    
+    batch['mixed_opinion_labels'] = torch.zeros_like(batch['opinion_labels'], dtype=torch.float)
+    for b in range(batch_size):
+        batch['mixed_opinion_labels'][b] = lam * F.one_hot(batch['opinion_labels'][b], num_classes=3) + \
+                                         (1 - lam) * F.one_hot(batch['opinion_labels'][index[b]], num_classes=3)
+    
+    # For sentiment labels
+    if 'sentiment_labels' in batch:
+        batch['mixed_sentiment_labels'] = torch.zeros((batch_size, 3), dtype=torch.float, device=batch['sentiment_labels'].device)
+        for b in range(batch_size):
+            batch['mixed_sentiment_labels'][b] = lam * F.one_hot(batch['sentiment_labels'][b], num_classes=3) + \
+                                              (1 - lam) * F.one_hot(batch['sentiment_labels'][index[b]], num_classes=3)
     
     return batch

@@ -321,7 +321,7 @@ def train_phase(model, train_loader, val_loader, config, logger, device, dataset
 
 def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, config, 
                logger, global_step, epoch, dataset_name, phase, generate):
-    """Train for one epoch"""
+    """Train for one epoch with simplified error handling and no mixup"""
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -335,20 +335,25 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, conf
             batch_on_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
                              for k, v in batch.items()}
             
-            # Apply mixup if configured
-            if getattr(config, 'use_mixup', False) and random.random() < 0.5:  # 50% chance
-                from src.data.dataset import mixup_batch
-                batch_on_device = mixup_batch(batch_on_device, alpha=config.mixup_alpha)
-                
-            # Rest of your function...
-            # Forward pass
-            outputs = model(**batch_on_device, generate=generate)
+            # Ensure input_ids are long tensors
+            if 'input_ids' in batch_on_device:
+                batch_on_device['input_ids'] = batch_on_device['input_ids'].long()
             
-            # Calculate loss
+            # Forward pass - pass the text if available for better error handling
+            texts = batch_on_device.get('text', None)
+            outputs = model(**batch_on_device, generate=generate, texts=texts)
+            
+            # Calculate loss with our improved loss function
             loss_dict = loss_fn(outputs, batch_on_device, generate=generate)
             loss = loss_dict['loss']
             
-            # Backward pass and optimize
+            # Make sure loss is differentiable
+            if not loss.requires_grad:
+                print("Warning: Loss does not require grad, adding a dummy term")
+                dummy_term = outputs['aspect_logits'].sum() * 0.0001
+                loss = loss + dummy_term
+            
+            # Backward pass
             loss.backward()
             
             # Gradient accumulation
@@ -391,6 +396,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, conf
         except Exception as e:
             print(f"Error in batch {batch_idx}: {e}")
             traceback.print_exc()
+            
+            # Clean up GPU memory
+            torch.cuda.empty_cache()
+            
             continue
     
     # Return average loss

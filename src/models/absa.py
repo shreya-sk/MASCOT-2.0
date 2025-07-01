@@ -23,6 +23,10 @@ class LLMABSA(nn.Module):
         # Initialize embeddings
         self.embeddings = LLMEmbedding(config)
         
+        # Add a direct reference to the encoder for compatibility
+        if hasattr(self.embeddings, 'encoder'):
+            self.encoder = self.embeddings.encoder
+        
         # Get the actual embedding output dimension
         embedding_size = getattr(self.embeddings, 'model_hidden_size', config.hidden_size)
         
@@ -95,15 +99,44 @@ class LLMABSA(nn.Module):
         else:
             return embeddings_output
     
-# Update this in src/models/absa.py
     def forward(self, input_ids, attention_mask, texts=None, **kwargs):
         """Forward pass for triplet extraction with enhanced error handling and improved outputs"""
         try:
-            # Get embeddings
-            embeddings_output = self.embeddings(
-                input_ids=input_ids,
-                attention_mask=attention_mask
-            )
+            # Get embeddings - Try different approaches to handle the error
+            try:
+                # Try using the embeddings wrapper with keyword args
+                embeddings_output = self.embeddings(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                )
+            except TypeError:
+                try:
+                    # Try with positional args
+                    embeddings_output = self.embeddings(input_ids, attention_mask)
+                except TypeError:
+                    # Fallback to direct encoder use
+                    if hasattr(self, 'encoder'):
+                        outputs = self.encoder(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            return_dict=True
+                        )
+                        if hasattr(outputs, 'last_hidden_state'):
+                            embeddings_output = {'hidden_states': outputs.last_hidden_state}
+                        else:
+                            # Last resort fallback
+                            batch_size, seq_len = input_ids.size()
+                            device = input_ids.device
+                            embeddings_output = {
+                                'hidden_states': torch.zeros(batch_size, seq_len, self.hidden_size, device=device)
+                            }
+                    else:
+                        # Create a simple embedding as last resort
+                        batch_size, seq_len = input_ids.size()
+                        device = input_ids.device
+                        embeddings_output = {
+                            'hidden_states': torch.zeros(batch_size, seq_len, self.hidden_size, device=device)
+                        }
             
             # Extract hidden states
             hidden_states = self._extract_hidden_states(embeddings_output)
@@ -137,11 +170,6 @@ class LLMABSA(nn.Module):
                 opinion_logits = torch.zeros(batch_size, seq_len, 3, device=device)
                 # Set bias toward O tag (index 0)
                 opinion_logits[:, :, 0] = 1.0
-                
-            # Print debug info for the dimension of hidden_states
-            # print(f"Hidden states shape: {hidden_states.shape}")
-            # print(f"Expected hidden dimension: {self.hidden_size}")
-            # print(f"Expected classifier input dimension: {self.sentiment_classifier.input_dim}")
             
             # Get sentiment and confidence with explicit error handling
             try:

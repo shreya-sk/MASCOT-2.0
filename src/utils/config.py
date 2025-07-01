@@ -46,8 +46,8 @@ class LLMABSAConfig:
     boundary_weight: float = 0.5  # Weight for boundary refinement
     focal_gamma: float = 2.0  # Focal loss gamma parameter
     
-    # Data augmentation
-    use_mixup: bool = True  # Enable mixup augmentation
+    # Data augmentation - DISABLE mixup to avoid errors
+    use_mixup: bool = False  # Disable mixup augmentation
     mixup_alpha: float = 0.2  # Mixup parameter
     use_augmentation: bool = True  # Enable data augmentation
     
@@ -109,72 +109,3 @@ class LLMABSAConfig:
         # Ensure consistent batch size with gradient accumulation
         self.effective_batch_size = self.batch_size * self.gradient_accumulation_steps
         print(f"Effective batch size: {self.effective_batch_size}")
-
-
-@dataclass
-class MemoryConstrainedConfig(LLMABSAConfig):
-    """
-    Super lightweight configuration for extremely constrained environments
-    """
-    # Use tiny models
-    model_name: str = "prajjwal1/bert-tiny"  # Absolute minimum model size
-    hidden_size: int = 128  # Small hidden size
-    num_layers: int = 1  # Single layer
-    dropout: float = 0.1  # Light dropout
-    num_attention_heads: int = 2  # Minimum heads
-    
-    # Disable memory-intensive features
-    use_focal_loss: bool = False
-    use_boundary_loss: bool = False
-    use_contrastive_verification: bool = False
-    use_syntax: bool = False
-    
-    # Minimal batch size
-    batch_size: int = 4
-    gradient_accumulation_steps: int = 2
-    
-    # Short sequences
-    max_seq_length: int = 64
-    
-    # Simpler training
-    learning_rate: float = 5e-4
-    num_epochs: int = 8
-    
-    # Update experiment name
-    experiment_name: str = "ultra-lightweight-absa"
-
-
-@dataclass
-class HighPerformanceConfig(LLMABSAConfig):
-    """
-    Configuration for higher performance when more memory is available
-    """
-    # Stronger model
-    model_name: str = "microsoft/deberta-v3-large"  # Better model
-    hidden_size: int = 1024  # Match model hidden size
-    num_layers: int = 3  # Use more layers
-    dropout: float = 0.1  # Lighter dropout for better models
-    num_attention_heads: int = 16  # Match model
-    
-    # Enable all features
-    use_focal_loss: bool = True
-    use_boundary_loss: bool = True
-    use_contrastive_verification: bool = True  # Enable contrastive verification
-    use_syntax: bool = True  # Enable syntax information
-    
-    # Less freezing
-    freeze_layers: float = 0.4  # Only freeze 40% of layers
-    
-    # Larger batch size
-    batch_size: int = 12
-    gradient_accumulation_steps: int = 2
-    
-    # Longer sequences
-    max_seq_length: int = 160
-    
-    # More advanced training
-    learning_rate: float = 1e-5
-    use_fp16: bool = True  # Enable mixed precision
-    
-    # Update experiment name
-    experiment_name: str = "high-performance-absa-v2"

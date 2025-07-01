@@ -138,6 +138,10 @@ class LLMEmbedding(nn.Module):
     def forward(self, input_ids, attention_mask, domain_id=None):
         """Memory-efficient forward pass with robustness improvements"""
         try:
+            # Ensure input_ids is LongTensor
+            if input_ids.dtype != torch.long and input_ids.dtype != torch.int:
+                input_ids = input_ids.long()  # Convert to Long tensor
+                
             # Get embeddings from model
             outputs = self.encoder(
                 input_ids=input_ids,
@@ -181,6 +185,7 @@ class LLMEmbedding(nn.Module):
             
         except Exception as e:
             print(f"Error in embedding forward pass: {e}")
+            import traceback
             traceback.print_exc()
             
             # Return tensor placeholders with correct dimensions

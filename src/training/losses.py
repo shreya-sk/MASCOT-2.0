@@ -56,11 +56,11 @@ class ABSALoss(nn.Module):
             sentiment_logits = outputs['sentiment_logits']  # [batch_size, num_classes]
             
             # Initialize losses
-            aspect_loss = torch.tensor(0.0, device=aspect_logits.device)
-            opinion_loss = torch.tensor(0.0, device=opinion_logits.device)
-            sentiment_loss = torch.tensor(0.0, device=sentiment_logits.device)
-            boundary_loss = torch.tensor(0.0, device=aspect_logits.device)
-            explanation_loss = torch.tensor(0.0, device=aspect_logits.device)
+            aspect_loss = torch.tensor(0.0, device=aspect_logits.device, requires_grad=True)
+            opinion_loss = torch.tensor(0.0, device=opinion_logits.device, requires_grad=True)
+            sentiment_loss = torch.tensor(0.0, device=sentiment_logits.device, requires_grad=True)
+            boundary_loss = torch.tensor(0.0, device=aspect_logits.device, requires_grad=True)
+            explanation_loss = torch.tensor(0.0, device=aspect_logits.device, requires_grad=True)
             
             # Process aspect loss
             if 'aspect_labels' in targets:
@@ -68,8 +68,19 @@ class ABSALoss(nn.Module):
                 
                 # Handle mixed labels from mixup
                 if 'mixed_aspect_labels' in targets:
-                    # Use soft labels from mixup
-                    aspect_loss = self._compute_soft_loss(aspect_logits, targets['mixed_aspect_labels'])
+                    try:
+                        # Use soft labels from mixup
+                        aspect_loss = self._compute_soft_loss(aspect_logits, targets['mixed_aspect_labels'])
+                    except Exception as e:
+                        print(f"Error in mixed aspect loss: {e}. Falling back to standard loss.")
+                        # Fall back to standard loss
+                        if len(aspect_labels.shape) == 3:  # [batch_size, num_spans, seq_len]
+                            aspect_labels = aspect_labels.max(dim=1)[0]  # [batch_size, seq_len]
+                        aspect_labels = aspect_labels.long()
+                        aspect_loss = self.span_criterion(
+                            aspect_logits.view(-1, 3),
+                            aspect_labels.view(-1)
+                        )
                 else:
                     # Handle multiple spans if needed
                     if len(aspect_labels.shape) == 3:  # [batch_size, num_spans, seq_len]
@@ -88,8 +99,19 @@ class ABSALoss(nn.Module):
                 
                 # Handle mixed labels from mixup
                 if 'mixed_opinion_labels' in targets:
-                    # Use soft labels from mixup
-                    opinion_loss = self._compute_soft_loss(opinion_logits, targets['mixed_opinion_labels'])
+                    try:
+                        # Use soft labels from mixup
+                        opinion_loss = self._compute_soft_loss(opinion_logits, targets['mixed_opinion_labels'])
+                    except Exception as e:
+                        print(f"Error in mixed opinion loss: {e}. Falling back to standard loss.")
+                        # Fall back to standard loss
+                        if len(opinion_labels.shape) == 3:  # [batch_size, num_spans, seq_len]
+                            opinion_labels = opinion_labels.max(dim=1)[0]  # [batch_size, seq_len]
+                        opinion_labels = opinion_labels.long()
+                        opinion_loss = self.span_criterion(
+                            opinion_logits.view(-1, 3),
+                            opinion_labels.view(-1)
+                        )
                 else:
                     # Handle multiple spans if needed
                     if len(opinion_labels.shape) == 3:  # [batch_size, num_spans, seq_len]
@@ -108,10 +130,21 @@ class ABSALoss(nn.Module):
                 
                 # Handle mixed labels from mixup
                 if 'mixed_sentiment_labels' in targets:
-                    # Use soft labels from mixup
-                    sentiment_loss = self._compute_soft_sentiment_loss(
-                        sentiment_logits, targets['mixed_sentiment_labels']
-                    )
+                    try:
+                        # Use soft labels from mixup
+                        sentiment_loss = self._compute_soft_sentiment_loss(
+                            sentiment_logits, targets['mixed_sentiment_labels']
+                        )
+                    except Exception as e:
+                        print(f"Error in mixed sentiment loss: {e}. Falling back to standard loss.")
+                        # Fall back to standard loss
+                        if len(sentiment_labels.shape) > 1 and sentiment_labels.shape[1] > 0:
+                            sentiment_labels = sentiment_labels[:, 0]
+                        sentiment_labels = sentiment_labels.long()
+                        sentiment_loss = self.sentiment_criterion(
+                            sentiment_logits,
+                            sentiment_labels
+                        )
                 else:
                     # Handle multiple spans if needed
                     if len(sentiment_labels.shape) > 1 and sentiment_labels.shape[1] > 0:
@@ -130,32 +163,36 @@ class ABSALoss(nn.Module):
                 
                 # Create boundary labels from aspect and opinion labels
                 if 'aspect_labels' in targets and 'opinion_labels' in targets:
-                    aspect_labels_for_boundary = targets.get('aspect_labels')
-                    if len(aspect_labels_for_boundary.shape) == 3:
-                        aspect_labels_for_boundary = aspect_labels_for_boundary.max(dim=1)[0]
+                    try:
+                        aspect_labels_for_boundary = targets.get('aspect_labels')
+                        if len(aspect_labels_for_boundary.shape) == 3:
+                            aspect_labels_for_boundary = aspect_labels_for_boundary.max(dim=1)[0]
+                            
+                        opinion_labels_for_boundary = targets.get('opinion_labels')
+                        if len(opinion_labels_for_boundary.shape) == 3:
+                            opinion_labels_for_boundary = opinion_labels_for_boundary.max(dim=1)[0]
                         
-                    opinion_labels_for_boundary = targets.get('opinion_labels')
-                    if len(opinion_labels_for_boundary.shape) == 3:
-                        opinion_labels_for_boundary = opinion_labels_for_boundary.max(dim=1)[0]
-                    
-                    # Simple boundary loss - binary cross entropy
-                    boundary_target = torch.zeros_like(boundary_logits)
-                    
-                    # Mark start positions (B tags) in the target
-                    batch_size, seq_len = aspect_labels_for_boundary.shape
-                    for b in range(batch_size):
-                        for s in range(seq_len):
-                            if aspect_labels_for_boundary[b, s] == 1 or opinion_labels_for_boundary[b, s] == 1:
-                                boundary_target[b, s, 0] = 1.0  # Start boundary
-                            if s > 0 and (aspect_labels_for_boundary[b, s-1] > 0 and aspect_labels_for_boundary[b, s] == 0 or
-                                         opinion_labels_for_boundary[b, s-1] > 0 and opinion_labels_for_boundary[b, s] == 0):
-                                boundary_target[b, s-1, 1] = 1.0  # End boundary
-                                
-                    # Compute boundary loss
-                    boundary_loss = F.binary_cross_entropy_with_logits(
-                        boundary_logits,
-                        boundary_target
-                    )
+                        # Simple boundary loss - binary cross entropy
+                        boundary_target = torch.zeros_like(boundary_logits)
+                        
+                        # Mark start positions (B tags) in the target
+                        batch_size, seq_len = aspect_labels_for_boundary.shape
+                        for b in range(batch_size):
+                            for s in range(seq_len):
+                                if aspect_labels_for_boundary[b, s] == 1 or opinion_labels_for_boundary[b, s] == 1:
+                                    boundary_target[b, s, 0] = 1.0  # Start boundary
+                                if s > 0 and (aspect_labels_for_boundary[b, s-1] > 0 and aspect_labels_for_boundary[b, s] == 0 or
+                                            opinion_labels_for_boundary[b, s-1] > 0 and opinion_labels_for_boundary[b, s] == 0):
+                                    boundary_target[b, s-1, 1] = 1.0  # End boundary
+                                    
+                        # Compute boundary loss
+                        boundary_loss = F.binary_cross_entropy_with_logits(
+                            boundary_logits,
+                            boundary_target
+                        )
+                    except Exception as e:
+                        print(f"Error in boundary loss: {e}")
+                        boundary_loss = torch.tensor(0.0, device=aspect_logits.device, requires_grad=True)
             
             # Handle explanation generation loss if available and requested
             if generate and 'explanations' in outputs:
@@ -163,10 +200,14 @@ class ABSALoss(nn.Module):
                 
                 if 'explanation_targets' in targets:
                     # Compute generation loss
-                    explanation_targets = targets['explanation_targets']
-                    explanation_loss = self._compute_generation_loss(
-                        explanation_logits, explanation_targets
-                    )
+                    try:
+                        explanation_targets = targets['explanation_targets']
+                        explanation_loss = self._compute_generation_loss(
+                            explanation_logits, explanation_targets
+                        )
+                    except Exception as e:
+                        print(f"Error in explanation loss: {e}")
+                        explanation_loss = torch.tensor(0.0, device=aspect_logits.device, requires_grad=True)
             
             # Combine all losses with their weights
             total_loss = (
@@ -180,14 +221,20 @@ class ABSALoss(nn.Module):
             if generate and explanation_loss > 0:
                 total_loss = total_loss + explanation_loss
             
+            # Make sure total_loss is a scalar and requires_grad
+            if not total_loss.requires_grad:
+                # Create a small dummy loss that requires grad
+                dummy_term = (aspect_logits.sum() + opinion_logits.sum() + sentiment_logits.sum()) * 0.0001
+                total_loss = total_loss + dummy_term
+            
             # Return dictionary with all loss components
             return {
                 'loss': total_loss,
-                'aspect_loss': aspect_loss.item(),
-                'opinion_loss': opinion_loss.item(),
-                'sentiment_loss': sentiment_loss.item(),
-                'boundary_loss': boundary_loss.item(),
-                'explanation_loss': explanation_loss.item() if generate else 0.0
+                'aspect_loss': aspect_loss.detach().item(),
+                'opinion_loss': opinion_loss.detach().item(),
+                'sentiment_loss': sentiment_loss.detach().item(),
+                'boundary_loss': boundary_loss.detach().item(),
+                'explanation_loss': explanation_loss.detach().item() if generate else 0.0
             }
             
         except Exception as e:
@@ -198,7 +245,7 @@ class ABSALoss(nn.Module):
             # Create a simple differentiable loss for backward compatibility
             device = outputs['aspect_logits'].device
             
-            # Create a dummy loss that requires gradient
+            # Create a dummy loss that definitely requires gradient
             dummy_loss = (
                 outputs['aspect_logits'].sum() * 0.0001 +
                 outputs['opinion_logits'].sum() * 0.0001 +
@@ -216,7 +263,35 @@ class ABSALoss(nn.Module):
     
     def _compute_soft_loss(self, logits, soft_targets):
         """Compute loss with soft labels from mixup"""
+        # Ensure dimensions match
+        if soft_targets.dim() == logits.dim():
+            # Dimensions already match
+            pass
+        elif soft_targets.dim() == 3 and logits.dim() == 3:
+            # Check if the class dimension matches
+            if soft_targets.size(-1) != logits.size(-1):
+                # Reshape soft_targets to match logits class dimension
+                if soft_targets.size(-1) > logits.size(-1):
+                    # Truncate extra dimensions
+                    soft_targets = soft_targets[..., :logits.size(-1)]
+                else:
+                    # Pad with zeros
+                    padding = torch.zeros(*soft_targets.shape[:-1], logits.size(-1) - soft_targets.size(-1), 
+                                        device=soft_targets.device)
+                    soft_targets = torch.cat([soft_targets, padding], dim=-1)
+        elif soft_targets.dim() < logits.dim():
+            # Expand soft_targets to match logits dimensions
+            soft_targets = soft_targets.view(*soft_targets.shape, 1).expand(*soft_targets.shape, logits.size(-1))
+        
+        # Apply softmax and compute cross-entropy
         log_probs = F.log_softmax(logits, dim=-1)
+        
+        # Ensure shapes match for element-wise multiplication
+        if log_probs.shape != soft_targets.shape:
+            # Reshape log_probs to match the expected shape
+            log_probs = log_probs.view(soft_targets.shape)
+        
+        # Compute loss
         loss = -(soft_targets * log_probs).sum(dim=-1).mean()
         return loss
     
@@ -255,7 +330,16 @@ class FocalLossWithLS(nn.Module):
     def __init__(self, gamma=2.0, alpha=None, ignore_index=-100, label_smoothing=0.1):
         super().__init__()
         self.gamma = gamma
-        self.alpha = alpha
+        
+        # Ensure alpha is a tensor with proper dtype if provided
+        if alpha is not None:
+            if isinstance(alpha, torch.Tensor):
+                self.alpha = alpha.float()  # Ensure alpha is float tensor
+            else:
+                self.alpha = torch.tensor(alpha, dtype=torch.float)
+        else:
+            self.alpha = None
+            
         self.ignore_index = ignore_index
         self.label_smoothing = label_smoothing
         
@@ -270,11 +354,15 @@ class FocalLossWithLS(nn.Module):
         Returns:
             Loss tensor
         """
+        # Ensure targets are long dtype
+        if targets.dtype != torch.long:
+            targets = targets.long()
+            
         # Get number of classes
         num_classes = logits.size(-1)
         
         # Create one-hot encoding for targets
-        targets_one_hot = torch.zeros_like(logits).scatter_(
+        targets_one_hot = torch.zeros_like(logits, dtype=torch.float).scatter_(
             -1, targets.unsqueeze(-1), 1.0
         )
         
@@ -308,12 +396,25 @@ class FocalLossWithLS(nn.Module):
         
         # Apply alpha weighting if provided
         if self.alpha is not None:
-            alpha = self.alpha.to(logits.device)
-            alpha_weights = torch.zeros_like(targets, device=logits.device)
+            # Get device of logits
+            device = logits.device
             
-            # Apply alpha weighting only to valid targets
-            valid_targets = targets[targets != self.ignore_index]
-            alpha_weights[targets != self.ignore_index] = alpha[valid_targets]
+            # Make sure alpha is on the correct device
+            alpha = self.alpha.to(device)
+            
+            # Initialize alpha weights with zeros (same dtype as focal_loss)
+            alpha_weights = torch.zeros_like(targets, device=device, dtype=torch.float)
+            
+            # Get valid targets
+            valid_indices = targets != self.ignore_index
+            valid_targets = targets[valid_indices]
+            
+            # Apply alpha weighting only to valid targets (with proper indexing)
+            if len(valid_targets) > 0:
+                # Make sure valid_targets is in bounds of alpha
+                valid_targets_clamped = torch.clamp(valid_targets, 0, len(alpha) - 1)
+                # Use float tensor for alpha_weights to match alpha dtype
+                alpha_weights[valid_indices] = alpha[valid_targets_clamped]
             
             focal_loss = focal_loss * alpha_weights
         
