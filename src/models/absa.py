@@ -98,7 +98,20 @@ class LLMABSA(nn.Module):
                 return list(embeddings_output.values())[0]
         else:
             return embeddings_output
-    
+    # Add this method to LLMABSA class
+    def get_model_info(self):
+        """Debug method to check model configuration"""
+        return {
+            'embedding_size': getattr(self.embeddings, 'model_hidden_size', 'unknown'),
+            'config_hidden_size': self.config.hidden_size,
+            'actual_hidden_size': self.hidden_size,
+            'components': {
+                'embeddings': type(self.embeddings).__name__,
+                'span_detector': type(self.span_detector).__name__,
+                'classifier': type(self.sentiment_classifier).__name__
+            }
+        }
+        
     def forward(self, input_ids, attention_mask, texts=None, **kwargs):
         """Forward pass for triplet extraction with enhanced error handling and improved outputs"""
         try:

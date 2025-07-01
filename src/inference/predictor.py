@@ -44,8 +44,12 @@ class LLMABSAPredictor:
         # Initialize model
         self.model = LLMABSA.load(model_path, config=config, device=self.device)
         
-        # Set tokenizer for model if needed
-        self.model.tokenizer = self.tokenizer
+
+        if hasattr(self.model, 'set_tokenizer'):
+            self.model.set_tokenizer(self.tokenizer)
+        else:
+            self.model.tokenizer = self.tokenizer
+        
         
         # Initialize explanation generator
         self.explanation_generator = ExplanationGenerator()
@@ -53,7 +57,7 @@ class LLMABSAPredictor:
         # Confidence thresholds for filtering triplets
         self.min_confidence = 0.5
         self.high_confidence = 0.7
-    
+  
     def filter_triplets(self, triplets, confidence_threshold=0.6):
         """Filter low-confidence triplets to improve generation quality"""
         filtered = [t for t in triplets if t["confidence"] > confidence_threshold]
