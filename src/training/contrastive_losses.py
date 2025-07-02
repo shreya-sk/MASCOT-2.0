@@ -1,467 +1,554 @@
-# src/training/contrastive_losses.py
+"""
+Contrastive Learning Losses for ABSA (2024-2025 Breakthrough Features)
+Implements InfoNCE, NT-Xent, and Enhanced Triplet Loss for supervised contrastive learning
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-
-class ITSCLLoss(nn.Module):
-    """
-    Instruction Tuning with Supervised Contrastive Learning (ITSCL)
-    
-    2024-2025 breakthrough: Combines InfoNCE and NT-Xent losses for unified
-    extraction-generation alignment with contrastive verification.
-    """
-    
-    def __init__(self, config):
-        super().__init__()
-        self.temperature = getattr(config, 'contrastive_temperature', 0.07)
-        self.margin = getattr(config, 'contrastive_margin', 0.2)
-        self.lambda_infonce = getattr(config, 'lambda_infonce', 1.0)
-        self.lambda_ntxent = getattr(config, 'lambda_ntxent', 0.5)
-        self.lambda_cross_modal = getattr(config, 'lambda_cross_modal', 0.3)
-        
-        # Projection heads for contrastive learning
-        hidden_size = config.hidden_size
-        self.aspect_projection = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, 128),
-            nn.L2Norm(dim=1)
-        )
-        
-        self.opinion_projection = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, 128),
-            nn.L2Norm(dim=1)
-        )
-        
-        self.sentiment_combination_projection = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 256),
-            nn.L2Norm(dim=1)
-        )
-        
-        # Cross-modal alignment projection
-        self.cross_modal_projection = nn.Sequential(
-            nn.Linear(hidden_size, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.L2Norm(dim=1)
-        )
-        
-    def forward(self, outputs, targets, generation_embeddings=None):
-        """
-        Compute ITSCL loss combining multiple contrastive objectives
-        
-        Args:
-            outputs: Model outputs with embeddings
-            targets: Target labels
-            generation_embeddings: Optional embeddings from generation model
-            
-        Returns:
-            Dictionary with contrastive loss components
-        """
-        device = outputs['aspect_logits'].device
-        
-        # Extract embeddings from span features
-        span_features = outputs.get('span_features')
-        if span_features is None:
-            span_features = outputs.get('hidden_states')
-        
-        if span_features is None:
-            return {'contrastive_loss': torch.tensor(0.0, device=device)}
-        
-        # Create aspect and opinion embeddings through attention pooling
-        aspect_embeddings = self._extract_span_embeddings(
-            span_features, outputs['aspect_logits'], targets['aspect_labels']
-        )
-        opinion_embeddings = self._extract_span_embeddings(
-            span_features, outputs['opinion_logits'], targets['opinion_labels']
-        )
-        
-        # Project embeddings to contrastive space
-        aspect_proj = self.aspect_projection(aspect_embeddings)
-        opinion_proj = self.opinion_projection(opinion_embeddings)
-        
-        # 1. InfoNCE Loss for Aspect-Opinion Alignment
-        infonce_loss = self._compute_infonce_loss(aspect_proj, opinion_proj, targets['sentiment_labels'])
-        
-        # 2. NT-Xent Loss for Sentiment Consistency
-        sentiment_combinations = torch.cat([aspect_embeddings, opinion_embeddings], dim=-1)
-        sentiment_proj = self.sentiment_combination_projection(sentiment_combinations)
-        ntxent_loss = self._compute_ntxent_loss(sentiment_proj, targets['sentiment_labels'])
-        
-        # 3. Cross-Modal Contrastive Learning (if generation embeddings available)
-        cross_modal_loss = torch.tensor(0.0, device=device)
-        if generation_embeddings is not None:
-            extraction_repr = torch.cat([aspect_proj, opinion_proj], dim=-1)
-            cross_modal_loss = self._compute_cross_modal_loss(extraction_repr, generation_embeddings)
-        
-        # Combine all contrastive losses
-        total_contrastive_loss = (
-            self.lambda_infonce * infonce_loss +
-            self.lambda_ntxent * ntxent_loss +
-            self.lambda_cross_modal * cross_modal_loss
-        )
-        
-        return {
-            'contrastive_loss': total_contrastive_loss,
-            'infonce_loss': infonce_loss,
-            'ntxent_loss': ntxent_loss,
-            'cross_modal_loss': cross_modal_loss
-        }
-    
-    def _extract_span_embeddings(self, span_features, logits, labels):
-        """Extract span embeddings using attention pooling"""
-        batch_size, seq_len, hidden_size = span_features.shape
-        device = span_features.device
-        
-        # Get attention weights from logits (softmax over sequence)
-        attention_weights = F.softmax(logits[:, :, 1:].sum(dim=-1), dim=-1)  # B+I tags
-        
-        # Attention pooling
-        span_embeddings = torch.sum(span_features * attention_weights.unsqueeze(-1), dim=1)
-        
-        return span_embeddings
-    
-    def _compute_infonce_loss(self, aspect_embeddings, opinion_embeddings, sentiment_labels):
-        """
-        Compute InfoNCE loss for aspect-opinion alignment
-        Multi-positive contrastive learning considering sentiment compatibility
-        """
-        batch_size = aspect_embeddings.size(0)
-        device = aspect_embeddings.device
-        
-        # Compute similarity matrix
-        similarity_matrix = torch.matmul(aspect_embeddings, opinion_embeddings.transpose(0, 1)) / self.temperature
-        
-        # Create positive mask based on sentiment compatibility
-        sentiment_labels = sentiment_labels.squeeze() if len(sentiment_labels.shape) > 1 else sentiment_labels
-        positive_mask = torch.eye(batch_size, device=device)
-        
-        # Enhanced positive pairs: same sentiment = additional positive signal
-        for i in range(batch_size):
-            for j in range(batch_size):
-                if i != j and sentiment_labels[i] == sentiment_labels[j]:
-                    positive_mask[i, j] = 0.5  # Weaker positive for same sentiment
-        
-        # Compute InfoNCE loss
-        exp_sim = torch.exp(similarity_matrix)
-        pos_sim = exp_sim * positive_mask
-        
-        loss = -torch.log(pos_sim.sum(dim=1) / exp_sim.sum(dim=1) + 1e-8).mean()
-        
-        return loss
-    
-    def _compute_ntxent_loss(self, sentiment_embeddings, sentiment_labels):
-        """
-        Compute NT-Xent loss for sentiment consistency
-        Supervised contrastive learning for sentiment clustering
-        """
-        batch_size = sentiment_embeddings.size(0)
-        device = sentiment_embeddings.device
-        
-        # Normalize embeddings
-        sentiment_embeddings = F.normalize(sentiment_embeddings, dim=1)
-        
-        # Compute similarity matrix
-        similarity_matrix = torch.matmul(sentiment_embeddings, sentiment_embeddings.transpose(0, 1)) / self.temperature
-        
-        # Create mask for same sentiment labels
-        sentiment_labels = sentiment_labels.squeeze() if len(sentiment_labels.shape) > 1 else sentiment_labels
-        mask = torch.eq(sentiment_labels.unsqueeze(0), sentiment_labels.unsqueeze(1)).float()
-        
-        # Remove diagonal (self-similarity)
-        mask = mask - torch.eye(batch_size, device=device)
-        
-        # Compute NT-Xent loss
-        exp_sim = torch.exp(similarity_matrix)
-        
-        # Positive pairs (same sentiment)
-        pos_sim = exp_sim * mask
-        
-        # Negative pairs (different sentiment + self)
-        neg_mask = 1.0 - mask
-        neg_sim = exp_sim * neg_mask
-        
-        # Compute loss for each positive pair
-        loss = 0.0
-        num_positives = 0
-        
-        for i in range(batch_size):
-            pos_count = mask[i].sum()
-            if pos_count > 0:
-                pos_log_prob = torch.log(pos_sim[i].sum() / (pos_sim[i].sum() + neg_sim[i].sum()) + 1e-8)
-                loss += -pos_log_prob / pos_count
-                num_positives += 1
-        
-        return loss / max(num_positives, 1)
-    
-    def _compute_cross_modal_loss(self, extraction_embeddings, generation_embeddings):
-        """
-        Compute cross-modal contrastive loss between extraction and generation
-        """
-        batch_size = extraction_embeddings.size(0)
-        
-        # Project to same dimensionality
-        extraction_proj = self.cross_modal_projection(extraction_embeddings)
-        generation_proj = self.cross_modal_projection(generation_embeddings)
-        
-        # Compute similarity
-        similarity = F.cosine_similarity(extraction_proj, generation_proj, dim=1)
-        
-        # Target similarity = 1 (perfect alignment)
-        target = torch.ones_like(similarity)
-        
-        # MSE loss for alignment
-        loss = F.mse_loss(similarity, target)
-        
-        return loss
+import numpy as np
+from typing import Dict, List, Tuple, Optional
 
 
-class ContrastiveVerificationModule(nn.Module):
+class InfoNCELoss(nn.Module):
     """
-    Contrastive verification module for sentiment consistency checking
-    
-    Verifies that extracted triplets are consistent with generated explanations
-    using contrastive learning principles.
+    InfoNCE Loss extended for multiple positive and negative samples
+    Based on EMNLP 2024 breakthrough for implicit sentiment detection
     """
     
-    def __init__(self, config):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.verification_threshold = 0.7
-        
-        # Triplet encoder
-        self.triplet_encoder = nn.Sequential(
-            nn.Linear(self.hidden_size * 3, self.hidden_size * 2),  # aspect + opinion + sentiment
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.hidden_size * 2, self.hidden_size),
-            nn.ReLU(),
-            nn.Linear(self.hidden_size, 256)
-        )
-        
-        # Explanation encoder
-        self.explanation_encoder = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.hidden_size // 2, 256)
-        )
-        
-        # Contrastive classifier
-        self.consistency_classifier = nn.Sequential(
-            nn.Linear(512, 256),  # Concatenated triplet + explanation
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, 2)  # Consistent / Inconsistent
-        )
-        
-    def forward(self, triplet_embeddings, explanation_embeddings):
-        """
-        Verify consistency between triplets and explanations
-        
-        Args:
-            triplet_embeddings: Embeddings from extracted triplets
-            explanation_embeddings: Embeddings from generated explanations
-            
-        Returns:
-            Consistency scores and verification loss
-        """
-        # Encode triplets and explanations
-        triplet_repr = self.triplet_encoder(triplet_embeddings)
-        explanation_repr = self.explanation_encoder(explanation_embeddings)
-        
-        # Concatenate representations
-        combined_repr = torch.cat([triplet_repr, explanation_repr], dim=-1)
-        
-        # Classify consistency
-        consistency_logits = self.consistency_classifier(combined_repr)
-        consistency_probs = F.softmax(consistency_logits, dim=-1)
-        
-        # Contrastive verification loss
-        verification_loss = self._compute_verification_loss(triplet_repr, explanation_repr)
-        
-        return {
-            'consistency_scores': consistency_probs[:, 1],  # Probability of being consistent
-            'consistency_logits': consistency_logits,
-            'verification_loss': verification_loss
-        }
-    
-    def _compute_verification_loss(self, triplet_repr, explanation_repr):
-        """Compute contrastive verification loss"""
-        # Positive pairs: corresponding triplet-explanation pairs
-        pos_similarity = F.cosine_similarity(triplet_repr, explanation_repr, dim=1)
-        
-        # Negative pairs: mismatched triplet-explanation pairs
-        batch_size = triplet_repr.size(0)
-        if batch_size > 1:
-            # Create negative pairs by shifting
-            shifted_explanation = torch.roll(explanation_repr, shifts=1, dims=0)
-            neg_similarity = F.cosine_similarity(triplet_repr, shifted_explanation, dim=1)
-            
-            # Contrastive loss: maximize positive similarity, minimize negative similarity
-            contrastive_loss = torch.clamp(self.verification_threshold - pos_similarity + neg_similarity, min=0.0).mean()
-        else:
-            # Single sample - just maximize positive similarity
-            contrastive_loss = torch.clamp(self.verification_threshold - pos_similarity, min=0.0).mean()
-        
-        return contrastive_loss
-
-
-class MultiLevelContrastiveLoss(nn.Module):
-    """
-    4-layer contrastive framework combining sentiments, aspects, opinions, and their combinations
-    """
-    
-    def __init__(self, config):
-        super().__init__()
-        self.temperature = getattr(config, 'contrastive_temperature', 0.07)
-        
-        # Layer 1: Aspect-level contrastive learning
-        self.aspect_contrastive = SupConLoss(temperature=self.temperature)
-        
-        # Layer 2: Opinion-level contrastive learning  
-        self.opinion_contrastive = SupConLoss(temperature=self.temperature)
-        
-        # Layer 3: Sentiment-level contrastive learning
-        self.sentiment_contrastive = SupConLoss(temperature=self.temperature)
-        
-        # Layer 4: Combined triplet-level contrastive learning
-        self.triplet_contrastive = SupConLoss(temperature=self.temperature)
-        
-    def forward(self, aspect_embeddings, opinion_embeddings, sentiment_embeddings, 
-                aspect_labels, opinion_labels, sentiment_labels):
-        """Compute multi-level contrastive loss"""
-        
-        # Layer 1: Aspect contrastive loss
-        aspect_loss = self.aspect_contrastive(aspect_embeddings, aspect_labels)
-        
-        # Layer 2: Opinion contrastive loss
-        opinion_loss = self.opinion_contrastive(opinion_embeddings, opinion_labels)
-        
-        # Layer 3: Sentiment contrastive loss
-        sentiment_loss = self.sentiment_contrastive(sentiment_embeddings, sentiment_labels)
-        
-        # Layer 4: Combined triplet contrastive loss
-        triplet_embeddings = torch.cat([aspect_embeddings, opinion_embeddings, sentiment_embeddings], dim=-1)
-        combined_labels = self._combine_labels(aspect_labels, opinion_labels, sentiment_labels)
-        triplet_loss = self.triplet_contrastive(triplet_embeddings, combined_labels)
-        
-        total_loss = aspect_loss + opinion_loss + sentiment_loss + triplet_loss
-        
-        return {
-            'multi_level_contrastive_loss': total_loss,
-            'aspect_contrastive_loss': aspect_loss,
-            'opinion_contrastive_loss': opinion_loss,
-            'sentiment_contrastive_loss': sentiment_loss,
-            'triplet_contrastive_loss': triplet_loss
-        }
-    
-    def _combine_labels(self, aspect_labels, opinion_labels, sentiment_labels):
-        """Combine labels for triplet-level contrastive learning"""
-        # Create combined labels by concatenating string representations
-        batch_size = aspect_labels.size(0)
-        combined_labels = []
-        
-        for i in range(batch_size):
-            # Convert to string representation for hashing
-            aspect_str = str(aspect_labels[i].tolist())
-            opinion_str = str(opinion_labels[i].tolist())
-            sentiment_str = str(sentiment_labels[i].item())
-            
-            combined_str = f"{aspect_str}_{opinion_str}_{sentiment_str}"
-            combined_labels.append(hash(combined_str) % 10000)  # Modulo to keep reasonable range
-        
-        return torch.tensor(combined_labels, device=aspect_labels.device)
-
-
-class SupConLoss(nn.Module):
-    """
-    Supervised Contrastive Learning Loss
-    From "Supervised Contrastive Learning" by Khosla et al.
-    """
-    
-    def __init__(self, temperature=0.07, contrast_mode='all', base_temperature=0.07):
+    def __init__(self, temperature: float = 0.07, reduction: str = 'mean'):
         super().__init__()
         self.temperature = temperature
-        self.contrast_mode = contrast_mode
-        self.base_temperature = base_temperature
+        self.reduction = reduction
         
-    def forward(self, features, labels=None, mask=None):
+    def forward(self, 
+                query: torch.Tensor,           # [batch_size, hidden_dim]
+                positive_keys: torch.Tensor,   # [batch_size, num_positives, hidden_dim]
+                negative_keys: torch.Tensor,   # [batch_size, num_negatives, hidden_dim]
+                labels: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
-            features: hidden vector of shape [bsz, n_views, ...].
-            labels: ground truth of shape [bsz].
-            mask: contrastive mask of shape [bsz, bsz], mask_{i,j}=1 if sample j
-                has the same class as sample i. Can be asymmetric.
+            query: Query representations (aspect/opinion embeddings)
+            positive_keys: Positive samples (same sentiment/aspect)
+            negative_keys: Negative samples (different sentiment/aspect)
+            labels: Optional labels for supervised variant
+        
         Returns:
-            A loss scalar.
+            InfoNCE loss value
+        """
+        batch_size = query.size(0)
+        
+        # Normalize embeddings
+        query = F.normalize(query, dim=-1)
+        positive_keys = F.normalize(positive_keys, dim=-1)
+        negative_keys = F.normalize(negative_keys, dim=-1)
+        
+        # Compute similarities with positives
+        # [batch_size, num_positives]
+        pos_sim = torch.einsum('bd,bpd->bp', query, positive_keys) / self.temperature
+        
+        # Compute similarities with negatives
+        # [batch_size, num_negatives]
+        neg_sim = torch.einsum('bd,bnd->bn', query, negative_keys) / self.temperature
+        
+        # For multiple positives, we use the log-sum-exp trick
+        pos_logits = torch.logsumexp(pos_sim, dim=1)  # [batch_size]
+        
+        # Combine positive and negative similarities
+        all_sim = torch.cat([pos_sim, neg_sim], dim=1)  # [batch_size, num_pos + num_neg]
+        all_logits = torch.logsumexp(all_sim, dim=1)    # [batch_size]
+        
+        # InfoNCE loss
+        loss = -pos_logits + all_logits
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+class NTXentLoss(nn.Module):
+    """
+    NT-Xent Loss adapted for supervised learning with arbitrary positives
+    Enhanced version supporting aspect-opinion-sentiment relationships
+    """
+    
+    def __init__(self, temperature: float = 0.1, base_temperature: float = 0.07):
+        super().__init__()
+        self.temperature = temperature
+        self.base_temperature = base_temperature
+        
+    def forward(self, 
+                features: torch.Tensor,        # [batch_size, hidden_dim]
+                labels: torch.Tensor,          # [batch_size] - sentiment/aspect labels
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Supervised NT-Xent loss for contrastive learning
+        
+        Args:
+            features: Normalized feature embeddings
+            labels: Class labels for supervision
+            mask: Optional mask for valid samples
+            
+        Returns:
+            NT-Xent loss value
         """
         device = features.device
-        
-        if len(features.shape) < 3:
-            features = features.unsqueeze(1)
-            
         batch_size = features.shape[0]
-        if labels is not None and mask is not None:
-            raise ValueError('Cannot define both `labels` and `mask`')
-        elif labels is None and mask is None:
+        
+        if mask is None:
             mask = torch.eye(batch_size, dtype=torch.float32).to(device)
-        elif labels is not None:
-            labels = labels.contiguous().view(-1, 1)
-            if labels.shape[0] != batch_size:
-                raise ValueError('Num of labels does not match num of features')
-            mask = torch.eq(labels, labels.T).float().to(device)
-        else:
-            mask = mask.float().to(device)
-            
-        contrast_count = features.shape[1]
-        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
-        if self.contrast_mode == 'one':
-            anchor_feature = features[:, 0]
-            anchor_count = 1
-        elif self.contrast_mode == 'all':
-            anchor_feature = contrast_feature
-            anchor_count = contrast_count
-        else:
-            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
-            
-        # Compute logits
+        
+        # Normalize features
+        features = F.normalize(features, dim=1)
+        
+        # Compute similarity matrix
         anchor_dot_contrast = torch.div(
-            torch.matmul(anchor_feature, contrast_feature.T),
-            self.temperature)
+            torch.matmul(features, features.T), self.temperature
+        )
         
         # For numerical stability
         logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
         logits = anchor_dot_contrast - logits_max.detach()
         
-        # Tile mask
-        mask = mask.repeat(anchor_count, contrast_count)
+        # Create positive mask: samples with same label
+        labels = labels.contiguous().view(-1, 1)
+        mask_pos = torch.eq(labels, labels.T).float().to(device)
         
-        # Mask-out self-contrast cases
-        logits_mask = torch.scatter(
-            torch.ones_like(mask),
-            1,
-            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
-            0
-        )
-        mask = mask * logits_mask
+        # Remove self-contrast (diagonal)
+        mask_pos = mask_pos * (1 - torch.eye(batch_size).to(device))
         
-        # Compute log_prob
-        exp_logits = torch.exp(logits) * logits_mask
-        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+        # Compute log probabilities
+        exp_logits = torch.exp(logits) * (1 - torch.eye(batch_size).to(device))
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
         
-        # Compute mean of log-likelihood over positive
-        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+        # Compute mean of log-likelihood over positive pairs
+        mean_log_prob_pos = (mask_pos * log_prob).sum(1) / (mask_pos.sum(1) + 1e-8)
         
         # Loss
-        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
-        loss = loss.view(anchor_count, batch_size).mean()
+        loss = -(self.temperature / self.base_temperature) * mean_log_prob_pos
+        loss = loss.mean()
         
         return loss
+
+
+class EnhancedTripletLoss(nn.Module):
+    """
+    Enhanced Triplet Loss for aspect-opinion-sentiment relationships
+    Supports multiple positive/negative mining strategies
+    """
+    
+    def __init__(self, 
+                 margin: float = 0.3,
+                 mining_strategy: str = 'hard',
+                 distance_metric: str = 'euclidean'):
+        super().__init__()
+        self.margin = margin
+        self.mining_strategy = mining_strategy
+        self.distance_metric = distance_metric
+        
+    def compute_distance(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        """Compute distance between embeddings"""
+        if self.distance_metric == 'euclidean':
+            return F.pairwise_distance(x1, x2, p=2)
+        elif self.distance_metric == 'cosine':
+            return 1 - F.cosine_similarity(x1, x2)
+        else:
+            raise ValueError(f"Unknown distance metric: {self.distance_metric}")
+    
+    def mine_triplets(self, 
+                     embeddings: torch.Tensor, 
+                     labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Mine hard triplets for training
+        
+        Args:
+            embeddings: [batch_size, hidden_dim]
+            labels: [batch_size] - aspect/sentiment labels
+            
+        Returns:
+            anchor_indices, positive_indices, negative_indices
+        """
+        batch_size = embeddings.size(0)
+        
+        # Compute pairwise distances
+        distances = torch.cdist(embeddings, embeddings, p=2)
+        
+        # Create masks for positive and negative pairs
+        labels_equal = labels.unsqueeze(0) == labels.unsqueeze(1)
+        labels_not_equal = ~labels_equal
+        
+        # Remove diagonal (self-pairs)
+        eye_mask = torch.eye(batch_size, device=embeddings.device).bool()
+        labels_equal = labels_equal & ~eye_mask
+        
+        anchors, positives, negatives = [], [], []
+        
+        for i in range(batch_size):
+            # Find positive samples (same label)
+            pos_mask = labels_equal[i]
+            if not pos_mask.any():
+                continue
+                
+            # Find negative samples (different label)
+            neg_mask = labels_not_equal[i]
+            if not neg_mask.any():
+                continue
+            
+            if self.mining_strategy == 'hard':
+                # Hard positive: farthest positive sample
+                pos_distances = distances[i][pos_mask]
+                hardest_pos_idx = pos_distances.argmax()
+                pos_idx = torch.where(pos_mask)[0][hardest_pos_idx]
+                
+                # Hard negative: closest negative sample
+                neg_distances = distances[i][neg_mask]
+                hardest_neg_idx = neg_distances.argmin()
+                neg_idx = torch.where(neg_mask)[0][hardest_neg_idx]
+                
+            elif self.mining_strategy == 'semi_hard':
+                # Semi-hard negative mining
+                pos_distances = distances[i][pos_mask]
+                pos_idx = torch.where(pos_mask)[0][pos_distances.argmin()]  # Closest positive
+                
+                # Semi-hard negatives: closer than positive but still negative
+                anchor_pos_dist = distances[i][pos_idx]
+                neg_distances = distances[i][neg_mask]
+                semi_hard_mask = (neg_distances > anchor_pos_dist) & (neg_distances < anchor_pos_dist + self.margin)
+                
+                if semi_hard_mask.any():
+                    semi_hard_neg_indices = torch.where(neg_mask)[0][semi_hard_mask]
+                    neg_idx = semi_hard_neg_indices[torch.randint(len(semi_hard_neg_indices), (1,))]
+                else:
+                    # Fallback to hardest negative
+                    neg_idx = torch.where(neg_mask)[0][neg_distances.argmin()]
+                    
+            else:  # random
+                pos_idx = torch.where(pos_mask)[0][torch.randint(pos_mask.sum(), (1,))]
+                neg_idx = torch.where(neg_mask)[0][torch.randint(neg_mask.sum(), (1,))]
+            
+            anchors.append(i)
+            positives.append(pos_idx.item())
+            negatives.append(neg_idx.item())
+        
+        if not anchors:
+            # Return dummy triplets if no valid triplets found
+            return torch.tensor([0]), torch.tensor([0]), torch.tensor([0])
+            
+        return (torch.tensor(anchors, device=embeddings.device),
+                torch.tensor(positives, device=embeddings.device),
+                torch.tensor(negatives, device=embeddings.device))
+    
+    def forward(self, 
+                embeddings: torch.Tensor, 
+                labels: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Compute enhanced triplet loss
+        
+        Args:
+            embeddings: [batch_size, hidden_dim]
+            labels: [batch_size] - aspect/sentiment labels
+            
+        Returns:
+            Dictionary with loss and mining statistics
+        """
+        # Mine triplets
+        anchor_indices, pos_indices, neg_indices = self.mine_triplets(embeddings, labels)
+        
+        if len(anchor_indices) <= 1:
+            return {'loss': torch.tensor(0.0, device=embeddings.device),
+                   'num_triplets': 0}
+        
+        # Get anchor, positive, negative embeddings
+        anchor_emb = embeddings[anchor_indices]
+        pos_emb = embeddings[pos_indices]
+        neg_emb = embeddings[neg_indices]
+        
+        # Compute distances
+        pos_dist = self.compute_distance(anchor_emb, pos_emb)
+        neg_dist = self.compute_distance(anchor_emb, neg_emb)
+        
+        # Triplet loss
+        loss = F.relu(pos_dist - neg_dist + self.margin)
+        
+        # Statistics
+        valid_triplets = (loss > 0).sum().item()
+        
+        return {
+            'loss': loss.mean(),
+            'num_triplets': len(anchor_indices),
+            'valid_triplets': valid_triplets,
+            'avg_pos_dist': pos_dist.mean().item(),
+            'avg_neg_dist': neg_dist.mean().item()
+        }
+
+
+class SupervisedContrastiveLoss(nn.Module):
+    """
+    Unified supervised contrastive loss combining multiple strategies
+    Implements the ITSCL framework from EMNLP 2024
+    """
+    
+    def __init__(self,
+                 temperature: float = 0.07,
+                 contrast_mode: str = 'all',
+                 base_temperature: float = 0.07):
+        super().__init__()
+        self.temperature = temperature
+        self.contrast_mode = contrast_mode
+        self.base_temperature = base_temperature
+        
+    def forward(self,
+                features: torch.Tensor,           # [batch_size, num_views, hidden_dim]
+                labels: torch.Tensor,             # [batch_size]
+                aspect_labels: torch.Tensor,      # [batch_size] - aspect labels
+                opinion_labels: torch.Tensor,     # [batch_size] - opinion labels
+                sentiment_labels: torch.Tensor,   # [batch_size] - sentiment labels
+                mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """
+        Multi-level supervised contrastive loss for ABSA
+        
+        Args:
+            features: Feature representations with multiple views
+            labels: Combined triplet labels
+            aspect_labels: Aspect-specific labels
+            opinion_labels: Opinion-specific labels  
+            sentiment_labels: Sentiment labels
+            mask: Optional mask for valid samples
+            
+        Returns:
+            Dictionary with different loss components
+        """
+        device = features.device
+        batch_size, num_views = features.shape[:2]
+        
+        if mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+        
+        # Reshape features: [batch_size * num_views, hidden_dim]
+        contrast_features = features.view(batch_size * num_views, -1)
+        contrast_features = F.normalize(contrast_features, dim=1)
+        
+        # Create extended labels for all views
+        contrast_labels = labels.repeat(num_views)
+        contrast_aspect = aspect_labels.repeat(num_views)
+        contrast_opinion = opinion_labels.repeat(num_views)
+        contrast_sentiment = sentiment_labels.repeat(num_views)
+        
+        # Compute similarity matrix
+        anchor_dot_contrast = torch.div(
+            torch.matmul(contrast_features, contrast_features.T),
+            self.temperature
+        )
+        
+        # For numerical stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+        
+        # Create positive masks for different levels
+        contrast_labels = contrast_labels.contiguous().view(-1, 1)
+        contrast_aspect = contrast_aspect.contiguous().view(-1, 1)
+        contrast_opinion = contrast_opinion.contiguous().view(-1, 1)
+        contrast_sentiment = contrast_sentiment.contiguous().view(-1, 1)
+        
+        # Triplet-level positives (exact match)
+        mask_triplet = torch.eq(contrast_labels, contrast_labels.T).float().to(device)
+        
+        # Aspect-level positives
+        mask_aspect = torch.eq(contrast_aspect, contrast_aspect.T).float().to(device)
+        
+        # Opinion-level positives  
+        mask_opinion = torch.eq(contrast_opinion, contrast_opinion.T).float().to(device)
+        
+        # Sentiment-level positives
+        mask_sentiment = torch.eq(contrast_sentiment, contrast_sentiment.T).float().to(device)
+        
+        # Remove self-contrast
+        num_contrast = batch_size * num_views
+        eye_mask = torch.eye(num_contrast).to(device)
+        
+        mask_triplet = mask_triplet * (1 - eye_mask)
+        mask_aspect = mask_aspect * (1 - eye_mask)
+        mask_opinion = mask_opinion * (1 - eye_mask)
+        mask_sentiment = mask_sentiment * (1 - eye_mask)
+        
+        # Compute log probabilities
+        exp_logits = torch.exp(logits) * (1 - eye_mask)
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
+        
+        # Compute losses for different levels
+        losses = {}
+        
+        # Triplet-level loss (strongest constraint)
+        if mask_triplet.sum() > 0:
+            mean_log_prob_triplet = (mask_triplet * log_prob).sum(1) / (mask_triplet.sum(1) + 1e-8)
+            losses['triplet'] = -(self.temperature / self.base_temperature) * mean_log_prob_triplet.mean()
+        else:
+            losses['triplet'] = torch.tensor(0.0, device=device)
+        
+        # Aspect-level loss
+        if mask_aspect.sum() > 0:
+            mean_log_prob_aspect = (mask_aspect * log_prob).sum(1) / (mask_aspect.sum(1) + 1e-8)
+            losses['aspect'] = -(self.temperature / self.base_temperature) * mean_log_prob_aspect.mean()
+        else:
+            losses['aspect'] = torch.tensor(0.0, device=device)
+        
+        # Opinion-level loss
+        if mask_opinion.sum() > 0:
+            mean_log_prob_opinion = (mask_opinion * log_prob).sum(1) / (mask_opinion.sum(1) + 1e-8)
+            losses['opinion'] = -(self.temperature / self.base_temperature) * mean_log_prob_opinion.mean()
+        else:
+            losses['opinion'] = torch.tensor(0.0, device=device)
+        
+        # Sentiment-level loss
+        if mask_sentiment.sum() > 0:
+            mean_log_prob_sentiment = (mask_sentiment * log_prob).sum(1) / (mask_sentiment.sum(1) + 1e-8)
+            losses['sentiment'] = -(self.temperature / self.base_temperature) * mean_log_prob_sentiment.mean()
+        else:
+            losses['sentiment'] = torch.tensor(0.0, device=device)
+        
+        # Combined loss with adaptive weighting
+        total_loss = (losses['triplet'] + 
+                     0.7 * losses['aspect'] + 
+                     0.7 * losses['opinion'] + 
+                     0.5 * losses['sentiment'])
+        
+        losses['total'] = total_loss
+        
+        return losses
+
+
+class NegativeSampler:
+    """
+    Advanced negative sampling strategies for contrastive learning
+    """
+    
+    def __init__(self, strategy: str = 'hard', num_negatives: int = 5):
+        self.strategy = strategy
+        self.num_negatives = num_negatives
+        
+    def sample_negatives(self,
+                        anchor_features: torch.Tensor,
+                        anchor_labels: torch.Tensor,
+                        candidate_features: torch.Tensor,
+                        candidate_labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Sample negative examples for contrastive learning
+        
+        Args:
+            anchor_features: [batch_size, hidden_dim]
+            anchor_labels: [batch_size]
+            candidate_features: [num_candidates, hidden_dim]
+            candidate_labels: [num_candidates]
+            
+        Returns:
+            negative_features, negative_labels
+        """
+        batch_size = anchor_features.size(0)
+        device = anchor_features.device
+        
+        if self.strategy == 'random':
+            return self._random_sampling(anchor_labels, candidate_features, candidate_labels)
+        elif self.strategy == 'hard':
+            return self._hard_negative_sampling(anchor_features, anchor_labels, 
+                                              candidate_features, candidate_labels)
+        elif self.strategy == 'focal':
+            return self._focal_sampling(anchor_features, anchor_labels,
+                                      candidate_features, candidate_labels)
+        else:
+            raise ValueError(f"Unknown sampling strategy: {self.strategy}")
+    
+    def _random_sampling(self, anchor_labels, candidate_features, candidate_labels):
+        """Random negative sampling"""
+        negatives = []
+        neg_labels = []
+        
+        for anchor_label in anchor_labels:
+            # Find candidates with different labels
+            neg_mask = candidate_labels != anchor_label
+            neg_candidates = candidate_features[neg_mask]
+            neg_cand_labels = candidate_labels[neg_mask]
+            
+            if len(neg_candidates) == 0:
+                continue
+                
+            # Random sample
+            num_samples = min(self.num_negatives, len(neg_candidates))
+            indices = torch.randperm(len(neg_candidates))[:num_samples]
+            
+            negatives.append(neg_candidates[indices])
+            neg_labels.append(neg_cand_labels[indices])
+        
+        if not negatives:
+            return torch.empty(0, candidate_features.size(1)), torch.empty(0, dtype=torch.long)
+            
+        return torch.cat(negatives, dim=0), torch.cat(neg_labels, dim=0)
+    
+    def _hard_negative_sampling(self, anchor_features, anchor_labels, 
+                               candidate_features, candidate_labels):
+        """Hard negative sampling (closest negatives)"""
+        negatives = []
+        neg_labels = []
+        
+        for i, anchor_label in enumerate(anchor_labels):
+            anchor_emb = anchor_features[i:i+1]  # [1, hidden_dim]
+            
+            # Find candidates with different labels
+            neg_mask = candidate_labels != anchor_label
+            neg_candidates = candidate_features[neg_mask]
+            neg_cand_labels = candidate_labels[neg_mask]
+            
+            if len(neg_candidates) == 0:
+                continue
+            
+            # Compute distances to anchor
+            distances = torch.cdist(anchor_emb, neg_candidates, p=2).squeeze(0)
+            
+            # Select hardest (closest) negatives
+            num_samples = min(self.num_negatives, len(neg_candidates))
+            _, hard_indices = distances.topk(num_samples, largest=False)
+            
+            negatives.append(neg_candidates[hard_indices])
+            neg_labels.append(neg_cand_labels[hard_indices])
+        
+        if not negatives:
+            return torch.empty(0, candidate_features.size(1)), torch.empty(0, dtype=torch.long)
+            
+        return torch.cat(negatives, dim=0), torch.cat(neg_labels, dim=0)
+    
+    def _focal_sampling(self, anchor_features, anchor_labels,
+                       candidate_features, candidate_labels):
+        """Focal sampling (probability-based on difficulty)"""
+        negatives = []
+        neg_labels = []
+        
+        for i, anchor_label in enumerate(anchor_labels):
+            anchor_emb = anchor_features[i:i+1]
+            
+            # Find candidates with different labels
+            neg_mask = candidate_labels != anchor_label
+            neg_candidates = candidate_features[neg_mask]
+            neg_cand_labels = candidate_labels[neg_mask]
+            
+            if len(neg_candidates) == 0:
+                continue
+            
+            # Compute similarities (higher = harder negative)
+            similarities = F.cosine_similarity(anchor_emb, neg_candidates, dim=1)
+            
+            # Convert to probabilities (higher similarity = higher probability)
+            probs = F.softmax(similarities * 2.0, dim=0)  # Temperature scaling
+            
+            # Sample based on probabilities
+            num_samples = min(self.num_negatives, len(neg_candidates))
+            indices = torch.multinomial(probs, num_samples, replacement=False)
+            
+            negatives.append(neg_candidates[indices])
+            neg_labels.append(neg_cand_labels[indices])
+        
+        if not negatives:
+            return torch.empty(0, candidate_features.size(1)), torch.empty(0, dtype=torch.long)
+            
+        return torch.cat(negatives, dim=0), torch.cat(neg_labels, dim=0)
