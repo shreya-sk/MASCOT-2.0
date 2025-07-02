@@ -1,82 +1,100 @@
-#!/usr/bin/env python3
+# train.py
 """
-Complete Training Script for Enhanced ABSA with 2024-2025 Breakthrough Features
-Supports instruction-following, contrastive learning, and few-shot adaptation
+Enhanced Training Script with Complete Few-Shot Learning Implementation
+2024-2025 Breakthrough Features Integration
 """
 
-import os
-import sys
 import argparse
-import json
-import time
-from datetime import datetime
-import traceback
-import warnings
-warnings.filterwarnings('ignore')
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 import numpy as np
+import random
+import logging
+import os
+from datetime import datetime
 from tqdm import tqdm
 
-# Add src to path
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-
-from src.utils.config import LLMABSAConfig
-from src.models.absa import LLMABSA
+# Import your existing components
+from src.utils.config import LLMABSAConfig, create_high_performance_config
 from src.data.dataset import ABSADataset
 from src.data.preprocessor import ABSAPreprocessor
-from src.training.losses import ABSALoss
-from src.training.metrics import calculate_comprehensive_metrics, save_metrics_to_file
+from src.models.enhanced_absa_model import EnhancedABSAModel, create_enhanced_absa_model
+from src.training.few_shot_trainer import FewShotABSATrainer, FewShotDatasetAdapter
+from src.training.trainer import ABSATrainer
+from src.training.metrics import ABSAMetrics
 from src.utils.logger import setup_logger
 
-def setup_directories():
-    """Create necessary directories"""
-    dirs = ['checkpoints', 'logs', 'results', 'visualizations']
-    for dir_name in dirs:
-        os.makedirs(dir_name, exist_ok=True)
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+
 
 def parse_arguments():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Enhanced ABSA Training')
+    """Parse command line arguments with few-shot learning options"""
+    parser = argparse.ArgumentParser(description='Enhanced ABSA Training with Few-Shot Learning')
     
     # Dataset and model arguments
     parser.add_argument('--dataset', type=str, default='rest15', 
-                       choices=['laptop14', 'rest14', 'rest15', 'rest16'],
+                       choices=['rest14', 'rest15', 'rest16', 'laptop14', 'mams'],
                        help='Dataset to use for training')
     parser.add_argument('--model_name', type=str, default='microsoft/deberta-v3-base',
-                       help='Pre-trained model name')
-    parser.add_argument('--data_dir', type=str, default='Dataset/aste',
-                       help='Data directory')
+                       help='Pretrained model to use')
+    parser.add_argument('--config_type', type=str, default='high_performance',
+                       choices=['balanced', 'high_performance', 'memory_constrained', 'publication_ready'],
+                       help='Configuration preset to use')
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=8,
-                       help='Training batch size')
-    parser.add_argument('--learning_rate', type=float, default=3e-5,
-                       help='Learning rate')
-    parser.add_argument('--epochs', type=int, default=10,
+                       help='Batch size for training')
+    parser.add_argument('--epochs', type=int, default=20,
                        help='Number of training epochs')
+    parser.add_argument('--learning_rate', type=float, default=1e-5,
+                       help='Learning rate')
     parser.add_argument('--max_length', type=int, default=128,
                        help='Maximum sequence length')
     
-    # 2024-2025 Breakthrough Features
+    # 2024-2025 breakthrough features
     parser.add_argument('--use_contrastive', action='store_true', default=True,
                        help='Enable contrastive learning')
     parser.add_argument('--use_few_shot', action='store_true', default=True,
-                       help='Enable few-shot learning')
+                       help='Enable few-shot learning (NEW)')
     parser.add_argument('--use_implicit', action='store_true', default=True,
                        help='Enable implicit detection')
     parser.add_argument('--use_instruction', action='store_true', default=True,
                        help='Enable instruction following')
     
-    # Advanced training options
+    # Few-shot specific arguments (NEW)
+    parser.add_argument('--few_shot_k', type=int, default=5,
+                       help='K-shot for few-shot learning')
+    parser.add_argument('--episodes_per_epoch', type=int, default=100,
+                       help='Number of few-shot episodes per epoch')
+    parser.add_argument('--adaptation_steps', type=int, default=5,
+                       help='Domain adaptation steps')
+    parser.add_argument('--meta_learning_rate', type=float, default=0.01,
+                       help='Meta-learning rate for few-shot learning')
+    
+    # Few-shot method selection
+    parser.add_argument('--use_drp', action='store_true', default=True,
+                       help='Enable Dual Relations Propagation')
+    parser.add_argument('--use_afml', action='store_true', default=True,
+                       help='Enable Aspect-Focused Meta-Learning')
+    parser.add_argument('--use_cd_alphn', action='store_true', default=True,
+                       help='Enable Cross-Domain Aspect Label Propagation')
+    parser.add_argument('--use_ipt', action='store_true', default=True,
+                       help='Enable Instruction Prompt-based Few-Shot')
+    
+    # Training modes
+    parser.add_argument('--training_mode', type=str, default='hybrid',
+                       choices=['standard', 'few_shot_only', 'hybrid'],
+                       help='Training mode: standard, few-shot only, or hybrid')
+    parser.add_argument('--domain_adaptation', action='store_true',
+                       help='Enable cross-domain adaptation training')
+    
+    # Advanced options
     parser.add_argument('--debug', action='store_true',
                        help='Enable debug mode (fewer epochs, smaller data)')
     parser.add_argument('--resume', type=str, default=None,
                        help='Resume from checkpoint')
-    parser.add_argument('--save_every', type=int, default=1,
+    parser.add_argument('--save_every', type=int, default=5,
                        help='Save checkpoint every N epochs')
     parser.add_argument('--eval_every', type=int, default=1,
                        help='Evaluate every N epochs')
@@ -89,16 +107,21 @@ def parse_arguments():
     
     return parser.parse_args()
 
+
 def create_config_from_args(args):
     """Create configuration from arguments"""
-    config = LLMABSAConfig()
+    # Start with preset configuration
+    if args.config_type == 'high_performance':
+        config = create_high_performance_config()
+    else:
+        config = LLMABSAConfig()
     
-    # Update config with arguments
+    # Update with command line arguments
     config.model_name = args.model_name
     config.batch_size = args.batch_size
+    config.num_epochs = args.epochs
     config.learning_rate = args.learning_rate
-    config.epochs = args.epochs
-    config.max_length = args.max_length
+    config.max_seq_length = args.max_length
     
     # 2024-2025 breakthrough features
     config.use_contrastive_learning = args.use_contrastive
@@ -106,17 +129,36 @@ def create_config_from_args(args):
     config.use_implicit_detection = args.use_implicit
     config.use_instruction_following = args.use_instruction
     
+    # Few-shot specific configuration (NEW)
+    config.few_shot_k = args.few_shot_k
+    config.episodes_per_epoch = args.episodes_per_epoch
+    config.adaptation_steps = args.adaptation_steps
+    config.meta_learning_rate = args.meta_learning_rate
+    
+    # Few-shot method selection
+    config.use_drp = args.use_drp
+    config.use_afml = args.use_afml
+    config.use_cd_alphn = args.use_cd_alphn
+    config.use_ipt = args.use_ipt
+    
     # Hardware optimization
-    config.mixed_precision = args.mixed_precision
-    config.gradient_checkpointing = args.gradient_checkpointing
+    config.use_fp16 = args.mixed_precision
+    config.use_gradient_checkpointing = args.gradient_checkpointing
     
     # Debug mode adjustments
     if args.debug:
-        config.epochs = min(2, config.epochs)
+        config.num_epochs = min(3, config.num_epochs)
+        config.episodes_per_epoch = min(20, config.episodes_per_epoch)
         config.debug_mode = True
-        print("🐛 Debug mode enabled - reduced epochs and data")
+        print("🐛 Debug mode enabled - reduced epochs and episodes")
+    
+    # Set experiment name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    mode_suffix = args.training_mode
+    config.experiment_name = f"enhanced_absa_{args.dataset}_{mode_suffix}_{timestamp}"
     
     return config
+
 
 def load_datasets(config, tokenizer, args):
     """Load training, validation, and test datasets"""
@@ -125,305 +167,404 @@ def load_datasets(config, tokenizer, args):
     # Initialize preprocessor
     preprocessor = ABSAPreprocessor(
         tokenizer=tokenizer,
-        max_length=config.max_length,
+        max_length=config.max_seq_length,
         use_instruction_following=config.use_instruction_following
     )
     
     datasets = {}
     dataloaders = {}
     
+    # Load standard datasets
     for split in ['train', 'dev', 'test']:
-        try:
+        dataset_path = f"Dataset/aste/{args.dataset}/{split}.txt"
+        
+        if os.path.exists(dataset_path):
             dataset = ABSADataset(
-                data_dir=args.data_dir,
-                tokenizer=tokenizer,
+                file_path=dataset_path,
                 preprocessor=preprocessor,
-                split=split,
-                dataset_name=args.dataset,
-                max_length=config.max_length
+                config=config
             )
-            
-            # Debug mode: limit dataset size
-            if args.debug and len(dataset) > 100:
-                dataset.data = dataset.data[:100]
-                print(f"🐛 Limited {split} dataset to 100 samples for debug")
-            
             datasets[split] = dataset
             
-            # Create dataloader
-            shuffle = (split == 'train')
-            batch_size = config.batch_size if split == 'train' else min(config.batch_size * 2, 16)
+            # Create dataloaders
+            batch_size = config.batch_size if split == 'train' else config.batch_size * 2
+            shuffle = split == 'train'
             
             dataloader = DataLoader(
                 dataset,
                 batch_size=batch_size,
                 shuffle=shuffle,
-                collate_fn=preprocessor.collate_fn,
                 num_workers=2,
                 pin_memory=True
             )
             dataloaders[split] = dataloader
             
-            print(f"✓ {split}: {len(dataset)} samples, {len(dataloader)} batches")
-            
-        except Exception as e:
-            print(f"❌ Failed to load {split} dataset: {e}")
-            if split == 'train':
-                raise
-            datasets[split] = None
-            dataloaders[split] = None
+            print(f"   {split}: {len(dataset)} samples")
+        else:
+            print(f"   Warning: {dataset_path} not found")
     
     return datasets, dataloaders
 
-def initialize_model_and_optimizer(config, args):
-    """Initialize model, optimizer, and scheduler"""
-    print("🏗️ Initializing model and optimizer...")
+
+def setup_training_environment(args):
+    """Setup training environment and logging"""
+    # Set random seeds
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
     
-    # Initialize model
-    model = LLMABSA(config)
-    
-    # Move to GPU if available
+    # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
+    print(f"🔧 Using device: {device}")
     
-    # Initialize loss function
-    loss_fn = ABSALoss(config)
+    if torch.cuda.is_available():
+        print(f"   GPU: {torch.cuda.get_device_name()}")
+        print(f"   Memory: {torch.cuda.get_device_properties(device).total_memory / 1e9:.1f} GB")
     
-    # Prepare optimizer with different learning rates for different components
-    backbone_params = []
-    instruction_params = []
+    # Create directories
+    os.makedirs('checkpoints', exist_ok=True)
+    os.makedirs('logs', exist_ok=True)
+    os.makedirs('results', exist_ok=True)
     
-    for name, param in model.named_parameters():
-        if 't5_model' in name or 'instruction' in name or 'feature_bridge' in name:
-            instruction_params.append(param)
-        else:
-            backbone_params.append(param)
+    # Setup logging
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = f"logs/enhanced_absa_{args.dataset}_{args.training_mode}_{timestamp}.log"
+    logger = setup_logger(log_file)
     
-    optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': config.learning_rate},
-        {'params': instruction_params, 'lr': config.learning_rate * 0.5}  # Lower LR for T5
-    ], weight_decay=0.01)
+    return device, logger
+
+
+def create_few_shot_datasets(datasets, config):
+    """Convert standard datasets to few-shot format"""
+    print("🔄 Converting datasets for few-shot learning...")
     
-    # Calculate total training steps
-    # Note: This is an approximation since we don't know exact dataset size yet
-    estimated_steps = (1000 // config.batch_size) * config.epochs
+    few_shot_datasets = {}
+    
+    for split, dataset in datasets.items():
+        adapter = FewShotDatasetAdapter(dataset, config)
+        few_shot_dataset = adapter.convert_to_few_shot_format()
+        few_shot_datasets[split] = few_shot_dataset
+        
+        print(f"   {split}: {few_shot_dataset.features.size(0)} samples converted")
+    
+    return few_shot_datasets
+
+
+def train_standard_mode(model, dataloaders, config, device, logger):
+    """Train using standard ABSA approach"""
+    print("🎯 Training in Standard Mode...")
+    
+    trainer = ABSATrainer(
+        model=model,
+        config=config,
+        device=device,
+        logger=logger
+    )
+    
+    best_model = trainer.train(
+        train_dataloader=dataloaders['train'],
+        val_dataloader=dataloaders.get('dev'),
+        test_dataloader=dataloaders.get('test')
+    )
+    
+    return best_model
+
+
+def train_few_shot_mode(model, few_shot_datasets, config, tokenizer, device, logger):
+    """Train using few-shot learning approach"""
+    print("🎯 Training in Few-Shot Mode...")
+    
+    # Initialize few-shot trainer
+    few_shot_trainer = FewShotABSATrainer(
+        config=config,
+        model=model,
+        tokenizer=tokenizer,
+        device=device
+    )
+    
+    # Training loop
+    best_metrics = {'f1_mean': 0.0}
+    
+    for epoch in range(config.num_epochs):
+        print(f"\n📚 Epoch {epoch+1}/{config.num_epochs}")
+        
+        # Train epoch
+        train_metrics = few_shot_trainer.train_few_shot_epoch(
+            train_dataset=few_shot_datasets['train'],
+            val_dataset=few_shot_datasets.get('dev')
+        )
+        
+        # Evaluation
+        if 'dev' in few_shot_datasets:
+            val_metrics = few_shot_trainer.evaluate_few_shot(
+                few_shot_datasets['dev'], 
+                num_episodes=50
+            )
+            
+            print(f"Validation: F1={val_metrics['f1_mean']:.4f}±{val_metrics['f1_std']:.4f}")
+            
+            # Save best model
+            if val_metrics['f1_mean'] > best_metrics['f1_mean']:
+                best_metrics = val_metrics
+                checkpoint_path = f"checkpoints/{config.experiment_name}_best_few_shot.pt"
+                few_shot_trainer.save_few_shot_model(checkpoint_path)
+                print(f"💾 New best model saved: F1={val_metrics['f1_mean']:.4f}")
+        
+        # Test evaluation
+        if 'test' in few_shot_datasets and (epoch + 1) % config.eval_interval == 0:
+            test_metrics = few_shot_trainer.evaluate_few_shot(
+                few_shot_datasets['test'], 
+                num_episodes=100
+            )
+            print(f"Test: F1={test_metrics['f1_mean']:.4f}±{test_metrics['f1_std']:.4f}")
+    
+    return model
+
+
+def train_hybrid_mode(model, dataloaders, few_shot_datasets, config, tokenizer, device, logger):
+    """Train using hybrid approach (standard + few-shot)"""
+    print("🎯 Training in Hybrid Mode...")
+    
+    # Phase 1: Standard training with few-shot integration
+    print("\n📚 Phase 1: Hybrid Training")
+    
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay
+    )
     
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=int(0.1 * estimated_steps),
-        num_training_steps=estimated_steps
+        num_warmup_steps=config.warmup_steps,
+        num_training_steps=len(dataloaders['train']) * config.num_epochs
     )
     
-    # Mixed precision scaler
-    scaler = torch.cuda.amp.GradScaler() if config.mixed_precision and torch.cuda.is_available() else None
+    best_f1 = 0.0
     
-    print(f"✓ Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
-    print(f"✓ Device: {device}")
-    print(f"✓ Mixed precision: {scaler is not None}")
-    
-    return model, loss_fn, optimizer, scheduler, scaler, device
-
-def train_epoch(model, dataloader, loss_fn, optimizer, scheduler, scaler, device, config, epoch):
-    """Train for one epoch"""
-    model.train()
-    
-    total_loss = 0
-    component_losses = {}
-    num_batches = len(dataloader)
-    
-    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
-    
-    for batch_idx, batch in enumerate(progress_bar):
-        try:
+    for epoch in range(config.num_epochs):
+        print(f"\n📚 Epoch {epoch+1}/{config.num_epochs}")
+        
+        # Training phase
+        model.train()
+        epoch_losses = []
+        
+        # Prepare few-shot support data for this epoch
+        support_data, _, domain_ids = _sample_few_shot_support(few_shot_datasets['train'], config)
+        
+        pbar = tqdm(dataloaders['train'], desc="Training")
+        for batch_idx, batch in enumerate(pbar):
             # Move batch to device
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                    for k, v in batch.items()}
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
             
+            # Zero gradients
             optimizer.zero_grad()
             
-            # Forward pass with mixed precision
-            if scaler is not None:
-                with torch.cuda.amp.autocast():
-                    outputs = model(
-                        input_ids=batch['input_ids'],
-                        attention_mask=batch['attention_mask'],
-                        texts=batch.get('texts', None),
-                        task_type='triplet_extraction',
-                        target_text=batch.get('target_text', None)
-                    )
-                    
-                    if outputs is None:
-                        print(f"⚠ Skipping batch {batch_idx}: model returned None")
-                        continue
-                    
-                    # Calculate loss
-                    loss_dict = loss_fn(outputs, batch)
-                    loss = loss_dict['loss']
-                
-                # Backward pass with scaling
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Forward pass with few-shot support
+            outputs = model(
+                input_ids=batch['input_ids'],
+                attention_mask=batch['attention_mask'],
+                labels=batch['labels'],
+                few_shot_support_data=support_data,
+                domain_ids=domain_ids[:batch['input_ids'].size(0)],  # Match batch size
+                training=True
+            )
+            
+            loss = outputs['loss']
+            
+            # Backward pass
+            if config.use_fp16:
+                # Mixed precision training
+                from torch.cuda.amp import autocast, GradScaler
+                scaler = GradScaler()
+                with autocast():
+                    loss.backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                # Regular forward pass
-                outputs = model(
-                    input_ids=batch['input_ids'],
-                    attention_mask=batch['attention_mask'],
-                    texts=batch.get('texts', None),
-                    task_type='triplet_extraction',
-                    target_text=batch.get('target_text', None)
-                )
-                
-                if outputs is None:
-                    print(f"⚠ Skipping batch {batch_idx}: model returned None")
-                    continue
-                
-                # Calculate loss
-                loss_dict = loss_fn(outputs, batch)
-                loss = loss_dict['loss']
-                
-                # Backward pass
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             
             scheduler.step()
             
-            # Accumulate losses
-            total_loss += loss.item()
-            for k, v in loss_dict.items():
-                if k != 'loss':
-                    component_losses[k] = component_losses.get(k, 0) + v
+            epoch_losses.append(loss.item())
             
             # Update progress bar
-            current_lr = scheduler.get_last_lr()[0]
-            progress_bar.set_postfix({
+            pbar.set_postfix({
                 'Loss': f"{loss.item():.4f}",
-                'LR': f"{current_lr:.2e}"
+                'Avg': f"{np.mean(epoch_losses):.4f}",
+                'LR': f"{scheduler.get_last_lr()[0]:.2e}"
             })
+        
+        # Validation
+        if 'dev' in dataloaders:
+            val_metrics = evaluate_hybrid_model(
+                model, dataloaders['dev'], few_shot_datasets['dev'], 
+                config, device
+            )
             
-            # Debug mode: break early
-            if config.debug_mode and batch_idx >= 10:
-                print("🐛 Debug mode: stopping epoch early")
-                break
-                
-        except Exception as e:
-            print(f"❌ Error in batch {batch_idx}: {e}")
-            if config.debug_mode:
-                traceback.print_exc()
-            continue
+            val_f1 = val_metrics['fusion_f1']
+            print(f"Validation F1: {val_f1:.4f}")
+            print(f"Standard F1: {val_metrics['standard_f1']:.4f}")
+            print(f"Few-shot F1: {val_metrics['few_shot_f1']:.4f}")
+            
+            # Save best model
+            if val_f1 > best_f1:
+                best_f1 = val_f1
+                checkpoint_path = f"checkpoints/{config.experiment_name}_best_hybrid.pt"
+                model.save_enhanced_model(checkpoint_path)
+                print(f"💾 New best hybrid model saved: F1={val_f1:.4f}")
+        
+        # Test evaluation
+        if 'test' in dataloaders and (epoch + 1) % config.eval_interval == 0:
+            test_metrics = evaluate_hybrid_model(
+                model, dataloaders['test'], few_shot_datasets['test'], 
+                config, device
+            )
+            print(f"Test F1: {test_metrics['fusion_f1']:.4f}")
     
-    # Calculate average losses
-    avg_loss = total_loss / num_batches
-    avg_component_losses = {k: v / num_batches for k, v in component_losses.items()}
-    
-    return {
-        'train_loss': avg_loss,
-        **{f'train_{k}': v for k, v in avg_component_losses.items()}
-    }
+    return model
 
-def evaluate_model(model, dataloader, loss_fn, device, config):
-    """Evaluate model on validation/test set"""
+
+def _sample_few_shot_support(few_shot_dataset, config):
+    """Sample support data for few-shot learning"""
+    support_data, _ = few_shot_dataset.sample_episode(
+        k_shot=config.few_shot_k,
+        num_query=5
+    )
+    
+    # Simulate domain IDs
+    domain_ids = torch.randint(0, 3, (support_data['features'].size(0) + 100,))
+    
+    return support_data, _, domain_ids
+
+
+def evaluate_hybrid_model(model, dataloader, few_shot_dataset, config, device):
+    """Evaluate hybrid model performance"""
     model.eval()
     
-    total_loss = 0
-    all_predictions = []
-    all_targets = []
-    num_batches = len(dataloader)
+    all_standard_preds = []
+    all_few_shot_preds = []
+    all_fusion_preds = []
+    all_labels = []
+    
+    # Sample support data for evaluation
+    support_data, _, domain_ids = _sample_few_shot_support(few_shot_dataset, config)
     
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating", leave=False)):
-            try:
-                # Move batch to device
-                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                        for k, v in batch.items()}
-                
-                # Forward pass
-                outputs = model(
-                    input_ids=batch['input_ids'],
-                    attention_mask=batch['attention_mask'],
-                    texts=batch.get('texts', None),
-                    task_type='triplet_extraction'
-                )
-                
-                if outputs is None:
-                    continue
-                
-                # Calculate loss
-                loss_dict = loss_fn(outputs, batch)
-                total_loss += loss_dict['loss'].item()
-                
-                # Extract predictions and targets for metrics
-                predictions = model.extract_triplets(
-                    outputs=outputs,
-                    input_ids=batch['input_ids'],
-                    texts=batch.get('texts', batch.get('original_texts', []))
-                )
-                
-                targets = batch.get('triplets', [])
-                
-                all_predictions.extend(predictions)
-                all_targets.extend(targets)
-                
-                # Debug mode: break early
-                if config.debug_mode and batch_idx >= 5:
-                    break
-                    
-            except Exception as e:
-                print(f"❌ Error in evaluation batch {batch_idx}: {e}")
-                continue
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            
+            outputs = model(
+                input_ids=batch['input_ids'],
+                attention_mask=batch['attention_mask'],
+                few_shot_support_data=support_data,
+                domain_ids=domain_ids[:batch['input_ids'].size(0)],
+                training=False
+            )
+            
+            # Collect predictions
+            all_standard_preds.extend(outputs['standard_predictions'].argmax(dim=-1).cpu().numpy())
+            all_fusion_preds.extend(outputs['predictions'].argmax(dim=-1).cpu().numpy())
+            all_labels.extend(batch['labels'].cpu().numpy())
+            
+            if outputs['few_shot_predictions'] is not None:
+                all_few_shot_preds.extend(outputs['few_shot_predictions'].argmax(dim=-1).cpu().numpy())
     
-    # Calculate comprehensive metrics
-    try:
-        metrics = calculate_comprehensive_metrics(all_predictions, all_targets, config)
-        metrics['val_loss'] = total_loss / max(num_batches, 1)
-    except Exception as e:
-        print(f"⚠ Warning: Failed to calculate metrics: {e}")
-        metrics = {
-            'val_loss': total_loss / max(num_batches, 1),
-            'val_f1': 0.0,
-            'val_precision': 0.0,
-            'val_recall': 0.0
-        }
+    # Calculate metrics
+    from sklearn.metrics import f1_score, accuracy_score
+    
+    metrics = {
+        'standard_f1': f1_score(all_labels, all_standard_preds, average='macro'),
+        'standard_accuracy': accuracy_score(all_labels, all_standard_preds),
+        'fusion_f1': f1_score(all_labels, all_fusion_preds, average='macro'),
+        'fusion_accuracy': accuracy_score(all_labels, all_fusion_preds)
+    }
+    
+    if all_few_shot_preds:
+        metrics.update({
+            'few_shot_f1': f1_score(all_labels, all_few_shot_preds, average='macro'),
+            'few_shot_accuracy': accuracy_score(all_labels, all_few_shot_preds)
+        })
     
     return metrics
 
-def save_checkpoint(model, optimizer, scheduler, epoch, metrics, checkpoint_path):
-    """Save model checkpoint"""
-    try:
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-            'metrics': metrics,
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        torch.save(checkpoint, checkpoint_path)
-        print(f"✅ Checkpoint saved: {checkpoint_path}")
-        
-    except Exception as e:
-        print(f"❌ Failed to save checkpoint: {e}")
+
+def train_with_domain_adaptation(model, datasets, config, tokenizer, device, logger):
+    """Train with cross-domain adaptation"""
+    print("🌍 Training with Domain Adaptation...")
+    
+    # Use first dataset as source, others as targets
+    dataset_names = list(datasets.keys())
+    source_dataset = datasets[dataset_names[0]]
+    target_datasets = [datasets[name] for name in dataset_names[1:]]
+    
+    few_shot_trainer = FewShotABSATrainer(
+        config=config,
+        model=model,
+        tokenizer=tokenizer,
+        device=device
+    )
+    
+    # Convert to few-shot format
+    source_few_shot = FewShotDatasetAdapter(source_dataset, config).convert_to_few_shot_format()
+    target_few_shot = [
+        FewShotDatasetAdapter(target, config).convert_to_few_shot_format()
+        for target in target_datasets
+    ]
+    
+    # Domain adaptation training
+    adapted_model = few_shot_trainer.train_with_domain_adaptation(
+        source_dataset=source_few_shot,
+        target_datasets=target_few_shot,
+        epochs=config.num_epochs
+    )
+    
+    return adapted_model
+
 
 def main():
-    """Main training function"""
-    print("🚀 Starting Enhanced ABSA Training with 2024-2025 Breakthrough Features")
-    print("=" * 80)
+    """Main training function with few-shot learning integration"""
+    print("="*80)
+    print("🚀 ENHANCED ABSA TRAINING WITH FEW-SHOT LEARNING")
+    print("="*80)
     
-    # Setup
-    setup_directories()
+    # Parse arguments
     args = parse_arguments()
+    
+    # Create configuration
     config = create_config_from_args(args)
     
-    # Setup logging
-    logger = setup_logger('training', 'logs/training.log')
-    logger.info(f"Training started with config: {vars(args)}")
+    # Setup environment
+    device, logger = setup_training_environment(args)
     
-    # Initialize tokenizer
-    print(f"🔤 Loading tokenizer: {config.model_name}")
+    # Print configuration
+    print(f"\n📋 Training Configuration:")
+    print(f"   Dataset: {args.dataset}")
+    print(f"   Model: {config.model_name}")
+    print(f"   Training Mode: {args.training_mode}")
+    print(f"   Batch Size: {config.batch_size}")
+    print(f"   Epochs: {config.num_epochs}")
+    print(f"   Learning Rate: {config.learning_rate}")
+    
+    print(f"\n🎯 Enabled Features:")
+    print(f"   ✅ Contrastive Learning: {config.use_contrastive_learning}")
+    print(f"   {'✅' if config.use_few_shot_learning else '❌'} Few-Shot Learning: {config.use_few_shot_learning}")
+    print(f"   {'✅' if config.use_implicit_detection else '❌'} Implicit Detection: {config.use_implicit_detection}")
+    print(f"   {'✅' if config.use_instruction_following else '❌'} Instruction Following: {config.use_instruction_following}")
+    
+    if config.use_few_shot_learning:
+        print(f"\n🔬 Few-Shot Methods:")
+        print(f"   {'✅' if config.use_drp else '❌'} DRP (Dual Relations Propagation): {config.use_drp}")
+        print(f"   {'✅' if config.use_afml else '❌'} AFML (Aspect-Focused Meta-Learning): {config.use_afml}")
+        print(f"   {'✅' if config.use_cd_alphn else '❌'} CD-ALPHN (Cross-Domain Propagation): {config.use_cd_alphn}")
+        print(f"   {'✅' if config.use_ipt else '❌'} IPT (Instruction Prompt Few-Shot): {config.use_ipt}")
+    
+    # Load tokenizer
+    print(f"\n🔤 Loading tokenizer: {config.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -431,117 +572,103 @@ def main():
     # Load datasets
     datasets, dataloaders = load_datasets(config, tokenizer, args)
     
-    # Update config with actual dataset size for scheduler
-    train_steps_per_epoch = len(dataloaders['train'])
-    config.total_training_steps = train_steps_per_epoch * config.epochs
+    if not datasets:
+        print("❌ No datasets loaded. Please check dataset paths.")
+        return
     
-    # Initialize model
-    model, loss_fn, optimizer, scheduler, scaler, device = initialize_model_and_optimizer(config, args)
+    # Create enhanced model
+    print(f"\n🏗️ Creating Enhanced ABSA Model...")
+    model = create_enhanced_absa_model(config, device)
+    
+    # Convert datasets for few-shot learning if needed
+    few_shot_datasets = {}
+    if config.use_few_shot_learning and args.training_mode in ['few_shot_only', 'hybrid']:
+        few_shot_datasets = create_few_shot_datasets(datasets, config)
     
     # Resume from checkpoint if specified
-    start_epoch = 0
-    best_f1 = 0.0
-    training_history = []
+    if args.resume:
+        print(f"📥 Resuming from checkpoint: {args.resume}")
+        try:
+            model = EnhancedABSAModel.load_enhanced_model(args.resume, config, device)
+            print("✅ Checkpoint loaded successfully")
+        except Exception as e:
+            print(f"❌ Failed to load checkpoint: {e}")
+            return
     
-    if args.resume and os.path.exists(args.resume):
-        print(f"📂 Resuming from checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if checkpoint.get('scheduler_state_dict'):
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_f1 = checkpoint.get('metrics', {}).get('val_f1', 0.0)
-        print(f"✅ Resumed from epoch {start_epoch}, best F1: {best_f1:.4f}")
-    
-    # Training loop
-    print(f"\n🏃 Starting training for {config.epochs} epochs...")
-    print(f"📊 Dataset: {args.dataset} | Batch size: {config.batch_size} | Device: {device}")
-    
-    for epoch in range(start_epoch, config.epochs):
-        epoch_start_time = time.time()
+    # Training based on mode
+    try:
+        if args.training_mode == 'standard':
+            trained_model = train_standard_mode(model, dataloaders, config, device, logger)
         
-        print(f"\n📅 Epoch {epoch + 1}/{config.epochs}")
-        print("-" * 50)
+        elif args.training_mode == 'few_shot_only':
+            trained_model = train_few_shot_mode(
+                model, few_shot_datasets, config, tokenizer, device, logger
+            )
         
-        # Training
-        train_metrics = train_epoch(
-            model, dataloaders['train'], loss_fn, optimizer, 
-            scheduler, scaler, device, config, epoch + 1
-        )
+        elif args.training_mode == 'hybrid':
+            trained_model = train_hybrid_mode(
+                model, dataloaders, few_shot_datasets, config, tokenizer, device, logger
+            )
         
-        # Evaluation
-        val_metrics = {}
-        if dataloaders['dev'] and (epoch + 1) % args.eval_every == 0:
-            print("📊 Evaluating on validation set...")
-            val_metrics = evaluate_model(model, dataloaders['dev'], loss_fn, device, config)
-        
-        # Combine metrics
-        epoch_metrics = {**train_metrics, **val_metrics}
-        epoch_metrics['epoch'] = epoch + 1
-        epoch_metrics['epoch_time'] = time.time() - epoch_start_time
-        
-        training_history.append(epoch_metrics)
-        
-        # Print epoch summary
-        print(f"\n📈 Epoch {epoch + 1} Summary:")
-        print(f"  Train Loss: {train_metrics.get('train_loss', 0):.4f}")
-        if val_metrics:
-            print(f"  Val Loss: {val_metrics.get('val_loss', 0):.4f}")
-            print(f"  Val F1: {val_metrics.get('val_f1', 0):.4f}")
-            print(f"  Val Precision: {val_metrics.get('val_precision', 0):.4f}")
-            print(f"  Val Recall: {val_metrics.get('val_recall', 0):.4f}")
-        print(f"  Time: {epoch_metrics['epoch_time']:.1f}s")
-        
-        # Save checkpoint
-        if (epoch + 1) % args.save_every == 0:
-            current_f1 = val_metrics.get('val_f1', 0.0)
+        # Domain adaptation training
+        if args.domain_adaptation:
+            print("\n🌍 Starting Domain Adaptation Training...")
+            # For domain adaptation, load multiple datasets
+            multi_datasets = {}
+            for dataset_name in ['rest14', 'rest15', 'laptop14']:
+                try:
+                    dataset_path = f"Dataset/aste/{dataset_name}/train.txt"
+                    if os.path.exists(dataset_path):
+                        preprocessor = ABSAPreprocessor(tokenizer, config.max_seq_length)
+                        dataset = ABSADataset(dataset_path, preprocessor, config)
+                        multi_datasets[dataset_name] = dataset
+                except Exception as e:
+                    print(f"Warning: Could not load {dataset_name}: {e}")
             
-            # Save regular checkpoint
-            checkpoint_path = f"checkpoints/{args.dataset}_epoch_{epoch + 1}.pt"
-            save_checkpoint(model, optimizer, scheduler, epoch, epoch_metrics, checkpoint_path)
-            
-            # Save best model
-            if current_f1 > best_f1:
-                best_f1 = current_f1
-                best_checkpoint_path = f"checkpoints/{args.dataset}_best.pt"
-                save_checkpoint(model, optimizer, scheduler, epoch, epoch_metrics, best_checkpoint_path)
-                print(f"🏆 New best F1 score: {best_f1:.4f}")
+            if len(multi_datasets) > 1:
+                trained_model = train_with_domain_adaptation(
+                    trained_model, multi_datasets, config, tokenizer, device, logger
+                )
         
-        # Log to file
-        logger.info(f"Epoch {epoch + 1}: {epoch_metrics}")
-    
-    # Final evaluation on test set
-    if dataloaders['test']:
-        print("\n🎯 Final evaluation on test set...")
-        test_metrics = evaluate_model(model, dataloaders['test'], loss_fn, device, config)
-        print(f"📊 Test Results:")
-        print(f"  Test Loss: {test_metrics.get('val_loss', 0):.4f}")
-        print(f"  Test F1: {test_metrics.get('val_f1', 0):.4f}")
-        print(f"  Test Precision: {test_metrics.get('val_precision', 0):.4f}")
-        print(f"  Test Recall: {test_metrics.get('val_recall', 0):.4f}")
+        # Final evaluation and save
+        print("\n🎯 Final Evaluation...")
+        if 'test' in dataloaders:
+            if args.training_mode == 'hybrid' and few_shot_datasets:
+                final_metrics = evaluate_hybrid_model(
+                    trained_model, dataloaders['test'], 
+                    few_shot_datasets['test'], config, device
+                )
+                print(f"Final Test Results:")
+                print(f"   Standard F1: {final_metrics['standard_f1']:.4f}")
+                print(f"   Few-Shot F1: {final_metrics.get('few_shot_f1', 'N/A')}")
+                print(f"   Fusion F1: {final_metrics['fusion_f1']:.4f}")
+            else:
+                # Standard evaluation
+                test_metrics = ABSAMetrics.evaluate_model(
+                    trained_model, dataloaders['test'], device
+                )
+                print(f"Final Test F1: {test_metrics['macro_f1']:.4f}")
         
-        # Save test results
-        results_path = f"results/{args.dataset}_test_results.json"
-        with open(results_path, 'w') as f:
-            json.dump(test_metrics, f, indent=2)
-        print(f"✅ Test results saved: {results_path}")
-    
-    # Save training history
-    history_path = f"results/{args.dataset}_training_history.json"
-    with open(history_path, 'w') as f:
-        json.dump(training_history, f, indent=2)
-    print(f"✅ Training history saved: {history_path}")
-    
-    print("\n🎉 Training completed successfully!")
-    print(f"🏆 Best validation F1: {best_f1:.4f}")
-    print(f"💾 Best model saved: checkpoints/{args.dataset}_best.pt")
+        # Save final model
+        final_checkpoint_path = f"checkpoints/{config.experiment_name}_final.pt"
+        trained_model.save_enhanced_model(final_checkpoint_path)
+        print(f"💾 Final model saved to: {final_checkpoint_path}")
+        
+        # Print performance summary
+        print("\n📊 Performance Summary:")
+        performance_metrics = trained_model.get_performance_metrics()
+        for component, improvement in performance_metrics['expected_improvements'].items():
+            print(f"   📈 {component}: {improvement}")
+        
+        print(f"\n🎉 Training completed successfully!")
+        print(f"   Experiment: {config.experiment_name}")
+        print(f"   Best model: {final_checkpoint_path}")
+        
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        print(f"❌ Training failed: {e}")
+        raise
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n❌ Training interrupted by user")
-    except Exception as e:
-        print(f"\n❌ Training failed with error: {e}")
-        traceback.print_exc()
+    main()
