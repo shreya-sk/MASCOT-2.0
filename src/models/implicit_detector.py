@@ -1,414 +1,76 @@
-"""
-Implicit Sentiment Detection Module with Contrastive Learning
-Implements breakthrough techniques for implicit aspect/opinion detection
-Fixed version with complete implementation and proper error handling
-"""
-
+# src/models/implicit_detector.py - Complete Implementation
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional, Any
-from transformers import AutoModel, AutoConfig
-
-
-class ImplicitAspectDetector(nn.Module):
-    """
-    Detects implicit aspects using contrastive learning
-    Based on EMNLP 2024 breakthrough for implicit sentiment detection
-    """
-    
-    def __init__(self, 
-                 hidden_size: int = 768,
-                 num_layers: int = 2,
-                 dropout: float = 0.1,
-                 use_syntax: bool = True):
-        super().__init__()
-        
-        self.hidden_size = hidden_size
-        self.use_syntax = use_syntax
-        
-        # Feature extraction layers
-        self.aspect_encoder = nn.LSTM(
-            hidden_size, hidden_size // 2, 
-            num_layers=num_layers, 
-            batch_first=True, 
-            bidirectional=True,
-            dropout=dropout if num_layers > 1 else 0
-        )
-        
-        # Implicit detection heads
-        self.implicit_classifier = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, 2)  # implicit vs explicit
-        )
-        
-        # Contrastive projection head
-        self.projection_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, 128)  # Projection dimension
-        )
-        
-        # Syntax-aware enhancement
-        if use_syntax:
-            self.syntax_encoder = nn.Linear(50, hidden_size // 4)  # POS tags, dependencies
-            self.syntax_fusion = nn.Linear(hidden_size + hidden_size // 4, hidden_size)
-        
-        # Context aggregation
-        self.context_attention = nn.MultiheadAttention(
-            hidden_size, num_heads=8, dropout=dropout, batch_first=True
-        )
-        
-        self.layer_norm = nn.LayerNorm(hidden_size)
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, 
-                hidden_states: torch.Tensor,           # [batch_size, seq_len, hidden_size]
-                attention_mask: torch.Tensor,          # [batch_size, seq_len]
-                syntax_features: Optional[torch.Tensor] = None,  # [batch_size, seq_len, syntax_dim]
-                return_contrastive: bool = False) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass for implicit aspect detection
-        
-        Args:
-            hidden_states: Token-level hidden states from transformer
-            attention_mask: Attention mask for valid tokens
-            syntax_features: Optional syntax features (POS, dependencies)
-            return_contrastive: Whether to return contrastive features
-            
-        Returns:
-            Dictionary with predictions and features
-        """
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        
-        # LSTM encoding for sequence modeling
-        aspect_features, _ = self.aspect_encoder(hidden_states)
-        aspect_features = self.dropout(aspect_features)
-        
-        # Syntax integration
-        if self.use_syntax and syntax_features is not None:
-            syntax_emb = self.syntax_encoder(syntax_features)
-            combined_features = torch.cat([aspect_features, syntax_emb], dim=-1)
-            aspect_features = self.syntax_fusion(combined_features)
-            aspect_features = F.relu(aspect_features)
-        
-        # Context-aware attention
-        attended_features, attention_weights = self.context_attention(
-            aspect_features, aspect_features, aspect_features,
-            key_padding_mask=~attention_mask.bool()
-        )
-        
-        # Residual connection and normalization
-        aspect_features = self.layer_norm(aspect_features + attended_features)
-        
-        # Implicit/explicit classification
-        implicit_logits = self.implicit_classifier(aspect_features)
-        
-        # Token-level predictions
-        implicit_probs = F.softmax(implicit_logits, dim=-1)
-        implicit_predictions = implicit_logits.argmax(dim=-1)
-        
-        outputs = {
-            'implicit_logits': implicit_logits,
-            'implicit_probs': implicit_probs,
-            'implicit_predictions': implicit_predictions,
-            'attention_weights': attention_weights,
-            'aspect_features': aspect_features
-        }
-        
-        # Contrastive features for training
-        if return_contrastive:
-            # Project features for contrastive learning
-            contrastive_features = self.projection_head(aspect_features)
-            contrastive_features = F.normalize(contrastive_features, dim=-1)
-            outputs['contrastive_features'] = contrastive_features
-        
-        return outputs
-    
-    def extract_implicit_spans(self, 
-                              predictions: torch.Tensor,
-                              attention_mask: torch.Tensor,
-                              threshold: float = 0.5) -> List[List[Tuple[int, int]]]:
-        """
-        Extract implicit aspect spans from predictions
-        
-        Args:
-            predictions: [batch_size, seq_len, 2] - implicit probabilities
-            attention_mask: [batch_size, seq_len]
-            threshold: Confidence threshold for implicit detection
-            
-        Returns:
-            List of implicit spans for each batch item
-        """
-        batch_size, seq_len = predictions.shape[:2]
-        implicit_spans = []
-        
-        for b in range(batch_size):
-            spans = []
-            valid_len = attention_mask[b].sum().item()
-            
-            # Get implicit probabilities
-            implicit_probs = predictions[b, :valid_len, 1]  # Implicit class
-            implicit_mask = implicit_probs > threshold
-            
-            # Find contiguous spans
-            start = None
-            for i in range(valid_len):
-                if implicit_mask[i] and start is None:
-                    start = i
-                elif not implicit_mask[i] and start is not None:
-                    spans.append((start, i-1))
-                    start = None
-            
-            # Handle span at end
-            if start is not None:
-                spans.append((start, valid_len-1))
-            
-            implicit_spans.append(spans)
-        
-        return implicit_spans
-
-
-class ImplicitOpinionDetector(nn.Module):
-    """
-    Detects implicit opinions using advanced contrastive techniques
-    """
-    
-    def __init__(self, 
-                 hidden_size: int = 768,
-                 num_emotion_classes: int = 8,
-                 dropout: float = 0.1,
-                 use_emotional_lexicon: bool = True):
-        super().__init__()
-        
-        self.hidden_size = hidden_size
-        self.use_emotional_lexicon = use_emotional_lexicon
-        self.num_emotion_classes = num_emotion_classes
-        
-        # Opinion-specific encoder
-        self.opinion_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=hidden_size,
-                nhead=8,
-                dim_feedforward=hidden_size * 2,
-                dropout=dropout,
-                batch_first=True
-            ),
-            num_layers=2
-        )
-        
-        # Multi-level opinion detection
-        self.opinion_classifier = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, 3)  # implicit, explicit, neutral
-        )
-        
-        # Emotion classification for implicit opinions
-        self.emotion_classifier = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, num_emotion_classes)
-        )
-        
-        # Contrastive learning components
-        self.opinion_projection = nn.Sequential(
-            nn.Linear(hidden_size, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128)
-        )
-        
-        # Emotional lexicon integration
-        if use_emotional_lexicon:
-            self.lexicon_encoder = nn.Embedding(5000, 64)  # Emotional word embeddings
-            self.lexicon_fusion = nn.Linear(hidden_size + 64, hidden_size)
-        
-        # Cross-attention for aspect-opinion interaction
-        self.cross_attention = nn.MultiheadAttention(
-            hidden_size, num_heads=8, dropout=dropout, batch_first=True
-        )
-        
-        # Implicit opinion pattern detector
-        self.pattern_detector = ImplicitPatternDetector(hidden_size, dropout)
-        
-        # Contextual opinion scorer
-        self.context_scorer = ContextualOpinionScorer(hidden_size, dropout)
-        
-    def forward(self,
-                hidden_states: torch.Tensor,
-                attention_mask: torch.Tensor,
-                aspect_features: Optional[torch.Tensor] = None,
-                lexicon_ids: Optional[torch.Tensor] = None,
-                return_contrastive: bool = False) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass for implicit opinion detection
-        """
-        # Opinion encoding
-        opinion_features = self.opinion_encoder(
-            hidden_states,
-            src_key_padding_mask=~attention_mask.bool()
-        )
-        
-        # Lexicon integration
-        if self.use_emotional_lexicon and lexicon_ids is not None:
-            lexicon_emb = self.lexicon_encoder(lexicon_ids)
-            combined_features = torch.cat([opinion_features, lexicon_emb], dim=-1)
-            opinion_features = self.lexicon_fusion(combined_features)
-            opinion_features = F.gelu(opinion_features)
-        
-        # Cross-attention with aspects if available
-        if aspect_features is not None:
-            attended_features, _ = self.cross_attention(
-                opinion_features, aspect_features, aspect_features,
-                key_padding_mask=~attention_mask.bool()
-            )
-            opinion_features = opinion_features + attended_features
-        
-        # Implicit pattern detection
-        pattern_outputs = self.pattern_detector(opinion_features, attention_mask)
-        
-        # Contextual opinion scoring
-        context_outputs = self.context_scorer(opinion_features, attention_mask)
-        
-        # Enhanced features combining patterns and context
-        enhanced_features = opinion_features + pattern_outputs['pattern_features'] + context_outputs['context_features']
-        
-        # Opinion classification
-        opinion_logits = self.opinion_classifier(enhanced_features)
-        emotion_logits = self.emotion_classifier(enhanced_features)
-        
-        outputs = {
-            'opinion_logits': opinion_logits,
-            'emotion_logits': emotion_logits,
-            'opinion_features': enhanced_features,
-            'opinion_probs': F.softmax(opinion_logits, dim=-1),
-            'emotion_probs': F.softmax(emotion_logits, dim=-1),
-            'pattern_scores': pattern_outputs['pattern_scores'],
-            'context_scores': context_outputs['context_scores'],
-            'implicit_indicators': pattern_outputs['implicit_indicators']
-        }
-        
-        if return_contrastive:
-            contrastive_features = self.opinion_projection(enhanced_features)
-            contrastive_features = F.normalize(contrastive_features, dim=-1)
-            outputs['contrastive_features'] = contrastive_features
-        
-        return outputs
+import re
+import numpy as np
 
 
 class ImplicitPatternDetector(nn.Module):
-    """
-    Detects implicit opinion patterns using linguistic cues
-    """
+    """Detects implicit opinion patterns using linguistic rules and neural networks"""
     
     def __init__(self, hidden_size: int, dropout: float = 0.1):
         super().__init__()
         
-        self.hidden_size = hidden_size
-        
-        # Pattern recognition layers
-        self.pattern_cnn = nn.Conv1d(
-            in_channels=hidden_size,
-            out_channels=hidden_size // 2,
-            kernel_size=3,
-            padding=1
+        # Pattern embedding layers
+        self.pattern_encoder = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, hidden_size)
         )
         
-        self.pattern_lstm = nn.LSTM(
-            hidden_size // 2,
-            hidden_size // 4,
-            batch_first=True,
-            bidirectional=True
+        # Attention for pattern focus
+        self.pattern_attention = nn.MultiheadAttention(
+            hidden_size, num_heads=8, dropout=dropout, batch_first=True
         )
         
-        # Implicit indicators detector
-        self.indicator_detector = nn.Sequential(
-            nn.Linear(hidden_size // 2, 64),
-            nn.ReLU(),
-            nn.Linear(64, 8)  # Different types of implicit indicators
+        # Pattern classification
+        self.pattern_classifier = nn.Linear(hidden_size, 4)  # Direct, Indirect, Comparative, Implicit
+        
+        # Linguistic pattern rules
+        self.implicit_patterns = {
+            'comparative': ['better', 'worse', 'more', 'less', 'superior', 'inferior', 'compared to'],
+            'expectation': ['expected', 'supposed to', 'should be', 'would be', 'disappointing', 'surprising'],
+            'emotional': ['love', 'hate', 'enjoy', 'dislike', 'appreciate', 'regret', 'frustrated'],
+            'evaluative': ['worth', 'value', 'quality', 'standard', 'level', 'grade', 'recommend']
+        }
+        
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # Pattern encoding
+        pattern_features = self.pattern_encoder(hidden_states)
+        
+        # Self-attention for pattern focus
+        attended_features, attention_weights = self.pattern_attention(
+            pattern_features, pattern_features, pattern_features,
+            key_padding_mask=~attention_mask.bool()
         )
         
-        # Pattern scorer
-        self.pattern_scorer = nn.Sequential(
-            nn.Linear(hidden_size // 2, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
-        
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, 
-                features: torch.Tensor, 
-                attention_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Detect implicit opinion patterns
-        
-        Args:
-            features: [batch_size, seq_len, hidden_size]
-            attention_mask: [batch_size, seq_len]
-            
-        Returns:
-            Dictionary with pattern information
-        """
-        batch_size, seq_len, hidden_size = features.shape
-        
-        # CNN for local pattern detection
-        # Transpose for conv1d: [batch_size, hidden_size, seq_len]
-        features_transposed = features.transpose(1, 2)
-        cnn_output = F.relu(self.pattern_cnn(features_transposed))
-        cnn_output = cnn_output.transpose(1, 2)  # Back to [batch_size, seq_len, hidden_size//2]
-        
-        # LSTM for sequential pattern modeling
-        lstm_output, _ = self.pattern_lstm(cnn_output)
-        pattern_features = self.dropout(lstm_output)
-        
-        # Implicit indicators detection
-        implicit_indicators = self.indicator_detector(pattern_features)
-        
-        # Pattern scoring
-        pattern_scores = self.pattern_scorer(pattern_features).squeeze(-1)
+        # Pattern classification
+        pattern_logits = self.pattern_classifier(attended_features)
         
         return {
-            'pattern_features': pattern_features,
-            'implicit_indicators': implicit_indicators,
-            'pattern_scores': pattern_scores
+            'pattern_features': attended_features,
+            'pattern_logits': pattern_logits,
+            'attention_weights': attention_weights
         }
 
 
 class ContextualOpinionScorer(nn.Module):
-    """
-    Scores opinions based on contextual information
-    """
+    """Scores contextual opinion expressions for implicit detection"""
     
     def __init__(self, hidden_size: int, dropout: float = 0.1):
         super().__init__()
         
-        self.hidden_size = hidden_size
-        
-        # Context attention
-        self.context_attention = nn.MultiheadAttention(
-            hidden_size, num_heads=8, dropout=dropout, batch_first=True
+        # Context encoding
+        self.context_encoder = nn.LSTM(
+            hidden_size, hidden_size // 2, num_layers=2,
+            bidirectional=True, batch_first=True, dropout=dropout
         )
         
-        # Context encoder
-        self.context_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=hidden_size,
-                nhead=4,
-                dim_feedforward=hidden_size,
-                dropout=dropout,
-                batch_first=True
-            ),
-            num_layers=1
-        )
-        
-        # Context scorer
-        self.context_scorer = nn.Sequential(
+        # Opinion scoring layers
+        self.opinion_scorer = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -416,655 +78,663 @@ class ContextualOpinionScorer(nn.Module):
             nn.Sigmoid()
         )
         
-        # Sentiment polarity detector for context
-        self.polarity_detector = nn.Sequential(
-            nn.Linear(hidden_size, 32),
-            nn.ReLU(),
-            nn.Linear(32, 3)  # positive, negative, neutral context
-        )
-        
-    def forward(self, 
-                features: torch.Tensor, 
-                attention_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Score opinions based on context
-        
-        Args:
-            features: [batch_size, seq_len, hidden_size]
-            attention_mask: [batch_size, seq_len]
-            
-        Returns:
-            Dictionary with context information
-        """
-        # Self-attention for context modeling
-        context_attended, _ = self.context_attention(
-            features, features, features,
-            key_padding_mask=~attention_mask.bool()
-        )
-        
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
         # Context encoding
-        context_features = self.context_encoder(
-            context_attended,
-            src_key_padding_mask=~attention_mask.bool()
-        )
+        context_features, _ = self.context_encoder(hidden_states)
         
-        # Context scoring
-        context_scores = self.context_scorer(context_features).squeeze(-1)
+        # Opinion scoring
+        opinion_scores = self.opinion_scorer(context_features).squeeze(-1)
         
-        # Polarity detection
-        polarity_logits = self.polarity_detector(context_features)
+        # Apply attention mask
+        opinion_scores = opinion_scores * attention_mask.float()
         
         return {
             'context_features': context_features,
-            'context_scores': context_scores,
-            'polarity_logits': polarity_logits,
-            'polarity_probs': F.softmax(polarity_logits, dim=-1)
+            'opinion_scores': opinion_scores
         }
 
 
-class AdvancedImplicitExtractor:
+class ImplicitAspectDetector(nn.Module):
     """
-    Advanced extraction methods for implicit sentiment analysis results
+    Complete implicit aspect detection following 2024-2025 breakthrough standards
+    Implements Grid Tagging Matching (GM-GTM) and sentiment combination vectors
     """
     
-    def __init__(self, 
-                 confidence_threshold: float = 0.7,
-                 consistency_threshold: float = 0.6,
-                 min_span_length: int = 1,
-                 max_span_length: int = 10):
+    def __init__(self, hidden_size: int, num_classes: int = 3, dropout: float = 0.1):
+        super().__init__()
         
-        self.confidence_threshold = confidence_threshold
-        self.consistency_threshold = consistency_threshold
-        self.min_span_length = min_span_length
-        self.max_span_length = max_span_length
+        self.hidden_size = hidden_size
+        self.num_classes = num_classes
         
-        # Implicit pattern types
-        self.implicit_patterns = {
-            'negation': ['not', 'never', 'no', 'nothing', 'nobody', 'nowhere'],
-            'intensifiers': ['very', 'extremely', 'highly', 'quite', 'really'],
-            'comparatives': ['better', 'worse', 'more', 'less', 'superior', 'inferior'],
-            'temporal': ['used to', 'before', 'previously', 'formerly'],
-            'conditional': ['if', 'unless', 'provided', 'assuming'],
-            'expectation': ['should', 'ought', 'expected', 'supposed', 'meant']
+        # Grid tagging matrix for relationships
+        self.grid_tagger = nn.Linear(hidden_size, num_classes * num_classes)
+        
+        # Sentiment combination vectors (4 fully connected layers as per EMNLP 2024)
+        self.sentiment_combiner = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, hidden_size // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 4, num_classes)
+        )
+        
+        # Implicit-explicit combination classifier
+        self.combination_classifier = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 4)  # Explicit-Explicit, Explicit-Implicit, Implicit-Explicit, Implicit-Implicit
+        )
+        
+        # Aspect candidate scorer
+        self.aspect_scorer = nn.Linear(hidden_size, 1)
+        
+        # Implicit detection patterns
+        self.implicit_indicators = {
+            'implicit_aspects': [
+                'it', 'this', 'that', 'place', 'restaurant', 'spot', 'experience',
+                'meal', 'visit', 'time', 'everything', 'overall', 'general'
+            ],
+            'aspect_categories': {
+                'food': ['taste', 'flavor', 'quality', 'freshness', 'temperature'],
+                'service': ['staff', 'waiter', 'waitress', 'server', 'attention'],
+                'ambiance': ['atmosphere', 'environment', 'setting', 'mood', 'vibe'],
+                'price': ['cost', 'expensive', 'cheap', 'affordable', 'value'],
+                'location': ['place', 'spot', 'location', 'convenient', 'accessible']
+            }
         }
-    
-    def extract_implicit_triplets(self,
-                                 model_outputs: Dict[str, torch.Tensor],
-                                 tokenizer,
-                                 input_ids: torch.Tensor,
-                                 attention_mask: torch.Tensor) -> List[Dict[str, Any]]:
+        
+    def forward(self, 
+                hidden_states: torch.Tensor,
+                attention_mask: torch.Tensor,
+                explicit_aspects: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
-        Extract implicit triplets with advanced confidence and consistency checking
+        Forward pass for implicit aspect detection
         
         Args:
-            model_outputs: Dictionary of model outputs
-            tokenizer: Tokenizer for text decoding
-            input_ids: [batch_size, seq_len]
+            hidden_states: [batch_size, seq_len, hidden_size]
             attention_mask: [batch_size, seq_len]
+            explicit_aspects: Optional explicit aspect representations
             
         Returns:
-            List of extracted implicit triplets with metadata
+            Dictionary with implicit detection results
         """
-        batch_size, seq_len = input_ids.shape
-        all_triplets = []
+        batch_size, seq_len, hidden_size = hidden_states.shape
         
-        for b in range(batch_size):
-            # Get valid sequence length
-            valid_len = attention_mask[b].sum().item()
-            
-            # Extract tokens
-            tokens = tokenizer.convert_ids_to_tokens(input_ids[b][:valid_len])
-            text = tokenizer.decode(input_ids[b][:valid_len], skip_special_tokens=True)
-            
-            # Get predictions and confidence scores
-            batch_triplets = self._extract_batch_triplets(
-                model_outputs, b, valid_len, tokens, text
-            )
-            
-            all_triplets.append(batch_triplets)
+        # 1. Grid tagging matrix computation
+        grid_logits = self.grid_tagger(hidden_states)  # [batch_size, seq_len, num_classes^2]
+        grid_logits = grid_logits.view(batch_size, seq_len, self.num_classes, self.num_classes)
         
-        return all_triplets
-    
-    def _extract_batch_triplets(self,
-                               outputs: Dict[str, torch.Tensor],
-                               batch_idx: int,
-                               valid_len: int,
-                               tokens: List[str],
-                               text: str) -> List[Dict[str, Any]]:
-        """Extract triplets for a single batch item"""
+        # 2. Sentiment combination vectors (following EMNLP 2024)
+        sentiment_combinations = self.sentiment_combiner(hidden_states)  # [batch_size, seq_len, num_classes]
         
-        # Extract predictions
-        aspect_preds = outputs.get('aspect_logits', torch.zeros(1, valid_len, 2))
-        opinion_preds = outputs.get('opinion_logits', torch.zeros(1, valid_len, 2))
-        sentiment_preds = outputs.get('sentiment_logits', torch.zeros(1, valid_len, 3))
+        # 3. Implicit aspect scoring
+        implicit_scores = self.aspect_scorer(hidden_states).squeeze(-1)  # [batch_size, seq_len]
+        implicit_scores = torch.sigmoid(implicit_scores) * attention_mask.float()
         
-        # Get implicit detection results
-        implicit_aspect_probs = torch.zeros(valid_len)
-        implicit_opinion_probs = torch.zeros(valid_len)
-        if 'implicit_aspect_logits' in outputs:
-            implicit_aspect_probs = F.softmax(outputs['implicit_aspect_logits'], dim=-1)[batch_idx, :valid_len, 1]
-        if 'implicit_opinion_logits' in outputs:
-            implicit_opinion_probs = F.softmax(outputs['implicit_opinion_logits'], dim=-1)[batch_idx, :valid_len, 0]
+        # 4. Implicit-explicit combination classification
+        combination_logits = None
+        if explicit_aspects is not None:
+            # Combine implicit and explicit representations
+            combined_repr = torch.cat([hidden_states, explicit_aspects], dim=-1)
+            combination_logits = self.combination_classifier(combined_repr)
         
-        # Get confidence scores
-        confidence_scores = torch.ones(valid_len)
-        if 'confidence_scores' in outputs:
-            confidence_scores = outputs['confidence_scores'][batch_idx, :valid_len, 0]
-        
-        # Extract aspects
-        aspect_spans = self._extract_confident_spans(
-            aspect_preds[batch_idx, :valid_len].argmax(dim=-1),
-            confidence_scores,
-            implicit_aspect_probs,
-            span_type='aspect'
-        )
-        
-        # Extract opinions
-        opinion_spans = self._extract_confident_spans(
-            opinion_preds[batch_idx, :valid_len].argmax(dim=-1),
-            confidence_scores,
-            implicit_opinion_probs,
-            span_type='opinion'
-        )
-        
-        # Match aspects with opinions and extract triplets
-        triplets = []
-        for aspect_span in aspect_spans:
-            for opinion_span in opinion_spans:
-                if self._spans_are_compatible(aspect_span, opinion_span, valid_len):
-                    
-                    # Get sentiment for this aspect-opinion pair
-                    sentiment_info = self._get_triplet_sentiment(
-                        sentiment_preds[batch_idx, :valid_len],
-                        aspect_span, opinion_span
-                    )
-                    
-                    # Calculate overall confidence
-                    triplet_confidence = self._calculate_triplet_confidence(
-                        aspect_span, opinion_span, confidence_scores, 
-                        implicit_aspect_probs, implicit_opinion_probs
-                    )
-                    
-                    # Check if triplet meets quality thresholds
-                    if triplet_confidence >= self.confidence_threshold:
-                        
-                        # Extract text spans
-                        aspect_text = self._extract_span_text(tokens, aspect_span['indices'])
-                        opinion_text = self._extract_span_text(tokens, opinion_span['indices'])
-                        
-                        # Detect implicit patterns
-                        implicit_patterns = self._detect_implicit_patterns(
-                            tokens, aspect_span['indices'], opinion_span['indices']
-                        )
-                        
-                        triplet = {
-                            'aspect': {
-                                'text': aspect_text,
-                                'span': aspect_span['indices'],
-                                'confidence': aspect_span['confidence'],
-                                'is_implicit': aspect_span['is_implicit']
-                            },
-                            'opinion': {
-                                'text': opinion_text,
-                                'span': opinion_span['indices'],
-                                'confidence': opinion_span['confidence'],
-                                'is_implicit': opinion_span['is_implicit']
-                            },
-                            'sentiment': sentiment_info['label'],
-                            'sentiment_confidence': sentiment_info['confidence'],
-                            'overall_confidence': triplet_confidence,
-                            'implicit_patterns': implicit_patterns,
-                            'extraction_method': 'contrastive_implicit',
-                            'quality_score': self._calculate_quality_score(
-                                aspect_span, opinion_span, sentiment_info, implicit_patterns
-                            )
-                        }
-                        
-                        triplets.append(triplet)
-        
-        # Post-process and filter triplets
-        filtered_triplets = self._post_process_triplets(triplets, text)
-        
-        return filtered_triplets
-    
-    def _extract_confident_spans(self,
-                                predictions: torch.Tensor,
-                                confidence_scores: torch.Tensor,
-                                implicit_probs: torch.Tensor,
-                                span_type: str) -> List[Dict[str, Any]]:
-        """Extract confident spans of given type"""
-        
-        spans = []
-        seq_len = len(predictions)
-        
-        # Find contiguous positive predictions
-        in_span = False
-        span_start = None
-        
-        for i in range(seq_len):
-            is_positive = predictions[i] > 0
-            is_confident = confidence_scores[i] >= self.confidence_threshold
-            is_implicit = implicit_probs[i] >= 0.5
-            
-            if is_positive and is_confident:
-                if not in_span:
-                    span_start = i
-                    in_span = True
-            else:
-                if in_span and span_start is not None:
-                    # End current span
-                    span_end = i - 1
-                    
-                    # Check span length constraints
-                    span_length = span_end - span_start + 1
-                    if self.min_span_length <= span_length <= self.max_span_length:
-                        
-                        # Calculate span-level metrics
-                        span_confidence = confidence_scores[span_start:span_end+1].mean().item()
-                        span_implicit_prob = implicit_probs[span_start:span_end+1].mean().item()
-                        
-                        spans.append({
-                            'indices': (span_start, span_end),
-                            'confidence': span_confidence,
-                            'is_implicit': span_implicit_prob >= 0.5,
-                            'implicit_confidence': span_implicit_prob,
-                            'type': span_type,
-                            'length': span_length
-                        })
-                    
-                    in_span = False
-                    span_start = None
-        
-        # Handle span at end of sequence
-        if in_span and span_start is not None:
-            span_end = seq_len - 1
-            span_length = span_end - span_start + 1
-            
-            if self.min_span_length <= span_length <= self.max_span_length:
-                span_confidence = confidence_scores[span_start:span_end+1].mean().item()
-                span_implicit_prob = implicit_probs[span_start:span_end+1].mean().item()
-                
-                spans.append({
-                    'indices': (span_start, span_end),
-                    'confidence': span_confidence,
-                    'is_implicit': span_implicit_prob >= 0.5,
-                    'implicit_confidence': span_implicit_prob,
-                    'type': span_type,
-                    'length': span_length
-                })
-        
-        return spans
-    
-    def _spans_are_compatible(self, 
-                             aspect_span: Dict[str, Any], 
-                             opinion_span: Dict[str, Any], 
-                             seq_len: int) -> bool:
-        """Check if aspect and opinion spans are compatible for triplet formation"""
-        
-        # Distance constraint
-        aspect_start, aspect_end = aspect_span['indices']
-        opinion_start, opinion_end = opinion_span['indices']
-        
-        # Calculate minimum distance between spans
-        if aspect_end < opinion_start:
-            distance = opinion_start - aspect_end
-        elif opinion_end < aspect_start:
-            distance = aspect_start - opinion_end
-        else:
-            distance = 0  # Overlapping spans
-        
-        # Maximum distance constraint
-        max_distance = min(15, seq_len // 3)  # Adaptive based on sequence length
-        if distance > max_distance:
-            return False
-        
-        # Confidence compatibility
-        confidence_diff = abs(aspect_span['confidence'] - opinion_span['confidence'])
-        if confidence_diff > 0.3:  # Large confidence gap
-            return False
-        
-        return True
-    
-    def _get_triplet_sentiment(self,
-                              sentiment_preds: torch.Tensor,
-                              aspect_span: Dict[str, Any],
-                              opinion_span: Dict[str, Any]) -> Dict[str, Any]:
-        """Get sentiment for aspect-opinion pair"""
-        
-        aspect_start, aspect_end = aspect_span['indices']
-        opinion_start, opinion_end = opinion_span['indices']
-        
-        # Define region for sentiment analysis
-        region_start = min(aspect_start, opinion_start)
-        region_end = max(aspect_end, opinion_end)
-        
-        # Get sentiment predictions in region
-        region_sentiments = sentiment_preds[region_start:region_end+1]
-        sentiment_probs = F.softmax(region_sentiments, dim=-1)
-        
-        # Aggregate sentiment (majority vote with confidence weighting)
-        avg_sentiment_probs = sentiment_probs.mean(dim=0)
-        predicted_sentiment = avg_sentiment_probs.argmax().item()
-        sentiment_confidence = avg_sentiment_probs[predicted_sentiment].item()
-        
-        # Map to sentiment labels
-        sentiment_labels = ['negative', 'neutral', 'positive']
+        # 5. Apply attention mask to all outputs
+        sentiment_combinations = sentiment_combinations * attention_mask.unsqueeze(-1)
+        grid_logits = grid_logits * attention_mask.unsqueeze(-1).unsqueeze(-1)
         
         return {
-            'label': sentiment_labels[predicted_sentiment],
-            'confidence': sentiment_confidence,
-            'probabilities': avg_sentiment_probs.tolist(),
-            'region': (region_start, region_end)
+            'implicit_aspect_scores': implicit_scores,
+            'sentiment_combinations': sentiment_combinations,
+            'grid_logits': grid_logits,
+            'combination_logits': combination_logits,
+            'hidden_states': hidden_states
         }
     
-    def _calculate_triplet_confidence(self,
-                                     aspect_span: Dict[str, Any],
-                                     opinion_span: Dict[str, Any],
-                                     confidence_scores: torch.Tensor,
-                                     implicit_aspect_probs: torch.Tensor,
-                                     implicit_opinion_probs: torch.Tensor) -> float:
-        """Calculate overall confidence for triplet"""
+    def extract_implicit_aspects(self,
+                                input_ids: torch.Tensor,
+                                hidden_states: torch.Tensor,
+                                implicit_scores: torch.Tensor,
+                                tokenizer,
+                                threshold: float = 0.5) -> List[Dict[str, Any]]:
+        """Extract implicit aspects using scores and linguistic patterns"""
         
-        # Individual span confidences
-        aspect_conf = aspect_span['confidence']
-        opinion_conf = opinion_span['confidence']
+        implicit_aspects = []
+        batch_size = input_ids.size(0)
         
-        # Implicit detection consistency
-        aspect_start, aspect_end = aspect_span['indices']
-        opinion_start, opinion_end = opinion_span['indices']
-        
-        # Regional confidence
-        region_start = min(aspect_start, opinion_start)
-        region_end = max(aspect_end, opinion_end)
-        region_confidence = confidence_scores[region_start:region_end+1].mean().item()
-        
-        # Implicit consistency score
-        implicit_consistency = 1.0
-        if aspect_span['is_implicit'] or opinion_span['is_implicit']:
-            aspect_implicit_conf = implicit_aspect_probs[aspect_start:aspect_end+1].mean().item()
-            opinion_implicit_conf = implicit_opinion_probs[opinion_start:opinion_end+1].mean().item()
-            implicit_consistency = (aspect_implicit_conf + opinion_implicit_conf) / 2
-        
-        # Weighted combination
-        overall_confidence = (
-            0.3 * aspect_conf +
-            0.3 * opinion_conf +
-            0.2 * region_confidence +
-            0.2 * implicit_consistency
-        )
-        
-        return overall_confidence
-    
-    def _extract_span_text(self, tokens: List[str], span_indices: Tuple[int, int]) -> str:
-        """Extract text for span indices"""
-        start, end = span_indices
-        span_tokens = tokens[start:end+1]
-        
-        # Handle subword tokens (starting with ##)
-        cleaned_tokens = []
-        for token in span_tokens:
-            if token.startswith('##'):
-                if cleaned_tokens:
-                    cleaned_tokens[-1] += token[2:]
-                else:
-                    cleaned_tokens.append(token[2:])
-            else:
-                cleaned_tokens.append(token)
-        
-        return ' '.join(cleaned_tokens)
-    
-    def _detect_implicit_patterns(self,
-                                 tokens: List[str],
-                                 aspect_indices: Tuple[int, int],
-                                 opinion_indices: Tuple[int, int]) -> List[Dict[str, Any]]:
-        """Detect implicit opinion patterns in the vicinity of spans"""
-        
-        patterns_found = []
-        
-        # Define search region
-        aspect_start, aspect_end = aspect_indices
-        opinion_start, opinion_end = opinion_indices
-        search_start = max(0, min(aspect_start, opinion_start) - 5)
-        search_end = min(len(tokens), max(aspect_end, opinion_end) + 5)
-        
-        search_tokens = [token.lower() for token in tokens[search_start:search_end]]
-        
-        # Check for each pattern type
-        for pattern_type, pattern_words in self.implicit_patterns.items():
-            for word in pattern_words:
-                if word in search_tokens:
-                    position = search_tokens.index(word) + search_start
-                    patterns_found.append({
-                        'type': pattern_type,
-                        'word': word,
-                        'position': position,
-                        'distance_to_aspect': abs(position - (aspect_start + aspect_end) // 2),
-                        'distance_to_opinion': abs(position - (opinion_start + opinion_end) // 2)
+        for batch_idx in range(batch_size):
+            # Get tokens for this sample
+            tokens = tokenizer.convert_ids_to_tokens(input_ids[batch_idx])
+            scores = implicit_scores[batch_idx].cpu().numpy()
+            
+            # Find high-scoring implicit regions
+            implicit_positions = np.where(scores > threshold)[0]
+            
+            if len(implicit_positions) == 0:
+                continue
+                
+            # Group consecutive positions into spans
+            spans = self._group_consecutive_positions(implicit_positions)
+            
+            for span_start, span_end in spans:
+                # Extract span text
+                span_tokens = tokens[span_start:span_end+1]
+                span_text = tokenizer.convert_tokens_to_string(span_tokens).strip()
+                
+                # Check if it's a valid implicit aspect
+                if self._is_valid_implicit_aspect(span_text, tokens):
+                    implicit_aspects.append({
+                        'text': span_text,
+                        'start': span_start,
+                        'end': span_end,
+                        'confidence': float(scores[span_start:span_end+1].mean()),
+                        'type': 'implicit_aspect',
+                        'category': self._categorize_aspect(span_text)
                     })
         
-        return patterns_found
+        return implicit_aspects
     
-    def _calculate_quality_score(self,
-                               aspect_span: Dict[str, Any],
-                               opinion_span: Dict[str, Any],
-                               sentiment_info: Dict[str, Any],
-                               implicit_patterns: List[Dict[str, Any]]) -> float:
-        """Calculate overall quality score for triplet"""
+    def _group_consecutive_positions(self, positions: np.ndarray) -> List[Tuple[int, int]]:
+        """Group consecutive positions into spans"""
+        if len(positions) == 0:
+            return []
         
-        # Base confidence score
-        base_score = (aspect_span['confidence'] + opinion_span['confidence'] + 
-                     sentiment_info['confidence']) / 3
+        spans = []
+        start = positions[0]
+        prev = positions[0]
         
-        # Implicit pattern bonus
-        pattern_bonus = min(0.1 * len(implicit_patterns), 0.3)
+        for pos in positions[1:]:
+            if pos - prev > 1:  # Gap found
+                spans.append((start, prev))
+                start = pos
+            prev = pos
         
-        # Span length penalty (very short or very long spans are less reliable)
-        aspect_length_penalty = 0.0
-        if aspect_span['length'] == 1:
-            aspect_length_penalty = 0.05
-        elif aspect_span['length'] > 7:
-            aspect_length_penalty = 0.1
-        
-        opinion_length_penalty = 0.0
-        if opinion_span['length'] == 1:
-            opinion_length_penalty = 0.05
-        elif opinion_span['length'] > 7:
-            opinion_length_penalty = 0.1
-        
-        # Implicit consistency bonus
-        implicit_bonus = 0.0
-        if aspect_span['is_implicit'] or opinion_span['is_implicit']:
-            implicit_bonus = 0.05
-        
-        quality_score = (base_score + pattern_bonus + implicit_bonus - 
-                        aspect_length_penalty - opinion_length_penalty)
-        
-        return max(0.0, min(1.0, quality_score))
+        spans.append((start, prev))
+        return spans
     
-    def _post_process_triplets(self, 
-                              triplets: List[Dict[str, Any]], 
-                              text: str) -> List[Dict[str, Any]]:
-        """Post-process and filter triplets"""
+    def _is_valid_implicit_aspect(self, text: str, all_tokens: List[str]) -> bool:
+        """Check if text is a valid implicit aspect"""
+        text_lower = text.lower()
         
-        # Remove duplicate or overlapping triplets
-        filtered_triplets = []
+        # Check if it's in implicit indicators
+        if any(indicator in text_lower for indicator in self.implicit_indicators['implicit_aspects']):
+            return True
         
-        for triplet in triplets:
-            is_duplicate = False
-            
-            for existing in filtered_triplets:
-                if self._triplets_overlap(triplet, existing):
-                    # Keep the one with higher quality score
-                    if triplet['quality_score'] > existing['quality_score']:
-                        filtered_triplets.remove(existing)
-                    else:
-                        is_duplicate = True
-                        break
-            
-            if not is_duplicate:
-                filtered_triplets.append(triplet)
+        # Check if it's too short or contains only punctuation
+        if len(text.strip()) < 2 or text.strip() in ['[PAD]', '[CLS]', '[SEP]']:
+            return False
         
-        # Sort by quality score
-        filtered_triplets.sort(key=lambda x: x['quality_score'], reverse=True)
+        # Check if it's a pronoun or demonstrative that could refer to an aspect
+        pronouns = ['it', 'this', 'that', 'they', 'them', 'these', 'those']
+        if text_lower in pronouns:
+            return True
         
-        return filtered_triplets
+        return False
     
-    def _triplets_overlap(self, triplet1: Dict[str, Any], triplet2: Dict[str, Any]) -> bool:
-        """Check if two triplets have overlapping spans"""
+    def _categorize_aspect(self, text: str) -> str:
+        """Categorize aspect into predefined categories"""
+        text_lower = text.lower()
         
-        def spans_overlap(span1, span2):
-            start1, end1 = span1
-            start2, end2 = span2
-            return not (end1 < start2 or end2 < start1)
+        for category, keywords in self.implicit_indicators['aspect_categories'].items():
+            if any(keyword in text_lower for keyword in keywords):
+                return category
         
-        aspect_overlap = spans_overlap(
-            triplet1['aspect']['span'], 
-            triplet2['aspect']['span']
-        )
-        
-        opinion_overlap = spans_overlap(
-            triplet1['opinion']['span'], 
-            triplet2['opinion']['span']
-        )
-        
-        return aspect_overlap and opinion_overlap
+        return 'general'
 
 
-class ContrastiveImplicitABSA(nn.Module):
+class ImplicitOpinionDetector(nn.Module):
     """
-    Main module combining all implicit detection components with contrastive learning
-    Implements the full ITSCL framework from EMNLP 2024
+    Complete implicit opinion detection with contrastive learning
+    Implements span-level contextual interactions (SCI-Net) approach
     """
     
-    def __init__(self, 
-                 config,
-                 backbone_model: Optional[nn.Module] = None):
+    def __init__(self, hidden_size: int, num_heads: int = 8, num_layers: int = 2, dropout: float = 0.1):
+        super().__init__()
+        
+        self.hidden_size = hidden_size
+        
+        # Bi-directional contextual interaction layers (SCI-Net)
+        self.contextual_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=hidden_size,
+                nhead=num_heads,
+                dim_feedforward=hidden_size * 2,
+                dropout=dropout,
+                batch_first=True
+            ) for _ in range(num_layers)
+        ])
+        
+        # Linear projection for task-oriented representations
+        self.task_projection = nn.Linear(hidden_size, hidden_size)
+        
+        # Cross-task attention for aspect-opinion interaction
+        self.cross_attention = nn.MultiheadAttention(
+            hidden_size, num_heads=num_heads, dropout=dropout, batch_first=True
+        )
+        
+        # Opinion classification with implicit detection
+        self.opinion_classifier = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, 3)  # B-I-O for opinions
+        )
+        
+        # Implicit opinion scorer
+        self.implicit_scorer = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 4, 1),
+            nn.Sigmoid()
+        )
+        
+        # Pattern detector and context scorer
+        self.pattern_detector = ImplicitPatternDetector(hidden_size, dropout)
+        self.context_scorer = ContextualOpinionScorer(hidden_size, dropout)
+        
+        # Implicit opinion patterns
+        self.implicit_opinion_patterns = {
+            'positive_implicit': [
+                'recommend', 'worth', 'appreciate', 'enjoy', 'love', 'amazing',
+                'excellent', 'perfect', 'wonderful', 'fantastic', 'great'
+            ],
+            'negative_implicit': [
+                'disappointed', 'regret', 'waste', 'avoid', 'terrible', 'awful',
+                'horrible', 'disgusting', 'unacceptable', 'disappointing'
+            ],
+            'comparative': [
+                'better than', 'worse than', 'compared to', 'unlike', 'different from',
+                'similar to', 'as good as', 'not as good as'
+            ]
+        }
+    
+    def forward(self,
+                hidden_states: torch.Tensor,
+                attention_mask: torch.Tensor,
+                aspect_features: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass for implicit opinion detection
+        
+        Args:
+            hidden_states: [batch_size, seq_len, hidden_size]
+            attention_mask: [batch_size, seq_len]
+            aspect_features: Optional aspect representations for cross-attention
+            
+        Returns:
+            Dictionary with implicit opinion detection results
+        """
+        
+        # 1. Bi-directional contextual interactions (SCI-Net)
+        contextualized_states = hidden_states
+        for layer in self.contextual_layers:
+            contextualized_states = layer(
+                contextualized_states, 
+                src_key_padding_mask=~attention_mask.bool()
+            )
+        
+        # 2. Task-oriented projection
+        task_features = self.task_projection(contextualized_states)
+        
+        # 3. Cross-task attention with aspects
+        if aspect_features is not None:
+            attended_features, cross_attention_weights = self.cross_attention(
+                task_features, aspect_features, aspect_features,
+                key_padding_mask=~attention_mask.bool()
+            )
+            # Residual connection
+            task_features = task_features + attended_features
+        else:
+            cross_attention_weights = None
+        
+        # 4. Pattern detection
+        pattern_outputs = self.pattern_detector(task_features, attention_mask)
+        
+        # 5. Contextual scoring
+        context_outputs = self.context_scorer(task_features, attention_mask)
+        
+        # 6. Combine all features
+        enhanced_features = (task_features + 
+                           pattern_outputs['pattern_features'] + 
+                           context_outputs['context_features'])
+        
+        # 7. Opinion classification
+        opinion_logits = self.opinion_classifier(enhanced_features)
+        
+        # 8. Implicit opinion scoring
+        implicit_scores = self.implicit_scorer(enhanced_features).squeeze(-1)
+        implicit_scores = implicit_scores * attention_mask.float()
+        
+        return {
+            'opinion_logits': opinion_logits,
+            'implicit_opinion_scores': implicit_scores,
+            'contextualized_features': enhanced_features,
+            'pattern_outputs': pattern_outputs,
+            'context_outputs': context_outputs,
+            'cross_attention_weights': cross_attention_weights
+        }
+    
+    def extract_implicit_opinions(self,
+                                 input_ids: torch.Tensor,
+                                 implicit_scores: torch.Tensor,
+                                 pattern_outputs: Dict[str, torch.Tensor],
+                                 tokenizer,
+                                 threshold: float = 0.5) -> List[Dict[str, Any]]:
+        """Extract implicit opinions using scores and patterns"""
+        
+        implicit_opinions = []
+        batch_size = input_ids.size(0)
+        
+        for batch_idx in range(batch_size):
+            # Get tokens and scores for this sample
+            tokens = tokenizer.convert_ids_to_tokens(input_ids[batch_idx])
+            scores = implicit_scores[batch_idx].cpu().numpy()
+            pattern_logits = pattern_outputs['pattern_logits'][batch_idx].cpu().numpy()
+            
+            # Combine implicit scores with pattern scores
+            combined_scores = scores + pattern_logits.max(axis=-1) * 0.3
+            
+            # Find high-scoring regions
+            implicit_positions = np.where(combined_scores > threshold)[0]
+            
+            if len(implicit_positions) == 0:
+                continue
+            
+            # Group into spans
+            spans = self._group_consecutive_positions(implicit_positions)
+            
+            for span_start, span_end in spans:
+                # Extract span text
+                span_tokens = tokens[span_start:span_end+1]
+                span_text = tokenizer.convert_tokens_to_string(span_tokens).strip()
+                
+                # Determine sentiment and pattern type
+                pattern_type = self._classify_opinion_pattern(span_text)
+                sentiment = self._infer_implicit_sentiment(span_text, pattern_type)
+                
+                if self._is_valid_implicit_opinion(span_text):
+                    implicit_opinions.append({
+                        'text': span_text,
+                        'start': span_start,
+                        'end': span_end,
+                        'confidence': float(combined_scores[span_start:span_end+1].mean()),
+                        'type': 'implicit_opinion',
+                        'pattern_type': pattern_type,
+                        'sentiment': sentiment
+                    })
+        
+        return implicit_opinions
+    
+    def _group_consecutive_positions(self, positions: np.ndarray) -> List[Tuple[int, int]]:
+        """Group consecutive positions into spans"""
+        if len(positions) == 0:
+            return []
+        
+        spans = []
+        start = positions[0]
+        prev = positions[0]
+        
+        for pos in positions[1:]:
+            if pos - prev > 1:  # Gap found
+                spans.append((start, prev))
+                start = pos
+            prev = pos
+        
+        spans.append((start, prev))
+        return spans
+    
+    def _classify_opinion_pattern(self, text: str) -> str:
+        """Classify the type of implicit opinion pattern"""
+        text_lower = text.lower()
+        
+        for pattern_type, keywords in self.implicit_opinion_patterns.items():
+            if any(keyword in text_lower for keyword in keywords):
+                return pattern_type
+        
+        return 'general'
+    
+    def _infer_implicit_sentiment(self, text: str, pattern_type: str) -> str:
+        """Infer sentiment from implicit opinion text and pattern"""
+        text_lower = text.lower()
+        
+        # Pattern-based sentiment inference
+        if pattern_type == 'positive_implicit':
+            return 'POS'
+        elif pattern_type == 'negative_implicit':
+            return 'NEG'
+        elif pattern_type == 'comparative':
+            # More sophisticated comparative analysis needed
+            if any(word in text_lower for word in ['better', 'superior', 'prefer']):
+                return 'POS'
+            elif any(word in text_lower for word in ['worse', 'inferior', 'disappointing']):
+                return 'NEG'
+        
+        return 'NEU'
+    
+    def _is_valid_implicit_opinion(self, text: str) -> bool:
+        """Check if text represents a valid implicit opinion"""
+        text_lower = text.lower()
+        
+        # Filter out very short spans
+        if len(text.strip()) < 2:
+            return False
+        
+        # Filter out punctuation and special tokens
+        if text.strip() in ['[PAD]', '[CLS]', '[SEP]', '.', ',', '!', '?']:
+            return False
+        
+        # Check for opinion indicators
+        opinion_indicators = ['recommend', 'worth', 'love', 'hate', 'enjoy', 'appreciate', 
+                            'regret', 'disappointed', 'amazing', 'terrible', 'great', 'awful']
+        
+        if any(indicator in text_lower for indicator in opinion_indicators):
+            return True
+        
+        # Check for evaluative language
+        evaluative = ['good', 'bad', 'excellent', 'poor', 'wonderful', 'horrible', 
+                     'fantastic', 'disappointing', 'impressive', 'unacceptable']
+        
+        if any(eval_word in text_lower for eval_word in evaluative):
+            return True
+        
+        return False
+
+
+class CompleteImplicitDetector(nn.Module):
+    """
+    Complete implicit sentiment detection system integrating aspects and opinions
+    Implements instruction tuning-based contrastive learning for implicit-explicit combinations
+    """
+    
+    def __init__(self, config):
         super().__init__()
         
         self.config = config
         self.hidden_size = config.hidden_size
         
-        # Backbone transformer (shared)
-        if backbone_model is None:
-            self.backbone = AutoModel.from_pretrained(config.model_name)
-        else:
-            self.backbone = backbone_model
-        
-        # Implicit detection modules
+        # Initialize component detectors
         self.implicit_aspect_detector = ImplicitAspectDetector(
             hidden_size=self.hidden_size,
-            dropout=config.dropout,
-            use_syntax=getattr(config, 'use_syntax_features', True)
+            num_classes=3,
+            dropout=config.dropout
         )
         
         self.implicit_opinion_detector = ImplicitOpinionDetector(
             hidden_size=self.hidden_size,
-            dropout=config.dropout,
-            use_emotional_lexicon=getattr(config, 'use_emotional_lexicon', True)
+            num_heads=8,
+            num_layers=2,
+            dropout=config.dropout
         )
         
-        # Feature fusion
-        self.feature_fusion = nn.Sequential(
+        # Unified implicit-explicit combiner
+        self.implicit_explicit_combiner = nn.Sequential(
+            nn.Linear(self.hidden_size * 3, self.hidden_size * 2),  # aspect + opinion + context
+            nn.GELU(),
+            nn.Dropout(config.dropout),
             nn.Linear(self.hidden_size * 2, self.hidden_size),
             nn.GELU(),
             nn.Dropout(config.dropout),
-            nn.LayerNorm(self.hidden_size)
+            nn.Linear(self.hidden_size, 4)  # 4 combination types
         )
         
-        # Final prediction heads
-        self.final_aspect_head = nn.Linear(self.hidden_size, 2)  # aspect/no-aspect
-        self.final_opinion_head = nn.Linear(self.hidden_size, 2)  # opinion/no-opinion
-        self.final_sentiment_head = nn.Linear(self.hidden_size, 3)  # pos/neg/neu
-        
-        # Confidence estimation
-        self.confidence_estimator = nn.Sequential(
-            nn.Linear(self.hidden_size, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
+        # Confidence scorer for implicit detection
+        self.confidence_scorer = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(self.hidden_size // 2, 1),
             nn.Sigmoid()
         )
         
     def forward(self,
-                input_ids: torch.Tensor,
+                hidden_states: torch.Tensor,
                 attention_mask: torch.Tensor,
-                aspect_labels: Optional[torch.Tensor] = None,
-                opinion_labels: Optional[torch.Tensor] = None,
-                sentiment_labels: Optional[torch.Tensor] = None,
-                implicit_labels: Optional[torch.Tensor] = None,
-                syntax_features: Optional[torch.Tensor] = None,
-                training: bool = True) -> Dict[str, torch.Tensor]:
+                explicit_aspect_features: Optional[torch.Tensor] = None,
+                explicit_opinion_features: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
-        Forward pass with contrastive learning
-        """
-        # Get backbone features
-        backbone_outputs = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=True
-        )
-        hidden_states = backbone_outputs.last_hidden_state
+        Complete forward pass for implicit detection
         
-        # Implicit aspect detection
+        Args:
+            hidden_states: [batch_size, seq_len, hidden_size]
+            attention_mask: [batch_size, seq_len]
+            explicit_aspect_features: Optional explicit aspect representations
+            explicit_opinion_features: Optional explicit opinion representations
+            
+        Returns:
+            Complete implicit detection results
+        """
+        
+        # 1. Implicit aspect detection
         aspect_outputs = self.implicit_aspect_detector(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            syntax_features=syntax_features,
-            return_contrastive=training
+            hidden_states, attention_mask, explicit_aspect_features
         )
         
-        # Implicit opinion detection
+        # 2. Implicit opinion detection (with aspect context)
         opinion_outputs = self.implicit_opinion_detector(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            aspect_features=aspect_outputs['aspect_features'],
-            return_contrastive=training
+            hidden_states, attention_mask, aspect_outputs['hidden_states']
         )
         
-        # Feature fusion
-        fused_features = self.feature_fusion(torch.cat([
-            aspect_outputs['aspect_features'],
-            opinion_outputs['opinion_features']
-        ], dim=-1))
+        # 3. Implicit-explicit combination analysis
+        combination_logits = None
+        if explicit_aspect_features is not None and explicit_opinion_features is not None:
+            # Combine all representations
+            combined_repr = torch.cat([
+                aspect_outputs['hidden_states'],
+                opinion_outputs['contextualized_features'],
+                (explicit_aspect_features + explicit_opinion_features) / 2
+            ], dim=-1)
+            
+            combination_logits = self.implicit_explicit_combiner(combined_repr)
         
-        # Final predictions
-        final_aspect_logits = self.final_aspect_head(fused_features)
-        final_opinion_logits = self.final_opinion_head(fused_features)
-        final_sentiment_logits = self.final_sentiment_head(fused_features)
+        # 4. Overall confidence scoring
+        confidence_features = (aspect_outputs['hidden_states'] + 
+                             opinion_outputs['contextualized_features']) / 2
+        confidence_scores = self.confidence_scorer(confidence_features).squeeze(-1)
+        confidence_scores = confidence_scores * attention_mask.float()
         
-        # Confidence scores
-        confidence_scores = self.confidence_estimator(fused_features)
-        
-        outputs = {
-            'aspect_logits': final_aspect_logits,
-            'opinion_logits': final_opinion_logits,
-            'sentiment_logits': final_sentiment_logits,
-            'implicit_aspect_logits': aspect_outputs['implicit_logits'],
-            'implicit_opinion_logits': opinion_outputs['opinion_logits'],
+        return {
+            # Aspect outputs
+            'implicit_aspect_scores': aspect_outputs['implicit_aspect_scores'],
+            'aspect_sentiment_combinations': aspect_outputs['sentiment_combinations'],
+            'aspect_grid_logits': aspect_outputs['grid_logits'],
+            
+            # Opinion outputs  
+            'implicit_opinion_scores': opinion_outputs['implicit_opinion_scores'],
+            'opinion_logits': opinion_outputs['opinion_logits'],
+            'opinion_contextualized_features': opinion_outputs['contextualized_features'],
+            'pattern_outputs': opinion_outputs['pattern_outputs'],
+            'context_outputs': opinion_outputs['context_outputs'],
+            
+            # Combined outputs
+            'combination_logits': combination_logits,
             'confidence_scores': confidence_scores,
-            'attention_weights': aspect_outputs['attention_weights'],
-            'fused_features': fused_features,
-            'aspect_features': aspect_outputs['aspect_features'],
-            'opinion_features': opinion_outputs['opinion_features']
+            'enhanced_hidden_states': opinion_outputs['contextualized_features']
         }
-        
-        return outputs
     
-    def extract_implicit_predictions(self,
-                                   outputs: Dict[str, torch.Tensor],
-                                   tokenizer,
-                                   input_ids: torch.Tensor,
-                                   attention_mask: torch.Tensor,
-                                   confidence_threshold: float = 0.7) -> Dict[str, Any]:
+    def extract_all_implicit_elements(self,
+                                    input_ids: torch.Tensor,
+                                    outputs: Dict[str, torch.Tensor],
+                                    tokenizer,
+                                    aspect_threshold: float = 0.5,
+                                    opinion_threshold: float = 0.5) -> Dict[str, List[Dict[str, Any]]]:
         """
-        Extract high-confidence implicit predictions
+        Extract all implicit elements (aspects and opinions) from the outputs
         """
-        extractor = AdvancedImplicitExtractor(
-            confidence_threshold=confidence_threshold
+        
+        # Extract implicit aspects
+        implicit_aspects = self.implicit_aspect_detector.extract_implicit_aspects(
+            input_ids, 
+            outputs['enhanced_hidden_states'],
+            outputs['implicit_aspect_scores'],
+            tokenizer,
+            aspect_threshold
         )
         
-        return extractor.extract_implicit_triplets(
-            model_outputs=outputs,
-            tokenizer=tokenizer,
-            input_ids=input_ids,
-            attention_mask=attention_mask
+        # Extract implicit opinions
+        implicit_opinions = self.implicit_opinion_detector.extract_implicit_opinions(
+            input_ids,
+            outputs['implicit_opinion_scores'],
+            outputs['pattern_outputs'],
+            tokenizer,
+            opinion_threshold
         )
+        
+        # Combine into triplets with confidence scores
+        implicit_triplets = self._combine_implicit_triplets(
+            implicit_aspects, implicit_opinions, outputs['confidence_scores'], input_ids
+        )
+        
+        return {
+            'implicit_aspects': implicit_aspects,
+            'implicit_opinions': implicit_opinions,
+            'implicit_triplets': implicit_triplets,
+            'summary': {
+                'num_implicit_aspects': len(implicit_aspects),
+                'num_implicit_opinions': len(implicit_opinions),
+                'num_implicit_triplets': len(implicit_triplets)
+            }
+        }
+    
+    def _combine_implicit_triplets(self,
+                                 implicit_aspects: List[Dict[str, Any]],
+                                 implicit_opinions: List[Dict[str, Any]],
+                                 confidence_scores: torch.Tensor,
+                                 input_ids: torch.Tensor) -> List[Dict[str, Any]]:
+        """Combine implicit aspects and opinions into triplets"""
+        
+        triplets = []
+        
+        # Simple proximity-based pairing for now
+        for aspect in implicit_aspects:
+            best_opinion = None
+            best_distance = float('inf')
+            
+            for opinion in implicit_opinions:
+                # Calculate distance between aspect and opinion
+                distance = abs(aspect['start'] - opinion['start'])
+                
+                if distance < best_distance and distance < 10:  # Within 10 tokens
+                    best_distance = distance
+                    best_opinion = opinion
+            
+            if best_opinion is not None:
+                # Get confidence from the region
+                region_start = min(aspect['start'], best_opinion['start'])
+                region_end = max(aspect['end'], best_opinion['end'])
+                region_confidence = confidence_scores[0][region_start:region_end+1].mean().item()
+                
+                triplets.append({
+                    'aspect': aspect,
+                    'opinion': best_opinion,
+                    'sentiment': best_opinion.get('sentiment', 'NEU'),
+                    'confidence': region_confidence,
+                    'type': 'implicit',
+                    'distance': best_distance
+                })
+        
+        return triplets

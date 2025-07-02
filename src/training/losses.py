@@ -1,15 +1,242 @@
-# src/training/losses.py - Enhanced version with contrastive learning
+# src/training/losses.py - Enhanced version with implicit detection integration
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .contrastive_losses import ITSCLLoss, ContrastiveVerificationModule, MultiLevelContrastiveLoss
+from typing import Dict, Any, Optional
 
-class ABSALoss(nn.Module):
-    """
-    Enhanced ABSA loss function with contrastive learning integration
+
+class FocalLossWithLS(nn.Module):
+    """Focal Loss with Label Smoothing for imbalanced classification"""
     
-    2024-2025 breakthrough: Combines traditional extraction losses with advanced
-    contrastive learning for unified extraction-generation training.
+    def __init__(self, gamma=2.0, alpha=None, label_smoothing=0.1, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+        
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none', label_smoothing=self.label_smoothing)
+        pt = torch.exp(-ce_loss)
+        
+        if self.alpha is not None:
+            if self.alpha.type() != inputs.data.type():
+                self.alpha = self.alpha.type_as(inputs.data)
+            at = self.alpha.gather(0, targets.data.view(-1))
+            ce_loss = ce_loss * at
+        
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+class ImplicitDetectionLoss(nn.Module):
+    """
+    Specialized loss for implicit detection following 2024-2025 breakthrough standards
+    Implements Grid Tagging Matching loss and sentiment combination vector loss
+    """
+    
+    def __init__(self, config):
+        super().__init__()
+        
+        # Loss weights for different implicit components
+        self.implicit_aspect_weight = getattr(config, 'implicit_aspect_weight', 1.0)
+        self.implicit_opinion_weight = getattr(config, 'implicit_opinion_weight', 1.0)
+        self.combination_weight = getattr(config, 'combination_weight', 0.5)
+        self.grid_tagging_weight = getattr(config, 'grid_tagging_weight', 0.8)
+        self.confidence_weight = getattr(config, 'confidence_weight', 0.3)
+        
+        # Loss functions
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
+        self.cross_entropy = nn.CrossEntropyLoss(reduction='none', label_smoothing=0.1)
+        self.mse_loss = nn.MSELoss(reduction='none')
+        
+        # Grid tagging matrix loss (for relationship modeling)
+        self.grid_loss = nn.CrossEntropyLoss(reduction='none')
+        
+    def forward(self, outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Compute implicit detection losses
+        
+        Args:
+            outputs: Model outputs containing implicit detection results
+            targets: Target labels for implicit elements
+            
+        Returns:
+            Dictionary of computed losses
+        """
+        device = next(iter(outputs.values())).device
+        losses = {}
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # 1. Implicit aspect detection loss
+        if 'implicit_aspect_scores' in outputs and 'implicit_aspect_labels' in targets:
+            implicit_aspect_loss = self._compute_implicit_aspect_loss(
+                outputs['implicit_aspect_scores'],
+                targets['implicit_aspect_labels']
+            )
+            losses['implicit_aspect_loss'] = implicit_aspect_loss
+            total_loss = total_loss + self.implicit_aspect_weight * implicit_aspect_loss
+        
+        # 2. Implicit opinion detection loss
+        if 'implicit_opinion_scores' in outputs and 'implicit_opinion_labels' in targets:
+            implicit_opinion_loss = self._compute_implicit_opinion_loss(
+                outputs['implicit_opinion_scores'],
+                targets['implicit_opinion_labels']
+            )
+            losses['implicit_opinion_loss'] = implicit_opinion_loss
+            total_loss = total_loss + self.implicit_opinion_weight * implicit_opinion_loss
+        
+        # 3. Sentiment combination vectors loss (EMNLP 2024 approach)
+        if 'aspect_sentiment_combinations' in outputs and 'sentiment_combination_labels' in targets:
+            combination_loss = self._compute_sentiment_combination_loss(
+                outputs['aspect_sentiment_combinations'],
+                targets['sentiment_combination_labels']
+            )
+            losses['sentiment_combination_loss'] = combination_loss
+            total_loss = total_loss + self.combination_weight * combination_loss
+        
+        # 4. Grid tagging matrix loss (GM-GTM approach)
+        if 'aspect_grid_logits' in outputs and 'grid_labels' in targets:
+            grid_loss = self._compute_grid_tagging_loss(
+                outputs['aspect_grid_logits'],
+                targets['grid_labels']
+            )
+            losses['grid_tagging_loss'] = grid_loss
+            total_loss = total_loss + self.grid_tagging_weight * grid_loss
+        
+        # 5. Implicit-explicit combination loss
+        if 'combination_logits' in outputs and 'combination_labels' in targets:
+            combination_class_loss = self._compute_combination_classification_loss(
+                outputs['combination_logits'],
+                targets['combination_labels']
+            )
+            losses['combination_classification_loss'] = combination_class_loss
+            total_loss = total_loss + self.combination_weight * combination_class_loss
+        
+        # 6. Confidence scoring loss
+        if 'confidence_scores' in outputs and 'confidence_labels' in targets:
+            confidence_loss = self._compute_confidence_loss(
+                outputs['confidence_scores'],
+                targets['confidence_labels']
+            )
+            losses['confidence_loss'] = confidence_loss
+            total_loss = total_loss + self.confidence_weight * confidence_loss
+        
+        losses['total_implicit_loss'] = total_loss
+        return losses
+    
+    def _compute_implicit_aspect_loss(self, scores: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Compute loss for implicit aspect detection"""
+        # Binary classification loss for implicit vs explicit aspects
+        valid_mask = labels != -100
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=scores.device, requires_grad=True)
+        
+        valid_scores = scores[valid_mask]
+        valid_labels = labels[valid_mask].float()
+        
+        loss = self.bce_loss(valid_scores, valid_labels)
+        return loss.mean()
+    
+    def _compute_implicit_opinion_loss(self, scores: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Compute loss for implicit opinion detection"""
+        valid_mask = labels != -100
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=scores.device, requires_grad=True)
+        
+        valid_scores = scores[valid_mask]
+        valid_labels = labels[valid_mask].float()
+        
+        loss = self.bce_loss(valid_scores, valid_labels)
+        return loss.mean()
+    
+    def _compute_sentiment_combination_loss(self, combinations: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        Compute loss for sentiment combination vectors (4 fully connected layers approach)
+        Following EMNLP 2024 breakthrough for implicit aspect detection
+        """
+        batch_size, seq_len, num_classes = combinations.shape
+        
+        # Reshape for loss computation
+        combinations_flat = combinations.view(-1, num_classes)
+        labels_flat = labels.view(-1)
+        
+        # Filter out padding tokens
+        valid_mask = labels_flat != -100
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=combinations.device, requires_grad=True)
+        
+        valid_combinations = combinations_flat[valid_mask]
+        valid_labels = labels_flat[valid_mask]
+        
+        loss = self.cross_entropy(valid_combinations, valid_labels)
+        return loss.mean()
+    
+    def _compute_grid_tagging_loss(self, grid_logits: torch.Tensor, grid_labels: torch.Tensor) -> torch.Tensor:
+        """
+        Compute Grid Tagging Matching (GM-GTM) loss for relationship modeling
+        Following the causality-compliant output template design
+        """
+        batch_size, seq_len, num_classes_1, num_classes_2 = grid_logits.shape
+        
+        # Reshape for loss computation
+        grid_logits_flat = grid_logits.view(-1, num_classes_1 * num_classes_2)
+        grid_labels_flat = grid_labels.view(-1)
+        
+        # Filter out padding
+        valid_mask = grid_labels_flat != -100
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=grid_logits.device, requires_grad=True)
+        
+        valid_logits = grid_logits_flat[valid_mask]
+        valid_labels = grid_labels_flat[valid_mask]
+        
+        loss = self.cross_entropy(valid_logits, valid_labels)
+        return loss.mean()
+    
+    def _compute_combination_classification_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Compute loss for implicit-explicit combination classification"""
+        batch_size, seq_len, num_classes = logits.shape
+        
+        logits_flat = logits.view(-1, num_classes)
+        labels_flat = labels.view(-1)
+        
+        valid_mask = labels_flat != -100
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        
+        valid_logits = logits_flat[valid_mask]
+        valid_labels = labels_flat[valid_mask]
+        
+        loss = self.cross_entropy(valid_logits, valid_labels)
+        return loss.mean()
+    
+    def _compute_confidence_loss(self, scores: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Compute loss for confidence scoring"""
+        valid_mask = labels != -100
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=scores.device, requires_grad=True)
+        
+        valid_scores = scores[valid_mask]
+        valid_labels = labels[valid_mask].float()
+        
+        loss = self.mse_loss(valid_scores, valid_labels)
+        return loss.mean()
+
+
+class EnhancedABSALoss(nn.Module):
+    """
+    Complete ABSA loss function with implicit detection and contrastive learning
+    
+    2024-2025 breakthrough: Integrates explicit extraction, implicit detection,
+    and instruction-following generation in a unified loss framework.
     """
     def __init__(self, config):
         super().__init__()
@@ -24,12 +251,15 @@ class ABSALoss(nn.Module):
         self.extraction_weight = getattr(config, 'extraction_weight', 1.0)
         self.generation_weight = getattr(config, 'generation_weight', 0.5)
         
-        # Contrastive learning weights (NEW 2024-2025)
+        # Implicit detection weights (NEW 2024-2025)
+        self.implicit_weight = getattr(config, 'implicit_weight', 0.8)
+        
+        # Contrastive learning weights
         self.contrastive_weight = getattr(config, 'contrastive_weight', 1.0)
         self.verification_weight = getattr(config, 'verification_weight', 0.3)
         self.multi_level_weight = getattr(config, 'multi_level_weight', 0.5)
         
-        # Label smoothing and focal loss parameters
+        # Loss function parameters
         self.label_smoothing = getattr(config, 'label_smoothing', 0.1)
         self.gamma = getattr(config, 'focal_gamma', 2.0)
         self.use_focal_loss = getattr(config, 'use_focal_loss', True)
@@ -41,6 +271,11 @@ class ABSALoss(nn.Module):
             self.verification_module = ContrastiveVerificationModule(config)
             self.multi_level_contrastive = MultiLevelContrastiveLoss(config)
         
+        # Initialize implicit detection loss
+        self.use_implicit_detection = getattr(config, 'use_implicit_detection', True)
+        if self.use_implicit_detection:
+            self.implicit_loss = ImplicitDetectionLoss(config)
+        
         # Class weights for imbalanced data
         aspect_weights = torch.tensor([0.1, 1.0, 0.8])  # O, B, I
         opinion_weights = torch.tensor([0.1, 1.0, 0.8])
@@ -49,458 +284,498 @@ class ABSALoss(nn.Module):
             self.span_criterion = FocalLossWithLS(
                 gamma=self.gamma,
                 alpha=aspect_weights,
-                ignore_index=-100,
                 label_smoothing=self.label_smoothing
             )
             self.opinion_criterion = FocalLossWithLS(
                 gamma=self.gamma,
                 alpha=opinion_weights,
-                ignore_index=-100,
                 label_smoothing=self.label_smoothing
             )
         else:
             self.span_criterion = nn.CrossEntropyLoss(
                 weight=aspect_weights,
-                ignore_index=-100,
-                label_smoothing=self.label_smoothing
+                label_smoothing=self.label_smoothing,
+                ignore_index=-100
             )
             self.opinion_criterion = nn.CrossEntropyLoss(
                 weight=opinion_weights,
-                ignore_index=-100,
-                label_smoothing=self.label_smoothing
+                label_smoothing=self.label_smoothing,
+                ignore_index=-100
             )
         
+        # Sentiment loss
         self.sentiment_criterion = nn.CrossEntropyLoss(
-            ignore_index=-100,
-            label_smoothing=self.label_smoothing
+            label_smoothing=self.label_smoothing,
+            ignore_index=-100
         )
         
-    def forward(self, outputs, targets, generation_embeddings=None):
+        # Boundary loss for better span detection
+        self.boundary_criterion = nn.BCEWithLogitsLoss()
+        
+    def forward(self, outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], 
+                generation_embeddings: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
-        Enhanced forward pass with contrastive learning integration
+        Compute complete ABSA loss with implicit detection integration
+        
+        Args:
+            outputs: Model outputs
+            targets: Target labels
+            generation_embeddings: Optional embeddings for contrastive learning
+            
+        Returns:
+            Dictionary of computed losses
         """
-        try:
-            device = outputs['aspect_logits'].device
-            
-            # ============================================================================
-            # TRADITIONAL EXTRACTION LOSSES
-            # ============================================================================
-            
-            # Extract predictions and targets
-            aspect_logits = outputs.get('aspect_logits')
-            opinion_logits = outputs.get('opinion_logits')
-            sentiment_logits = outputs.get('sentiment_logits')
-            
-            aspect_labels = targets.get('aspect_labels')
-            opinion_labels = targets.get('opinion_labels')
-            sentiment_labels = targets.get('sentiment_labels')
-            
-            # Validate inputs
-            if any(x is None for x in [aspect_logits, opinion_logits, sentiment_logits]):
-                raise ValueError("Missing required logits in outputs")
-            if any(x is None for x in [aspect_labels, opinion_labels, sentiment_labels]):
-                raise ValueError("Missing required labels in targets")
-            
-            # Compute traditional losses
-            aspect_loss = self._compute_span_loss(aspect_logits, aspect_labels, self.span_criterion, "aspect")
-            opinion_loss = self._compute_span_loss(opinion_logits, opinion_labels, self.opinion_criterion, "opinion")
-            sentiment_loss = self._compute_sentiment_loss(sentiment_logits, sentiment_labels)
-            
-            # Boundary loss if available
-            boundary_loss = torch.tensor(0.0, device=device, requires_grad=True)
-            if 'boundary_logits' in outputs and self.boundary_weight > 0:
-                boundary_loss = self._compute_boundary_loss(
-                    outputs['boundary_logits'], aspect_labels, opinion_labels
-                )
-            
-            # Generation loss if available
-            generation_loss = torch.tensor(0.0, device=device, requires_grad=True)
-            if 'generation_loss' in outputs:
-                generation_loss = outputs['generation_loss']
-            
-            # ============================================================================
-            # CONTRASTIVE LEARNING LOSSES (2024-2025 BREAKTHROUGH)
-            # ============================================================================
-            
-            contrastive_total = torch.tensor(0.0, device=device, requires_grad=True)
-            contrastive_components = {}
-            
-            if self.use_contrastive:
-                # 1. ITSCL Loss (InfoNCE + NT-Xent + Cross-Modal)
-                try:
-                    itscl_results = self.itscl_loss(outputs, targets, generation_embeddings)
-                    contrastive_components.update(itscl_results)
-                    contrastive_total = contrastive_total + itscl_results.get('contrastive_loss', 0)
-                except Exception as e:
-                    print(f"Warning: ITSCL loss computation failed: {e}")
-                    contrastive_components['contrastive_loss'] = torch.tensor(0.0, device=device)
-                
-                # 2. Multi-Level Contrastive Loss
-                try:
-                    if 'span_features' in outputs or 'hidden_states' in outputs:
-                        span_features = outputs.get('span_features', outputs.get('hidden_states'))
-                        
-                        # Extract embeddings for contrastive learning
-                        aspect_embeddings = self._extract_embeddings_for_contrastive(
-                            span_features, aspect_logits, aspect_labels
-                        )
-                        opinion_embeddings = self._extract_embeddings_for_contrastive(
-                            span_features, opinion_logits, opinion_labels
-                        )
-                        sentiment_embeddings = self._extract_sentiment_embeddings(
-                            span_features, sentiment_logits
-                        )
-                        
-                        # Compute multi-level contrastive loss
-                        multi_level_results = self.multi_level_contrastive(
-                            aspect_embeddings, opinion_embeddings, sentiment_embeddings,
-                            self._flatten_labels(aspect_labels),
-                            self._flatten_labels(opinion_labels),
-                            self._flatten_labels(sentiment_labels)
-                        )
-                        
-                        contrastive_components.update({
-                            f"ml_{k}": v for k, v in multi_level_results.items()
-                        })
-                        contrastive_total = contrastive_total + multi_level_results.get('multi_level_contrastive_loss', 0)
-                        
-                except Exception as e:
-                    print(f"Warning: Multi-level contrastive loss computation failed: {e}")
-                
-                # 3. Contrastive Verification (if generation embeddings available)
-                try:
-                    if generation_embeddings is not None and 'span_features' in outputs:
-                        span_features = outputs['span_features']
-                        batch_size = span_features.size(0)
-                        
-                        # Create triplet embeddings
-                        triplet_embeddings = self._create_triplet_embeddings(
-                            span_features, aspect_logits, opinion_logits, sentiment_logits
-                        )
-                        
-                        # Ensure generation_embeddings has correct batch dimension
-                        if generation_embeddings.size(0) != batch_size:
-                            # Repeat or truncate to match batch size
-                            if generation_embeddings.size(0) == 1:
-                                generation_embeddings = generation_embeddings.repeat(batch_size, 1)
-                            else:
-                                generation_embeddings = generation_embeddings[:batch_size]
-                        
-                        verification_results = self.verification_module(
-                            triplet_embeddings, generation_embeddings
-                        )
-                        
-                        contrastive_components.update({
-                            f"verify_{k}": v for k, v in verification_results.items()
-                        })
-                        contrastive_total = contrastive_total + verification_results.get('verification_loss', 0)
-                        
-                except Exception as e:
-                    print(f"Warning: Contrastive verification computation failed: {e}")
-            
-            # ============================================================================
-            # TOTAL LOSS COMBINATION
-            # ============================================================================
-            
-            # Traditional extraction loss
-            extraction_total = (
-                self.aspect_weight * aspect_loss +
-                self.opinion_weight * opinion_loss +
-                self.sentiment_weight * sentiment_loss +
-                self.boundary_weight * boundary_loss
+        device = next(iter(outputs.values())).device
+        
+        # Validate inputs
+        required_outputs = ['aspect_logits', 'opinion_logits', 'sentiment_logits']
+        required_targets = ['aspect_labels', 'opinion_labels', 'sentiment_labels']
+        
+        for key in required_outputs:
+            if key not in outputs or outputs[key] is None:
+                raise ValueError(f"Missing required output: {key}")
+        
+        for key in required_targets:
+            if key not in targets or targets[key] is None:
+                raise ValueError(f"Missing required target: {key}")
+        
+        losses = {}
+        
+        # ============================================================================
+        # EXPLICIT DETECTION LOSSES (Traditional ABSA)
+        # ============================================================================
+        
+        # Extract components
+        aspect_logits = outputs['aspect_logits']
+        opinion_logits = outputs['opinion_logits']
+        sentiment_logits = outputs['sentiment_logits']
+        
+        aspect_labels = targets['aspect_labels']
+        opinion_labels = targets['opinion_labels']
+        sentiment_labels = targets['sentiment_labels']
+        
+        # Compute traditional losses
+        aspect_loss = self._compute_span_loss(aspect_logits, aspect_labels, self.span_criterion, "aspect")
+        opinion_loss = self._compute_span_loss(opinion_logits, opinion_labels, self.opinion_criterion, "opinion")
+        sentiment_loss = self._compute_sentiment_loss(sentiment_logits, sentiment_labels)
+        
+        losses.update({
+            'aspect_loss': aspect_loss,
+            'opinion_loss': opinion_loss,
+            'sentiment_loss': sentiment_loss
+        })
+        
+        # Boundary loss if available
+        boundary_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        if 'boundary_logits' in outputs and self.boundary_weight > 0:
+            boundary_loss = self._compute_boundary_loss(
+                outputs['boundary_logits'], aspect_labels, opinion_labels
             )
+            losses['boundary_loss'] = boundary_loss
+        
+        # Generation loss if available
+        generation_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        if 'generation_loss' in outputs:
+            generation_loss = outputs['generation_loss']
+            losses['generation_loss'] = generation_loss
+        
+        # ============================================================================
+        # IMPLICIT DETECTION LOSSES (2024-2025 BREAKTHROUGH)
+        # ============================================================================
+        
+        implicit_loss_total = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        if self.use_implicit_detection and self.implicit_loss is not None:
+            try:
+                implicit_losses = self.implicit_loss(outputs, targets)
+                losses.update(implicit_losses)
+                implicit_loss_total = implicit_losses.get('total_implicit_loss', torch.tensor(0.0, device=device))
+            except Exception as e:
+                print(f"Warning: Implicit detection loss computation failed: {e}")
+                losses['total_implicit_loss'] = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # ============================================================================
+        # CONTRASTIVE LEARNING LOSSES (2024-2025 BREAKTHROUGH)
+        # ============================================================================
+        
+        contrastive_total = torch.tensor(0.0, device=device, requires_grad=True)
+        contrastive_components = {}
+        
+        if self.use_contrastive:
+            # 1. ITSCL Loss (InfoNCE + NT-Xent + Cross-Modal)
+            try:
+                itscl_results = self.itscl_loss(outputs, targets, generation_embeddings)
+                contrastive_components.update(itscl_results)
+                contrastive_total = contrastive_total + itscl_results.get('contrastive_loss', 0)
+            except Exception as e:
+                print(f"Warning: ITSCL loss computation failed: {e}")
+                contrastive_components['contrastive_loss'] = torch.tensor(0.0, device=device)
             
-            # Total unified loss
-            total_loss = (
-                self.extraction_weight * extraction_total +
-                self.generation_weight * generation_loss +
-                self.contrastive_weight * contrastive_total
-            )
+            # 2. Multi-Level Contrastive Loss
+            try:
+                if 'span_features' in outputs or 'hidden_states' in outputs:
+                    span_features = outputs.get('span_features', outputs.get('hidden_states'))
+                    
+                    # Extract embeddings for contrastive learning
+                    aspect_embeddings = self._extract_embeddings_for_contrastive(
+                        span_features, aspect_logits, aspect_labels
+                    )
+                    opinion_embeddings = self._extract_embeddings_for_contrastive(
+                        span_features, opinion_logits, opinion_labels
+                    )
+                    sentiment_embeddings = self._extract_sentiment_embeddings(
+                        span_features, sentiment_logits
+                    )
+                    
+                    # Compute multi-level contrastive loss
+                    multi_level_results = self.multi_level_contrastive(
+                        aspect_embeddings, opinion_embeddings, sentiment_embeddings,
+                        self._flatten_labels(aspect_labels),
+                        self._flatten_labels(opinion_labels),
+                        self._flatten_labels(sentiment_labels)
+                    )
+                    
+                    contrastive_components.update({
+                        f"ml_{k}": v for k, v in multi_level_results.items()
+                    })
+                    contrastive_total = contrastive_total + multi_level_results.get('multi_level_contrastive_loss', 0)
+                    
+            except Exception as e:
+                print(f"Warning: Multi-level contrastive loss computation failed: {e}")
             
-            # Ensure total_loss requires gradients
-            if not total_loss.requires_grad:
-                dummy_term = (aspect_logits.sum() + opinion_logits.sum() + sentiment_logits.sum()) * 1e-8
-                total_loss = total_loss + dummy_term
-            
-            # Return comprehensive loss dictionary
-            loss_dict = {
-                'loss': total_loss,
-                'aspect_loss': aspect_loss.detach().item() if isinstance(aspect_loss, torch.Tensor) else aspect_loss,
-                'opinion_loss': opinion_loss.detach().item() if isinstance(opinion_loss, torch.Tensor) else opinion_loss,
-                'sentiment_loss': sentiment_loss.detach().item() if isinstance(sentiment_loss, torch.Tensor) else sentiment_loss,
-                'boundary_loss': boundary_loss.detach().item() if isinstance(boundary_loss, torch.Tensor) else boundary_loss,
-                'generation_loss': generation_loss.detach().item() if isinstance(generation_loss, torch.Tensor) else generation_loss,
-                'extraction_loss': extraction_total.detach().item() if isinstance(extraction_total, torch.Tensor) else extraction_total,
-                'contrastive_total': contrastive_total.detach().item() if isinstance(contrastive_total, torch.Tensor) else contrastive_total,
-            }
-            
-            # Add contrastive component losses
-            for k, v in contrastive_components.items():
-                if isinstance(v, torch.Tensor):
-                    loss_dict[k] = v.detach().item()
-                else:
-                    loss_dict[k] = v
-            
-            return loss_dict
-            
-        except Exception as e:
-            print(f"Error in enhanced loss calculation: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Return minimal differentiable loss
-            device = outputs['aspect_logits'].device
-            dummy_loss = (
-                outputs['aspect_logits'].sum() * 1e-6 +
-                outputs['opinion_logits'].sum() * 1e-6 +
-                outputs['sentiment_logits'].sum() * 1e-6
-            )
-            
-            return {
-                'loss': dummy_loss,
-                'aspect_loss': 0.0,
-                'opinion_loss': 0.0,
-                'sentiment_loss': 0.0,
-                'boundary_loss': 0.0,
-                'generation_loss': 0.0,
-                'extraction_loss': 0.0,
-                'contrastive_total': 0.0,
-            }
+            # 3. Verification Loss
+            try:
+                verification_results = self.verification_module(outputs, targets)
+                contrastive_components.update({
+                    f"verify_{k}": v for k, v in verification_results.items()
+                })
+                contrastive_total = contrastive_total + verification_results.get('verification_loss', 0)
+            except Exception as e:
+                print(f"Warning: Verification loss computation failed: {e}")
+        
+        losses.update(contrastive_components)
+        
+        # ============================================================================
+        # COMPUTE FINAL WEIGHTED LOSS
+        # ============================================================================
+        
+        # Traditional extraction losses
+        extraction_loss = (
+            self.aspect_weight * aspect_loss +
+            self.opinion_weight * opinion_loss +
+            self.sentiment_weight * sentiment_loss +
+            self.boundary_weight * boundary_loss
+        )
+        
+        # Total loss combining all components
+        total_loss = (
+            self.extraction_weight * extraction_loss +
+            self.generation_weight * generation_loss +
+            self.implicit_weight * implicit_loss_total +
+            self.contrastive_weight * contrastive_total
+        )
+        
+        losses.update({
+            'extraction_loss': extraction_loss,
+            'total_contrastive_loss': contrastive_total,
+            'total_loss': total_loss
+        })
+        
+        return losses
     
-    def _compute_span_loss(self, logits, labels, criterion, loss_name):
-        """Compute loss for span detection with robust handling"""
+    def _compute_span_loss(self, logits: torch.Tensor, labels: torch.Tensor, 
+                          criterion, span_type: str) -> torch.Tensor:
+        """Compute span detection loss with proper masking"""
         try:
-            # Handle multi-span case
-            if len(labels.shape) == 3:  # [batch_size, num_spans, seq_len]
-                batch_size, num_spans, seq_len = labels.shape
-                if num_spans == 1:
-                    labels = labels.squeeze(1)
-                else:
-                    labels = labels.max(dim=1)[0]
-            
-            labels = labels.long()
-            
-            # Validate shapes
             batch_size, seq_len, num_classes = logits.shape
-            if labels.shape != (batch_size, seq_len):
-                if labels.numel() == batch_size * seq_len:
-                    labels = labels.view(batch_size, seq_len)
-                else:
-                    labels = torch.zeros(batch_size, seq_len, dtype=torch.long, device=logits.device)
             
-            # Compute loss
-            loss = criterion(
-                logits.view(-1, num_classes),
-                labels.view(-1)
-            )
+            # Reshape for loss computation
+            logits_flat = logits.view(-1, num_classes)
+            labels_flat = labels.view(-1)
+            
+            # Filter out padding tokens
+            valid_mask = labels_flat != -100
+            
+            if not valid_mask.any():
+                return torch.tensor(0.0, device=logits.device, requires_grad=True)
+            
+            valid_logits = logits_flat[valid_mask]
+            valid_labels = labels_flat[valid_mask]
+            
+            loss = criterion(valid_logits, valid_labels)
             
             return loss
             
         except Exception as e:
-            print(f"Error computing {loss_name} loss: {e}")
-            return logits.sum() * 1e-8
+            print(f"Error computing {span_type} loss: {e}")
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
     
-    def _compute_sentiment_loss(self, logits, labels):
-        """Compute sentiment classification loss with robust handling"""
+    def _compute_sentiment_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Compute sentiment classification loss"""
         try:
-            if len(labels.shape) > 1:
-                labels = labels[:, 0] if labels.shape[1] > 0 else labels.squeeze()
+            batch_size, seq_len, num_classes = logits.shape
             
-            labels = labels.long()
+            logits_flat = logits.view(-1, num_classes)
+            labels_flat = labels.view(-1)
             
-            if logits.shape[0] != labels.shape[0]:
-                min_batch = min(logits.shape[0], labels.shape[0])
-                logits = logits[:min_batch]
-                labels = labels[:min_batch]
+            valid_mask = labels_flat != -100
             
-            loss = self.sentiment_criterion(logits, labels)
+            if not valid_mask.any():
+                return torch.tensor(0.0, device=logits.device, requires_grad=True)
+            
+            valid_logits = logits_flat[valid_mask]
+            valid_labels = labels_flat[valid_mask]
+            
+            loss = self.sentiment_criterion(valid_logits, valid_labels)
+            
             return loss
             
         except Exception as e:
             print(f"Error computing sentiment loss: {e}")
-            return logits.sum() * 1e-8
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
     
-    def _compute_boundary_loss(self, boundary_logits, aspect_labels, opinion_labels):
-        """Compute boundary refinement loss"""
+    def _compute_boundary_loss(self, boundary_logits: torch.Tensor, 
+                             aspect_labels: torch.Tensor, opinion_labels: torch.Tensor) -> torch.Tensor:
+        """Compute boundary detection loss"""
         try:
-            batch_size, seq_len, _ = boundary_logits.shape
-            device = boundary_logits.device
+            # Create boundary targets from span labels
+            boundary_targets = self._create_boundary_targets(aspect_labels, opinion_labels)
             
-            boundary_targets = torch.zeros(batch_size, seq_len, 2, device=device)
+            # Compute BCE loss
+            loss = self.boundary_criterion(boundary_logits.squeeze(-1), boundary_targets.float())
             
-            # Handle multi-span labels
-            if len(aspect_labels.shape) == 3:
-                aspect_labels = aspect_labels.max(dim=1)[0]
-            if len(opinion_labels.shape) == 3:
-                opinion_labels = opinion_labels.max(dim=1)[0]
-            
-            # Mark boundaries
-            for b in range(batch_size):
-                for s in range(seq_len):
-                    # Start boundary (B tags)
-                    if (s < aspect_labels.shape[1] and aspect_labels[b, s] == 1) or \
-                       (s < opinion_labels.shape[1] and opinion_labels[b, s] == 1):
-                        boundary_targets[b, s, 0] = 1.0
-                    
-                    # End boundary
-                    if s > 0 and s < min(aspect_labels.shape[1], opinion_labels.shape[1]):
-                        aspect_end = (aspect_labels[b, s-1] > 0 and aspect_labels[b, s] == 0)
-                        opinion_end = (opinion_labels[b, s-1] > 0 and opinion_labels[b, s] == 0)
-                        if aspect_end or opinion_end:
-                            boundary_targets[b, s-1, 1] = 1.0
-            
-            loss = F.binary_cross_entropy_with_logits(boundary_logits, boundary_targets)
-            return loss
+            return loss.mean()
             
         except Exception as e:
             print(f"Error computing boundary loss: {e}")
-            return boundary_logits.sum() * 1e-8
+            return torch.tensor(0.0, device=boundary_logits.device, requires_grad=True)
     
-    def _extract_embeddings_for_contrastive(self, span_features, logits, labels):
-        """Extract embeddings for contrastive learning using attention pooling"""
+    def _create_boundary_targets(self, aspect_labels: torch.Tensor, opinion_labels: torch.Tensor) -> torch.Tensor:
+        """Create boundary targets from span labels"""
+        batch_size, seq_len = aspect_labels.shape
+        boundary_targets = torch.zeros_like(aspect_labels, dtype=torch.float)
+        
+        for i in range(batch_size):
+            for j in range(seq_len):
+                # Mark boundaries where tags change from O to B or I to O
+                if j > 0:
+                    # Aspect boundaries
+                    if (aspect_labels[i, j-1] == 0 and aspect_labels[i, j] == 1) or \
+                       (aspect_labels[i, j-1] in [1, 2] and aspect_labels[i, j] == 0):
+                        boundary_targets[i, j] = 1
+                    
+                    # Opinion boundaries
+                    if (opinion_labels[i, j-1] == 0 and opinion_labels[i, j] == 1) or \
+                       (opinion_labels[i, j-1] in [1, 2] and opinion_labels[i, j] == 0):
+                        boundary_targets[i, j] = 1
+        
+        return boundary_targets
+    
+    def _extract_embeddings_for_contrastive(self, features: torch.Tensor, 
+                                           logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Extract embeddings for contrastive learning"""
         try:
-            batch_size, seq_len, hidden_size = span_features.shape
+            # Get predictions
+            preds = torch.argmax(logits, dim=-1)
             
-            # Get attention weights from B+I tags
-            attention_weights = F.softmax(logits[:, :, 1:].sum(dim=-1), dim=-1)
+            # Find entity positions (B and I tags)
+            entity_mask = (preds > 0) | (labels > 0)
             
-            # Weighted pooling
-            embeddings = torch.sum(span_features * attention_weights.unsqueeze(-1), dim=1)
+            # Extract entity features
+            batch_size, seq_len, hidden_size = features.shape
+            entity_features = []
             
-            return embeddings
+            for i in range(batch_size):
+                sample_mask = entity_mask[i]
+                if sample_mask.any():
+                    sample_features = features[i][sample_mask]
+                    # Average pool entity features
+                    pooled_features = sample_features.mean(dim=0)
+                    entity_features.append(pooled_features)
+                else:
+                    # Use global average if no entities found
+                    entity_features.append(features[i].mean(dim=0))
             
+            if entity_features:
+                return torch.stack(entity_features)
+            else:
+                return features.mean(dim=1)  # Fallback to global pooling
+                
         except Exception as e:
             print(f"Error extracting embeddings for contrastive learning: {e}")
-            # Return mean pooled embeddings as fallback
-            return span_features.mean(dim=1)
+            return features.mean(dim=1)
     
-    def _extract_sentiment_embeddings(self, span_features, sentiment_logits):
-        """Extract sentiment embeddings using global pooling"""
+    def _extract_sentiment_embeddings(self, features: torch.Tensor, sentiment_logits: torch.Tensor) -> torch.Tensor:
+        """Extract sentiment-aware embeddings"""
         try:
-            # Global average pooling for sentiment representation
-            sentiment_embeddings = span_features.mean(dim=1)
-            return sentiment_embeddings
+            # Use sentiment probabilities to weight features
+            sentiment_probs = F.softmax(sentiment_logits, dim=-1)
+            
+            # Weight features by sentiment confidence
+            sentiment_weights = sentiment_probs.max(dim=-1, keepdim=True)[0]
+            weighted_features = features * sentiment_weights
+            
+            # Global average pooling
+            pooled_features = weighted_features.mean(dim=1)
+            
+            return pooled_features
             
         except Exception as e:
             print(f"Error extracting sentiment embeddings: {e}")
-            return span_features.mean(dim=1)
+            return features.mean(dim=1)
     
-    def _flatten_labels(self, labels):
-        """Flatten multi-dimensional labels for contrastive learning"""
-        try:
-            if len(labels.shape) == 3:
-                # Convert multi-span labels to single labels by taking max
-                labels = labels.max(dim=1)[0]
-            
-            if len(labels.shape) == 2:
-                # Convert sequence labels to single label by taking mode
-                labels = torch.mode(labels, dim=1)[0]
-            
-            return labels.long()
-            
-        except Exception as e:
-            print(f"Error flattening labels: {e}")
-            batch_size = labels.size(0)
-            return torch.zeros(batch_size, dtype=torch.long, device=labels.device)
-    
-    def _create_triplet_embeddings(self, span_features, aspect_logits, opinion_logits, sentiment_logits):
-        """Create triplet embeddings for verification"""
-        try:
-            batch_size = span_features.size(0)
-            
-            # Extract aspect and opinion embeddings
-            aspect_embeddings = self._extract_embeddings_for_contrastive(
-                span_features, aspect_logits, None
-            )
-            opinion_embeddings = self._extract_embeddings_for_contrastive(
-                span_features, opinion_logits, None
-            )
-            
-            # Get sentiment embeddings
-            sentiment_embeddings = sentiment_logits.mean(dim=1) if len(sentiment_logits.shape) > 1 else sentiment_logits
-            
-            # Expand sentiment to match hidden size
-            if sentiment_embeddings.size(-1) != span_features.size(-1):
-                hidden_size = span_features.size(-1)
-                sentiment_expanded = sentiment_embeddings.unsqueeze(-1).expand(-1, hidden_size)
-            else:
-                sentiment_expanded = sentiment_embeddings
-            
-            # Concatenate all embeddings
-            triplet_embeddings = torch.cat([
-                aspect_embeddings,
-                opinion_embeddings,
-                sentiment_expanded
-            ], dim=-1)
-            
-            return triplet_embeddings
-            
-        except Exception as e:
-            print(f"Error creating triplet embeddings: {e}")
-            # Return concatenated mean pooled features
-            hidden_size = span_features.size(-1)
-            return torch.cat([
-                span_features.mean(dim=1),
-                span_features.mean(dim=1),
-                span_features.mean(dim=1)
-            ], dim=-1)
+    def _flatten_labels(self, labels: torch.Tensor) -> torch.Tensor:
+        """Flatten labels for contrastive learning"""
+        return labels.view(-1)
 
 
-class FocalLossWithLS(nn.Module):
-    """Focal loss with label smoothing for handling class imbalance"""
+# Additional helper functions for loss computation
+def compute_boundary_targets(aspect_labels: torch.Tensor, opinion_labels: torch.Tensor) -> torch.Tensor:
+    """Create boundary targets from aspect and opinion labels"""
+    batch_size, seq_len = aspect_labels.shape
+    boundary_targets = torch.zeros_like(aspect_labels, dtype=torch.float)
     
-    def __init__(self, gamma=2.0, alpha=None, ignore_index=-100, label_smoothing=0.1):
-        super().__init__()
-        self.gamma = gamma
-        self.ignore_index = ignore_index
-        self.label_smoothing = label_smoothing
+    for i in range(batch_size):
+        for j in range(seq_len):
+            if j > 0:
+                # Aspect boundaries
+                if (aspect_labels[i, j-1] == 0 and aspect_labels[i, j] == 1) or \
+                   (aspect_labels[i, j-1] in [1, 2] and aspect_labels[i, j] == 0):
+                    boundary_targets[i, j] = 1
+                
+                # Opinion boundaries  
+                if (opinion_labels[i, j-1] == 0 and opinion_labels[i, j] == 1) or \
+                   (opinion_labels[i, j-1] in [1, 2] and opinion_labels[i, j] == 0):
+                    boundary_targets[i, j] = 1
+    
+    return boundary_targets
+
+
+def compute_weighted_loss(losses: Dict[str, torch.Tensor], weights: Dict[str, float]) -> torch.Tensor:
+    """Compute weighted combination of multiple losses"""
+    total_loss = torch.tensor(0.0, requires_grad=True)
+    device = next(iter(losses.values())).device
+    total_loss = total_loss.to(device)
+    
+    for loss_name, loss_value in losses.items():
+        if loss_name in weights and torch.is_tensor(loss_value):
+            weight = weights[loss_name]
+            total_loss = total_loss + weight * loss_value
+    
+    return total_loss
+
+
+def create_loss_scheduler(config):
+    """Create loss weight scheduler for curriculum learning"""
+    
+    class LossScheduler:
+        def __init__(self, config):
+            self.config = config
+            self.step = 0
+            
+            # Initial weights
+            self.initial_weights = {
+                'extraction_weight': getattr(config, 'extraction_weight', 1.0),
+                'implicit_weight': getattr(config, 'implicit_weight', 0.1),  # Start low
+                'contrastive_weight': getattr(config, 'contrastive_weight', 0.1),  # Start low
+                'generation_weight': getattr(config, 'generation_weight', 0.5)
+            }
+            
+            # Final weights
+            self.final_weights = {
+                'extraction_weight': getattr(config, 'extraction_weight', 1.0),
+                'implicit_weight': getattr(config, 'implicit_weight', 0.8),  # Increase
+                'contrastive_weight': getattr(config, 'contrastive_weight', 1.0),  # Increase
+                'generation_weight': getattr(config, 'generation_weight', 0.5)
+            }
+            
+            # Warmup steps
+            self.warmup_steps = getattr(config, 'loss_warmup_steps', 1000)
         
-        if alpha is not None:
-            if isinstance(alpha, torch.Tensor):
-                self.alpha = alpha.float()
+        def get_current_weights(self):
+            """Get current loss weights based on training progress"""
+            if self.step < self.warmup_steps:
+                # Linear interpolation during warmup
+                progress = self.step / self.warmup_steps
+                current_weights = {}
+                
+                for key in self.initial_weights:
+                    initial = self.initial_weights[key]
+                    final = self.final_weights[key]
+                    current_weights[key] = initial + progress * (final - initial)
+                
+                return current_weights
             else:
-                self.alpha = torch.tensor(alpha, dtype=torch.float)
-        else:
-            self.alpha = None
+                return self.final_weights
+        
+        def step_update(self):
+            """Update step counter"""
+            self.step += 1
+        
+        def reset(self):
+            """Reset step counter"""
+            self.step = 0
     
-    def forward(self, logits, targets):
-        """Compute focal loss with label smoothing"""
-        try:
-            targets = targets.long()
-            
-            # Compute cross-entropy
-            ce_loss = F.cross_entropy(logits, targets, ignore_index=self.ignore_index, reduction='none')
-            
-            # Compute probabilities
-            pt = torch.exp(-ce_loss)
-            
-            # Apply focal weight
-            focal_weight = (1 - pt) ** self.gamma
-            focal_loss = focal_weight * ce_loss
-            
-            # Apply alpha weighting if provided
-            if self.alpha is not None:
-                alpha = self.alpha.to(logits.device)
-                alpha_weights = torch.ones_like(targets, dtype=torch.float, device=logits.device)
-                valid_mask = targets != self.ignore_index
-                valid_targets = targets[valid_mask]
-                
-                if len(valid_targets) > 0:
-                    valid_targets_clamped = torch.clamp(valid_targets, 0, len(alpha) - 1)
-                    alpha_weights[valid_mask] = alpha[valid_targets_clamped]
-                
-                focal_loss = focal_loss * alpha_weights
-            
-            # Apply mask for ignored indices
-            mask = (targets != self.ignore_index).float()
-            focal_loss = focal_loss * mask
-            
-            # Compute mean loss
-            if mask.sum() > 0:
-                return focal_loss.sum() / mask.sum()
-            else:
-                return focal_loss.sum()
-            
-        except Exception as e:
-            print(f"Error in focal loss computation: {e}")
-            return F.cross_entropy(logits, targets, ignore_index=self.ignore_index)
+    return LossScheduler(config)
+
+
+# Loss utilities for evaluation and debugging
+def analyze_loss_components(loss_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    """Analyze loss components for debugging"""
+    analysis = {}
+    
+    for loss_name, loss_value in loss_dict.items():
+        if torch.is_tensor(loss_value):
+            analysis[loss_name] = {
+                'value': loss_value.item(),
+                'requires_grad': loss_value.requires_grad,
+                'is_finite': torch.isfinite(loss_value).all().item(),
+                'magnitude': 'high' if loss_value.item() > 1.0 else 'normal' if loss_value.item() > 0.1 else 'low'
+            }
+    
+    return analysis
+
+
+def clip_loss_gradients(model: torch.nn.Module, max_norm: float = 1.0) -> float:
+    """Clip gradients of loss-related parameters"""
+    loss_params = []
+    
+    for name, param in model.named_parameters():
+        if param.requires_grad and any(loss_term in name for loss_term in 
+                                     ['loss', 'criterion', 'contrastive', 'implicit']):
+            loss_params.append(param)
+    
+    if loss_params:
+        return torch.nn.utils.clip_grad_norm_(loss_params, max_norm)
+    else:
+        return 0.0
+
+
+def get_loss_statistics(loss_history: List[Dict[str, float]], window_size: int = 100) -> Dict[str, Dict[str, float]]:
+    """Get statistics for loss history"""
+    if not loss_history:
+        return {}
+    
+    # Get recent window
+    recent_losses = loss_history[-window_size:] if len(loss_history) > window_size else loss_history
+    
+    # Collect all loss names
+    all_loss_names = set()
+    for loss_dict in recent_losses:
+        all_loss_names.update(loss_dict.keys())
+    
+    statistics = {}
+    
+    for loss_name in all_loss_names:
+        values = [loss_dict.get(loss_name, 0.0) for loss_dict in recent_losses if loss_name in loss_dict]
+        
+        if values:
+            statistics[loss_name] = {
+                'mean': np.mean(values),
+                'std': np.std(values),
+                'min': np.min(values),
+                'max': np.max(values),
+                'trend': 'decreasing' if len(values) > 10 and np.polyfit(range(len(values)), values, 1)[0] < 0 else 'stable'
+            }
+    
+    return statistics
