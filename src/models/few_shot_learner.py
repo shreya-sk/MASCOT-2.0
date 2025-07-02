@@ -1,889 +1,936 @@
 # src/models/few_shot_learner.py
+"""
+Complete Few-Shot Learning Implementation for ABSA
+2024-2025 Breakthrough: Meta-learning, Domain Adaptation, and Cross-Domain Transfer
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from typing import List, Dict, Tuple, Optional
+import numpy as np
+from collections import defaultdict
 
 class DualRelationsPropagation(nn.Module):
     """
-    Dual Relations Propagation (DRP) for metric-free few-shot ABSA
+    Dual Relations Propagation (DRP) Network
     
-    2024-2025 breakthrough: Models both similarity and diversity in aspect embeddings
-    for effective few-shot learning without explicit distance metrics.
+    2024-2025 breakthrough: Metric-free approach for few-shot ABSA
+    Models associated relations among aspects via similarity and diversity analysis
     """
     
     def __init__(self, config):
         super().__init__()
-        self.hidden_size = config.hidden_size
+        
+        self.hidden_size = getattr(config, 'hidden_size', 768)
         self.num_relations = getattr(config, 'num_relations', 16)
         self.propagation_steps = getattr(config, 'propagation_steps', 3)
+        self.temperature = getattr(config, 'few_shot_temperature', 0.1)
         
-        # Similarity relation network
-        self.similarity_network = nn.Sequential(
+        # Relation encoders
+        self.similarity_encoder = nn.Sequential(
             nn.Linear(self.hidden_size * 2, self.hidden_size),
             nn.ReLU(),
-            nn.Dropout(0.1),
             nn.Linear(self.hidden_size, self.num_relations),
             nn.Softmax(dim=-1)
         )
         
-        # Diversity relation network
-        self.diversity_network = nn.Sequential(
+        self.diversity_encoder = nn.Sequential(
             nn.Linear(self.hidden_size * 2, self.hidden_size),
             nn.ReLU(),
-            nn.Dropout(0.1),
             nn.Linear(self.hidden_size, self.num_relations),
             nn.Softmax(dim=-1)
         )
         
-        # Relation embedding matrices
-        self.similarity_relations = nn.Parameter(
-            torch.randn(self.num_relations, self.hidden_size, self.hidden_size)
-        )
-        self.diversity_relations = nn.Parameter(
-            torch.randn(self.num_relations, self.hidden_size, self.hidden_size)
-        )
+        # Relation propagation networks
+        self.relation_propagator = nn.ModuleList([
+            RelationPropagationLayer(self.hidden_size, self.num_relations)
+            for _ in range(self.propagation_steps)
+        ])
         
-        # Message passing networks
-        self.message_mlp = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
+        # Final classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(self.hidden_size, self.hidden_size)
+            nn.Linear(self.hidden_size // 2, 3)  # Sentiment classes
         )
-        
-        # Update network
-        self.update_gru = nn.GRUCell(self.hidden_size, self.hidden_size)
-        
-    def forward(self, aspect_embeddings, support_labels, query_embeddings):
+    
+    def forward(self, support_features, support_labels, query_features):
         """
-        Perform dual relations propagation for few-shot learning
+        Forward pass for few-shot learning
         
         Args:
-            aspect_embeddings: Support set aspect embeddings [num_support, hidden_size]
-            support_labels: Support set labels [num_support]
-            query_embeddings: Query set aspect embeddings [num_query, hidden_size]
-            
+            support_features: Features from support set [num_support, hidden_size]
+            support_labels: Labels for support set [num_support]
+            query_features: Features from query set [num_query, hidden_size]
+        
         Returns:
-            Updated query embeddings with propagated relations
+            Query predictions and relation weights
         """
-        # Combine support and query embeddings
-        all_embeddings = torch.cat([aspect_embeddings, query_embeddings], dim=0)
-        num_support = aspect_embeddings.size(0)
-        num_query = query_embeddings.size(0)
-        num_total = num_support + num_query
+        # Build relation graphs
+        similarity_relations = self._build_similarity_relations(support_features, query_features)
+        diversity_relations = self._build_diversity_relations(support_features, query_features)
         
-        # Initialize node representations
-        node_representations = all_embeddings.clone()
+        # Initialize node features
+        all_features = torch.cat([support_features, query_features], dim=0)
+        node_features = all_features
         
-        # Iterative message passing
-        for step in range(self.propagation_steps):
-            # Compute pairwise features
-            expanded_embeddings = node_representations.unsqueeze(1).expand(-1, num_total, -1)
-            expanded_embeddings_t = node_representations.unsqueeze(0).expand(num_total, -1, -1)
-            pairwise_features = torch.cat([expanded_embeddings, expanded_embeddings_t], dim=-1)
-            
-            # Compute similarity and diversity relation weights
-            similarity_weights = self.similarity_network(pairwise_features)  # [num_total, num_total, num_relations]
-            diversity_weights = self.diversity_network(pairwise_features)
-            
-            # Apply relation transformations
-            similarity_messages = self._apply_relations(
-                node_representations, similarity_weights, self.similarity_relations
-            )
-            diversity_messages = self._apply_relations(
-                node_representations, diversity_weights, self.diversity_relations
-            )
-            
-            # Combine messages
-            combined_messages = similarity_messages + diversity_messages
-            processed_messages = self.message_mlp(combined_messages)
-            
-            # Update node representations
-            for i in range(num_total):
-                # Aggregate messages from all neighbors
-                aggregated_message = processed_messages[i].mean(dim=0)
-                
-                # Update using GRU
-                node_representations[i] = self.update_gru(
-                    aggregated_message,
-                    node_representations[i]
-                )
+        # Propagate through relation networks
+        for layer in self.relation_propagator:
+            node_features = layer(node_features, similarity_relations, diversity_relations)
         
-        # Return updated query embeddings
-        updated_query_embeddings = node_representations[num_support:]
+        # Extract query features and classify
+        num_support = support_features.size(0)
+        query_node_features = node_features[num_support:]
         
-        return updated_query_embeddings
+        predictions = self.classifier(query_node_features)
+        
+        return {
+            'predictions': predictions,
+            'similarity_relations': similarity_relations,
+            'diversity_relations': diversity_relations,
+            'node_features': node_features
+        }
     
-    def _apply_relations(self, embeddings, relation_weights, relation_matrices):
-        """Apply relation transformations to embeddings"""
-        num_nodes = embeddings.size(0)
-        hidden_size = embeddings.size(1)
+    def _build_similarity_relations(self, support_features, query_features):
+        """Build similarity-based relation matrix"""
+        all_features = torch.cat([support_features, query_features], dim=0)
+        num_nodes = all_features.size(0)
         
-        # Apply each relation transformation
-        transformed_embeddings = torch.zeros(
-            num_nodes, num_nodes, hidden_size,
-            device=embeddings.device
-        )
+        # Pairwise similarities
+        similarity_matrix = torch.zeros(num_nodes, num_nodes, self.num_relations, device=all_features.device)
         
         for i in range(num_nodes):
-            for j in range(num_nodes):
-                # Weighted combination of relation transformations
-                relation_output = torch.zeros(hidden_size, device=embeddings.device)
+            for j in range(i + 1, num_nodes):
+                # Concatenate features for relation encoding
+                pair_features = torch.cat([all_features[i], all_features[j]], dim=0)
+                relation_weights = self.similarity_encoder(pair_features.unsqueeze(0))
                 
-                for r in range(self.num_relations):
-                    weight = relation_weights[i, j, r]
-                    relation_matrix = relation_matrices[r]
-                    transformed = torch.matmul(embeddings[j], relation_matrix)
-                    relation_output += weight * transformed
-                
-                transformed_embeddings[i, j] = relation_output
+                similarity_matrix[i, j] = relation_weights.squeeze(0)
+                similarity_matrix[j, i] = relation_weights.squeeze(0)  # Symmetric
         
-        return transformed_embeddings
+        return similarity_matrix
+    
+    def _build_diversity_relations(self, support_features, query_features):
+        """Build diversity-based relation matrix"""
+        all_features = torch.cat([support_features, query_features], dim=0)
+        num_nodes = all_features.size(0)
+        
+        # Pairwise diversity (complementary to similarity)
+        diversity_matrix = torch.zeros(num_nodes, num_nodes, self.num_relations, device=all_features.device)
+        
+        for i in range(num_nodes):
+            for j in range(i + 1, num_nodes):
+                # Use difference features for diversity
+                diff_features = torch.abs(all_features[i] - all_features[j])
+                pair_features = torch.cat([all_features[i], diff_features], dim=0)
+                relation_weights = self.diversity_encoder(pair_features.unsqueeze(0))
+                
+                diversity_matrix[i, j] = relation_weights.squeeze(0)
+                diversity_matrix[j, i] = relation_weights.squeeze(0)  # Symmetric
+        
+        return diversity_matrix
+
+
+class RelationPropagationLayer(nn.Module):
+    """Single layer of relation propagation"""
+    
+    def __init__(self, hidden_size, num_relations):
+        super().__init__()
+        
+        self.hidden_size = hidden_size
+        self.num_relations = num_relations
+        
+        # Relation-specific transformation matrices
+        self.relation_transforms = nn.ModuleList([
+            nn.Linear(hidden_size, hidden_size)
+            for _ in range(num_relations)
+        ])
+        
+        # Aggregation network
+        self.aggregator = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        
+        # Residual connection
+        self.layer_norm = nn.LayerNorm(hidden_size)
+    
+    def forward(self, node_features, similarity_relations, diversity_relations):
+        """Propagate features through relations"""
+        num_nodes = node_features.size(0)
+        device = node_features.device
+        
+        # Initialize aggregated features
+        aggregated_features = torch.zeros_like(node_features)
+        
+        for i in range(num_nodes):
+            node_messages = []
+            
+            for j in range(num_nodes):
+                if i == j:
+                    continue
+                
+                # Combine similarity and diversity relations
+                combined_relations = (similarity_relations[i, j] + diversity_relations[i, j]) / 2
+                
+                # Apply relation-specific transformations
+                neighbor_message = torch.zeros_like(node_features[j])
+                for r in range(self.num_relations):
+                    relation_weight = combined_relations[r]
+                    transformed_feature = self.relation_transforms[r](node_features[j])
+                    neighbor_message += relation_weight * transformed_feature
+                
+                node_messages.append(neighbor_message)
+            
+            if node_messages:
+                # Aggregate messages
+                stacked_messages = torch.stack(node_messages, dim=0)
+                aggregated_message = stacked_messages.mean(dim=0)
+                
+                # Combine with original features
+                combined = torch.cat([node_features[i], aggregated_message], dim=0)
+                aggregated_features[i] = self.aggregator(combined.unsqueeze(0)).squeeze(0)
+            else:
+                aggregated_features[i] = node_features[i]
+        
+        # Residual connection and layer norm
+        output = self.layer_norm(aggregated_features + node_features)
+        
+        return output
 
 
 class AspectFocusedMetaLearning(nn.Module):
     """
-    Aspect-Focused Meta-Learning (AFML) for few-shot ABSA
+    Aspect-Focused Meta-Learning (AFML)
     
-    Constructs aspect-aware and aspect-contrastive representations
-    for improved generalization to new aspects.
+    2024-2025 breakthrough: Constructs aspect-aware and aspect-contrastive
+    representations using external knowledge for few-shot aspect category
+    sentiment analysis
     """
     
     def __init__(self, config):
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.meta_lr = getattr(config, 'meta_learning_rate', 0.01)
-        self.adaptation_steps = getattr(config, 'adaptation_steps', 5)
         
-        # Aspect-aware encoder
-        self.aspect_aware_encoder = nn.Sequential(
+        self.hidden_size = getattr(config, 'hidden_size', 768)
+        self.num_aspects = getattr(config, 'num_aspects', 50)  # Maximum number of aspects
+        self.meta_learning_rate = getattr(config, 'meta_learning_rate', 0.01)
+        
+        # Aspect-aware encoders
+        self.aspect_encoder = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.LayerNorm(self.hidden_size)
-        )
-        
-        # Aspect-contrastive encoder
-        self.aspect_contrastive_encoder = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.ReLU(),
-            nn.Dropout(0.1),
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.LayerNorm(self.hidden_size)
-        )
-        
-        # Meta-classifier for aspect classification
-        self.meta_classifier = nn.Sequential(
-            nn.Linear(self.hidden_size * 2, self.hidden_size),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(self.hidden_size, 64),
-            nn.ReLU(),
-            nn.Linear(64, 3)  # B, I, O tags
-        )
-        
-        # Prototype memory for aspect patterns
-        self.prototype_memory = nn.Parameter(
-            torch.randn(100, self.hidden_size)  # 100 prototype slots
         )
         
         # External knowledge integration
-        self.knowledge_integrator = ExternalKnowledgeIntegrator(config)
+        self.knowledge_projector = nn.Sequential(
+            nn.Linear(self.hidden_size * 2, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, self.hidden_size)
+        )
         
-    def forward(self, support_embeddings, support_labels, query_embeddings, 
-                external_knowledge=None):
+        # Meta-learning components
+        self.meta_optimizer = MetaOptimizer(self.hidden_size, self.meta_learning_rate)
+        
+        # Contrastive sentence generator (simulated)
+        self.contrastive_generator = ContrastiveSentenceGenerator(config)
+        
+        # Fast adaptation network
+        self.adaptation_network = nn.ModuleDict({
+            'aspect_adapter': nn.Linear(self.hidden_size, self.hidden_size),
+            'sentiment_adapter': nn.Linear(self.hidden_size, 3)
+        })
+    
+    def forward(self, support_data, query_data, external_knowledge=None):
         """
-        Perform aspect-focused meta-learning
+        Meta-learning forward pass
         
         Args:
-            support_embeddings: Support set embeddings [num_support, seq_len, hidden_size]
-            support_labels: Support set labels [num_support, seq_len]
-            query_embeddings: Query embeddings [num_query, seq_len, hidden_size]
+            support_data: Support set with aspects and sentiments
+            query_data: Query set for prediction
             external_knowledge: Optional external knowledge embeddings
-            
-        Returns:
-            Adapted query predictions and meta-learned representations
         """
         # Extract aspect-aware representations
-        aspect_aware_repr = self.aspect_aware_encoder(support_embeddings)
-        aspect_contrastive_repr = self.aspect_contrastive_encoder(support_embeddings)
-        
-        # Combine representations
-        combined_repr = torch.cat([aspect_aware_repr, aspect_contrastive_repr], dim=-1)
-        
-        # Create aspect prototypes from support set
-        aspect_prototypes = self._create_aspect_prototypes(
-            combined_repr, support_labels
-        )
+        support_aspects = self._extract_aspect_representations(support_data)
+        query_aspects = self._extract_aspect_representations(query_data)
         
         # Integrate external knowledge if available
         if external_knowledge is not None:
-            aspect_prototypes = self.knowledge_integrator(
-                aspect_prototypes, external_knowledge
-            )
+            support_aspects = self._integrate_external_knowledge(support_aspects, external_knowledge)
+            query_aspects = self._integrate_external_knowledge(query_aspects, external_knowledge)
         
-        # Adapt to query set using meta-learning
-        adapted_query_embeddings = self._meta_adapt(
-            query_embeddings, aspect_prototypes, support_labels
+        # Generate contrastive examples
+        contrastive_data = self.contrastive_generator(support_data, query_data)
+        
+        # Meta-learning adaptation
+        adapted_params = self.meta_optimizer.adapt(
+            support_aspects, support_data['labels'], 
+            contrastive_data
         )
         
-        # Make predictions on adapted embeddings
-        query_aspect_aware = self.aspect_aware_encoder(adapted_query_embeddings)
-        query_contrastive = self.aspect_contrastive_encoder(adapted_query_embeddings)
-        query_combined = torch.cat([query_aspect_aware, query_contrastive], dim=-1)
-        
-        predictions = self.meta_classifier(query_combined)
+        # Apply adapted parameters for query prediction
+        query_predictions = self._predict_with_adapted_params(
+            query_aspects, adapted_params
+        )
         
         return {
-            'predictions': predictions,
-            'adapted_embeddings': adapted_query_embeddings,
-            'aspect_prototypes': aspect_prototypes,
-            'meta_representations': query_combined
+            'predictions': query_predictions,
+            'adapted_params': adapted_params,
+            'aspect_representations': query_aspects,
+            'contrastive_data': contrastive_data
         }
     
-    def _create_aspect_prototypes(self, embeddings, labels):
-        """Create aspect prototypes from support set"""
-        batch_size, seq_len, hidden_size = embeddings.shape
+    def _extract_aspect_representations(self, data):
+        """Extract aspect-focused representations"""
+        # Encode text features
+        text_features = data['features']  # Assuming pre-encoded
         
-        # Find aspect spans (B and I tags)
-        aspect_mask = (labels > 0).float()  # B=1, I=2, O=0
+        # Apply aspect-aware encoding
+        aspect_features = self.aspect_encoder(text_features)
         
-        prototypes = []
-        for b in range(batch_size):
-            # Get aspect tokens for this sample
-            aspect_tokens = embeddings[b][aspect_mask[b] > 0]
-            
-            if len(aspect_tokens) > 0:
-                # Average pooling to create prototype
-                prototype = aspect_tokens.mean(dim=0)
-                prototypes.append(prototype)
-        
-        if prototypes:
-            aspect_prototypes = torch.stack(prototypes)
-        else:
-            # Fallback: use mean of all embeddings
-            aspect_prototypes = embeddings.mean(dim=(0, 1)).unsqueeze(0)
-        
-        return aspect_prototypes
+        return aspect_features
     
-    def _meta_adapt(self, query_embeddings, aspect_prototypes, support_labels):
-        """Meta-adaptation to query set using gradient-based adaptation"""
-        batch_size, seq_len, hidden_size = query_embeddings.shape
+    def _integrate_external_knowledge(self, features, external_knowledge):
+        """Integrate external knowledge into representations"""
+        # Combine features with external knowledge
+        combined = torch.cat([features, external_knowledge], dim=-1)
+        enhanced_features = self.knowledge_projector(combined)
         
-        # Initialize adapted embeddings
-        adapted_embeddings = query_embeddings.clone()
+        return enhanced_features
+    
+    def _predict_with_adapted_params(self, query_features, adapted_params):
+        """Make predictions using adapted parameters"""
+        # Apply adapted transformations
+        adapted_features = query_features
         
-        # Create adaptation network (simple MLP)
-        adaptation_net = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
+        for param_name, param_value in adapted_params.items():
+            if 'aspect' in param_name:
+                adapted_features = F.linear(adapted_features, param_value)
+            elif 'sentiment' in param_name:
+                predictions = F.linear(adapted_features, param_value)
+        
+        return predictions
+
+
+class MetaOptimizer(nn.Module):
+    """Meta-optimizer for fast adaptation"""
+    
+    def __init__(self, hidden_size, learning_rate):
+        super().__init__()
+        
+        self.hidden_size = hidden_size
+        self.learning_rate = learning_rate
+        
+        # Learnable learning rate
+        self.adaptive_lr = nn.Parameter(torch.tensor(learning_rate))
+        
+        # Meta-gradient computation network
+        self.meta_network = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size)
-        ).to(query_embeddings.device)
-        
-        # Meta-learning inner loop
-        for step in range(self.adaptation_steps):
-            # Compute similarity to aspect prototypes
-            for b in range(batch_size):
-                for t in range(seq_len):
-                    query_token = adapted_embeddings[b, t]
-                    
-                    # Find most similar prototype
-                    similarities = F.cosine_similarity(
-                        query_token.unsqueeze(0),
-                        aspect_prototypes,
-                        dim=1
-                    )
-                    
-                    # Weighted combination with most similar prototypes
-                    weights = F.softmax(similarities, dim=0)
-                    prototype_influence = torch.sum(
-                        weights.unsqueeze(1) * aspect_prototypes,
-                        dim=0
-                    )
-                    
-                    # Adapt embedding
-                    adaptation_input = query_token + prototype_influence
-                    adapted_token = adaptation_net(adaptation_input)
-                    adapted_embeddings[b, t] = adapted_token
-        
-        return adapted_embeddings
-
-
-class ExternalKnowledgeIntegrator(nn.Module):
-    """
-    Integrates external knowledge for enhanced few-shot learning
+        )
     
-    Uses auxiliary contrastive sentences and external knowledge bases
-    to improve aspect understanding in low-resource scenarios.
+    def adapt(self, support_features, support_labels, contrastive_data):
+        """Perform fast adaptation using meta-learning"""
+        batch_size = support_features.size(0)
+        
+        # Initialize adaptation parameters
+        adapted_params = {
+            'aspect_weight': torch.randn(self.hidden_size, self.hidden_size, requires_grad=True),
+            'sentiment_weight': torch.randn(3, self.hidden_size, requires_grad=True)
+        }
+        
+        # Compute meta-gradients
+        meta_loss = self._compute_meta_loss(support_features, support_labels, adapted_params)
+        
+        # Update parameters using meta-gradients
+        meta_grads = torch.autograd.grad(meta_loss, list(adapted_params.values()), create_graph=True)
+        
+        updated_params = {}
+        for (param_name, param_value), grad in zip(adapted_params.items(), meta_grads):
+            updated_params[param_name] = param_value - self.adaptive_lr * grad
+        
+        return updated_params
+    
+    def _compute_meta_loss(self, features, labels, params):
+        """Compute meta-learning loss"""
+        # Apply current parameters
+        transformed = F.linear(features, params['aspect_weight'])
+        predictions = F.linear(transformed, params['sentiment_weight'])
+        
+        # Cross-entropy loss
+        loss = F.cross_entropy(predictions, labels)
+        
+        return loss
+
+
+class ContrastiveSentenceGenerator(nn.Module):
+    """
+    Generate contrastive sentences for aspect-focused learning
+    
+    2024-2025 innovation: Creates auxiliary contrastive sentences
+    with external knowledge incorporation for better few-shot learning
     """
     
     def __init__(self, config):
         super().__init__()
-        self.hidden_size = config.hidden_size
         
-        # Knowledge fusion network
-        self.knowledge_fusion = nn.MultiheadAttention(
-            embed_dim=self.hidden_size,
-            num_heads=8,
-            dropout=0.1,
-            batch_first=True
-        )
+        self.hidden_size = getattr(config, 'hidden_size', 768)
+        self.vocab_size = getattr(config, 'vocab_size', 30000)
         
-        # Knowledge encoder
-        self.knowledge_encoder = nn.Sequential(
+        # Contrastive generation components
+        self.aspect_modifier = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Linear(self.hidden_size, self.hidden_size)
+        )
+        
+        self.sentiment_flipper = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, self.hidden_size)
+        )
+        
+        # Knowledge integration for contrastive examples
+        self.knowledge_integrator = nn.MultiheadAttention(
+            embed_dim=self.hidden_size,
+            num_heads=8,
+            batch_first=True
+        )
+    
+    def forward(self, support_data, query_data):
+        """Generate contrastive examples"""
+        support_features = support_data['features']
+        
+        # Generate aspect-modified examples
+        aspect_modified = self.aspect_modifier(support_features)
+        
+        # Generate sentiment-flipped examples
+        sentiment_flipped = self.sentiment_flipper(support_features)
+        
+        # Create contrastive labels
+        original_labels = support_data['labels']
+        flipped_labels = self._flip_sentiment_labels(original_labels)
+        
+        contrastive_data = {
+            'aspect_modified': aspect_modified,
+            'sentiment_flipped': sentiment_flipped,
+            'original_labels': original_labels,
+            'flipped_labels': flipped_labels,
+            'original_features': support_features
+        }
+        
+        return contrastive_data
+    
+    def _flip_sentiment_labels(self, labels):
+        """Flip sentiment labels for contrastive learning"""
+        # 0: NEG, 1: NEU, 2: POS
+        flipped = labels.clone()
+        flipped[labels == 0] = 2  # NEG -> POS
+        flipped[labels == 2] = 0  # POS -> NEG
+        # NEU stays the same
+        
+        return flipped
+
+
+class CrossDomainAspectLabelPropagation(nn.Module):
+    """
+    Cross-Domain Aspect Label Propagation (CD-ALPHN)
+    
+    2024-2025 breakthrough: Overcomes traditional two-stage transfer learning
+    limitations through unified learning approaches addressing inconsistency
+    between source and target domains
+    """
+    
+    def __init__(self, config):
+        super().__init__()
+        
+        self.hidden_size = getattr(config, 'hidden_size', 768)
+        self.num_domains = getattr(config, 'num_domains', 5)
+        self.propagation_alpha = getattr(config, 'propagation_alpha', 0.8)
+        
+        # Domain-specific encoders
+        self.domain_encoders = nn.ModuleDict({
+            f'domain_{i}': nn.Sequential(
+                nn.Linear(self.hidden_size, self.hidden_size),
+                nn.ReLU(),
+                nn.Linear(self.hidden_size, self.hidden_size),
+                nn.LayerNorm(self.hidden_size)
+            )
+            for i in range(self.num_domains)
+        })
+        
+        # Domain-invariant encoder
+        self.invariant_encoder = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.LayerNorm(self.hidden_size)
         )
         
-    def forward(self, aspect_prototypes, external_knowledge):
-        """
-        Integrate external knowledge with aspect prototypes
-        
-        Args:
-            aspect_prototypes: Learned aspect prototypes [num_prototypes, hidden_size]
-            external_knowledge: External knowledge embeddings [num_knowledge, hidden_size]
-            
-        Returns:
-            Enhanced aspect prototypes with integrated knowledge
-        """
-        # Encode external knowledge
-        encoded_knowledge = self.knowledge_encoder(external_knowledge)
-        
-        # Fuse knowledge using attention
-        enhanced_prototypes, attention_weights = self.knowledge_fusion(
-            query=aspect_prototypes.unsqueeze(0),  # Add batch dimension
-            key=encoded_knowledge.unsqueeze(0),
-            value=encoded_knowledge.unsqueeze(0)
+        # Label propagation matrix
+        self.propagation_matrix = nn.Parameter(
+            torch.eye(self.num_domains) * self.propagation_alpha + 
+            torch.ones(self.num_domains, self.num_domains) * (1 - self.propagation_alpha) / (self.num_domains - 1)
         )
         
-        # Remove batch dimension
-        enhanced_prototypes = enhanced_prototypes.squeeze(0)
+        # Domain adversarial discriminator
+        self.domain_discriminator = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.hidden_size // 2, self.num_domains)
+        )
         
-        # Residual connection
-        enhanced_prototypes = aspect_prototypes + enhanced_prototypes
-        
-        return enhanced_prototypes
-
-
-class InstructionPromptTemplates:
-    """
-    Instruction Prompt Templates (IPT) for unified generative few-shot learning
+        # Aspect classifier
+        self.aspect_classifier = nn.Sequential(
+            nn.Linear(self.hidden_size * 2, self.hidden_size),  # domain + invariant
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.hidden_size, 3)  # Aspect labels
+        )
     
-    Implements IPT-a, IPT-b, and IPT-c for different few-shot scenarios.
-    """
-    
-    def __init__(self):
-        # IPT-a: Aspect-focused templates
-        self.ipt_a_templates = [
-            "Given the aspect '{aspect}', extract similar aspects and their sentiments from: {text}",
-            "Find aspects related to '{aspect}' in the following review: {text}",
-            "Identify aspects similar to '{aspect}' and determine their sentiment in: {text}"
-        ]
-        
-        # IPT-b: Sentiment-focused templates
-        self.ipt_b_templates = [
-            "Extract all {sentiment} aspects and opinions from: {text}",
-            "Find aspects with {sentiment} sentiment in the review: {text}",
-            "Identify {sentiment} opinions about any aspects in: {text}"
-        ]
-        
-        # IPT-c: Domain-specific templates
-        self.ipt_c_templates = [
-            "In this {domain} review, extract aspect-opinion-sentiment triplets: {text}",
-            "For {domain} domain, find all aspect sentiments in: {text}",
-            "Extract {domain}-specific aspects and opinions from: {text}"
-        ]
-    
-    def generate_few_shot_prompt(self, template_type, examples, query_text, **kwargs):
+    def forward(self, features, domain_ids, labels=None, training=True):
         """
-        Generate few-shot prompt using specified template type
+        Cross-domain forward pass with label propagation
         
         Args:
-            template_type: 'ipt_a', 'ipt_b', or 'ipt_c'
-            examples: List of example triplets
-            query_text: Query text to analyze
-            **kwargs: Additional parameters (aspect, sentiment, domain)
-            
-        Returns:
-            Generated prompt string
+            features: Input features [batch_size, hidden_size]
+            domain_ids: Domain identifiers [batch_size]
+            labels: Ground truth labels for training
+            training: Whether in training mode
         """
-        # Select template based on type
-        if template_type == 'ipt_a':
-            templates = self.ipt_a_templates
-            base_template = templates[0]  # Use first template
-        elif template_type == 'ipt_b':
-            templates = self.ipt_b_templates
-            base_template = templates[0]
-        elif template_type == 'ipt_c':
-            templates = self.ipt_c_templates
-            base_template = templates[0]
-        else:
-            raise ValueError(f"Unknown template type: {template_type}")
+        batch_size = features.size(0)
+        device = features.device
         
-        # Create few-shot examples
-        example_text = ""
-        for i, example in enumerate(examples[:5]):  # Use up to 5 examples
-            example_text += f"Example {i+1}:\n"
-            example_text += f"Text: {example['text']}\n"
-            example_text += f"Triplets: {example['triplets']}\n\n"
+        # Extract domain-specific and invariant features
+        domain_features = []
+        invariant_features = self.invariant_encoder(features)
         
-        # Format the prompt
-        prompt = f"{example_text}Now analyze:\n"
-        prompt += base_template.format(text=query_text, **kwargs)
+        for i, domain_id in enumerate(domain_ids):
+            domain_encoder = self.domain_encoders[f'domain_{domain_id.item()}']
+            domain_feat = domain_encoder(features[i].unsqueeze(0))
+            domain_features.append(domain_feat)
         
-        return prompt
-
-
-class FewShotABSALearner(nn.Module):
-    """
-    Complete few-shot ABSA learner combining DRP, AFML, and IPT
+        domain_features = torch.cat(domain_features, dim=0)
+        
+        # Combine domain-specific and invariant features
+        combined_features = torch.cat([domain_features, invariant_features], dim=-1)
+        
+        # Aspect classification
+        aspect_predictions = self.aspect_classifier(combined_features)
+        
+        results = {
+            'aspect_predictions': aspect_predictions,
+            'domain_features': domain_features,
+            'invariant_features': invariant_features,
+            'combined_features': combined_features
+        }
+        
+        if training:
+            # Domain adversarial loss
+            domain_predictions = self.domain_discriminator(invariant_features)
+            
+            # Label propagation loss
+            if labels is not None:
+                propagation_loss = self._compute_propagation_loss(
+                    aspect_predictions, labels, domain_ids
+                )
+                results['propagation_loss'] = propagation_loss
+            
+            # Domain adversarial loss (maximize domain confusion for invariant features)
+            domain_labels = domain_ids
+            domain_loss = F.cross_entropy(domain_predictions, domain_labels)
+            results['domain_loss'] = domain_loss
+            results['domain_predictions'] = domain_predictions
+        
+        return results
     
-    Provides unified few-shot learning capabilities for ABSA tasks
-    with 80% performance using only 10% of training data.
+    def _compute_propagation_loss(self, predictions, labels, domain_ids):
+        """Compute cross-domain label propagation loss"""
+        device = predictions.device
+        batch_size = predictions.size(0)
+        
+        # Group predictions by domain
+        domain_predictions = {}
+        domain_labels = {}
+        
+        for i, domain_id in enumerate(domain_ids):
+            domain_key = domain_id.item()
+            if domain_key not in domain_predictions:
+                domain_predictions[domain_key] = []
+                domain_labels[domain_key] = []
+            
+            domain_predictions[domain_key].append(predictions[i])
+            domain_labels[domain_key].append(labels[i])
+        
+        # Compute propagation loss
+        propagation_loss = 0.0
+        num_domains_present = len(domain_predictions)
+        
+        for source_domain in domain_predictions:
+            for target_domain in domain_predictions:
+                if source_domain != target_domain:
+                    # Get propagation weight
+                    prop_weight = self.propagation_matrix[source_domain, target_domain]
+                    
+                    # Compute cross-domain consistency loss
+                    source_preds = torch.stack(domain_predictions[source_domain])
+                    target_preds = torch.stack(domain_predictions[target_domain])
+                    
+                    # KL divergence for soft propagation
+                    source_probs = F.softmax(source_preds, dim=-1)
+                    target_log_probs = F.log_softmax(target_preds, dim=-1)
+                    
+                    # Average over available samples
+                    min_samples = min(len(source_probs), len(target_log_probs))
+                    if min_samples > 0:
+                        kl_loss = F.kl_div(
+                            target_log_probs[:min_samples], 
+                            source_probs[:min_samples], 
+                            reduction='mean'
+                        )
+                        propagation_loss += prop_weight * kl_loss
+        
+        return propagation_loss / max(num_domains_present * (num_domains_present - 1), 1)
+    
+    def adapt_to_target_domain(self, source_features, source_labels, source_domain_id,
+                             target_features, target_domain_id, adaptation_steps=5):
+        """
+        Adapt model to target domain using few-shot samples
+        
+        Args:
+            source_features: Source domain features
+            source_labels: Source domain labels
+            source_domain_id: Source domain identifier
+            target_features: Target domain features (few-shot)
+            target_domain_id: Target domain identifier
+            adaptation_steps: Number of adaptation steps
+        """
+        # Initialize target domain encoder if not exists
+        target_key = f'domain_{target_domain_id}'
+        if target_key not in self.domain_encoders:
+            # Initialize from source domain
+            source_key = f'domain_{source_domain_id}'
+            self.domain_encoders[target_key] = nn.Sequential(
+                nn.Linear(self.hidden_size, self.hidden_size),
+                nn.ReLU(),
+                nn.Linear(self.hidden_size, self.hidden_size),
+                nn.LayerNorm(self.hidden_size)
+            )
+            
+            # Copy weights from source domain as initialization
+            self.domain_encoders[target_key].load_state_dict(
+                self.domain_encoders[source_key].state_dict()
+            )
+        
+        # Fine-tune on target domain samples
+        optimizer = torch.optim.Adam(
+            self.domain_encoders[target_key].parameters(), 
+            lr=0.001
+        )
+        
+        for step in range(adaptation_steps):
+            # Forward pass on target samples
+            target_domain_ids = torch.full((target_features.size(0),), target_domain_id)
+            
+            outputs = self.forward(
+                target_features, target_domain_ids, 
+                training=True
+            )
+            
+            # Compute adaptation loss (unsupervised domain adaptation)
+            # Use domain consistency and feature similarity
+            invariant_features = outputs['invariant_features']
+            
+            # Minimize feature distance between source and target
+            if source_features.size(0) > 0:
+                source_invariant = self.invariant_encoder(source_features)
+                adaptation_loss = F.mse_loss(
+                    invariant_features.mean(dim=0), 
+                    source_invariant.mean(dim=0)
+                )
+                
+                adaptation_loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+        
+        return self.domain_encoders[target_key]
+
+
+class FewShotABSAEvaluator:
+    """
+    Comprehensive evaluator for few-shot ABSA methods
+    
+    Implements evaluation protocols for cross-domain transfer,
+    few-shot learning, and meta-learning approaches
+    """
+    
+    def __init__(self, config):
+        self.config = config
+        self.k_shots = getattr(config, 'few_shot_k', 5)
+        self.num_episodes = getattr(config, 'num_episodes', 100)
+        
+    def evaluate_few_shot_performance(self, model, datasets, domains):
+        """
+        Evaluate few-shot performance across domains
+        
+        Args:
+            model: Few-shot ABSA model
+            datasets: Dictionary of domain datasets
+            domains: List of domain names
+        
+        Returns:
+            Comprehensive evaluation results
+        """
+        results = {}
+        
+        for target_domain in domains:
+            domain_results = []
+            
+            for episode in range(self.num_episodes):
+                # Sample support and query sets
+                support_data, query_data = self._sample_episode(
+                    datasets[target_domain], self.k_shots
+                )
+                
+                # Few-shot prediction
+                predictions = model(support_data, query_data)
+                
+                # Calculate metrics
+                episode_metrics = self._calculate_episode_metrics(
+                    predictions, query_data['labels']
+                )
+                
+                domain_results.append(episode_metrics)
+            
+            # Aggregate results for domain
+            results[target_domain] = self._aggregate_episode_results(domain_results)
+        
+        return results
+    
+    def evaluate_cross_domain_transfer(self, model, source_domains, target_domains, datasets):
+        """
+        Evaluate cross-domain transfer performance
+        
+        Tests model's ability to transfer knowledge from source domains
+        to target domains with minimal target domain data
+        """
+        transfer_results = {}
+        
+        for source_domain in source_domains:
+            for target_domain in target_domains:
+                if source_domain == target_domain:
+                    continue
+                
+                # Train on source domain
+                source_data = datasets[source_domain]['train']
+                
+                # Few-shot adaptation to target domain
+                target_support, target_query = self._sample_episode(
+                    datasets[target_domain], self.k_shots
+                )
+                
+                # Perform transfer
+                if hasattr(model, 'adapt_to_target_domain'):
+                    model.adapt_to_target_domain(
+                        source_data['features'], source_data['labels'], 
+                        source_domains.index(source_domain),
+                        target_support['features'], 
+                        target_domains.index(target_domain)
+                    )
+                
+                # Evaluate on target domain
+                predictions = model(target_support, target_query)
+                metrics = self._calculate_episode_metrics(
+                    predictions, target_query['labels']
+                )
+                
+                transfer_key = f"{source_domain}_to_{target_domain}"
+                transfer_results[transfer_key] = metrics
+        
+        return transfer_results
+    
+    def _sample_episode(self, dataset, k_shots):
+        """Sample support and query sets for an episode"""
+        # Get unique classes
+        unique_labels = torch.unique(dataset['labels'])
+        
+        support_indices = []
+        query_indices = []
+        
+        for label in unique_labels:
+            label_indices = torch.where(dataset['labels'] == label)[0]
+            
+            # Sample k-shot support examples
+            if len(label_indices) >= k_shots:
+                support_idx = torch.randperm(len(label_indices))[:k_shots]
+                support_indices.extend(label_indices[support_idx].tolist())
+                
+                # Use remaining as query
+                remaining_idx = torch.randperm(len(label_indices))[k_shots:]
+                if len(remaining_idx) > 0:
+                    query_indices.extend(label_indices[remaining_idx].tolist())
+        
+        # Create support and query sets
+        support_data = {
+            'features': dataset['features'][support_indices],
+            'labels': dataset['labels'][support_indices]
+        }
+        
+        query_data = {
+            'features': dataset['features'][query_indices],
+            'labels': dataset['labels'][query_indices]
+        }
+        
+        return support_data, query_data
+    
+    def _calculate_episode_metrics(self, predictions, true_labels):
+        """Calculate metrics for a single episode"""
+        if isinstance(predictions, dict):
+            predictions = predictions['predictions']
+        
+        # Convert to class predictions
+        if predictions.dim() > 1:
+            pred_labels = predictions.argmax(dim=-1)
+        else:
+            pred_labels = predictions
+        
+        # Calculate accuracy
+        accuracy = (pred_labels == true_labels).float().mean().item()
+        
+        # Calculate F1 score (macro average)
+        f1_scores = []
+        for class_id in torch.unique(true_labels):
+            true_pos = ((pred_labels == class_id) & (true_labels == class_id)).sum().item()
+            false_pos = ((pred_labels == class_id) & (true_labels != class_id)).sum().item()
+            false_neg = ((pred_labels != class_id) & (true_labels == class_id)).sum().item()
+            
+            precision = true_pos / (true_pos + false_pos) if (true_pos + false_pos) > 0 else 0
+            recall = true_pos / (true_pos + false_neg) if (true_pos + false_neg) > 0 else 0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+            
+            f1_scores.append(f1)
+        
+        macro_f1 = np.mean(f1_scores) if f1_scores else 0.0
+        
+        return {
+            'accuracy': accuracy,
+            'macro_f1': macro_f1,
+            'per_class_f1': f1_scores
+        }
+    
+    def _aggregate_episode_results(self, episode_results):
+        """Aggregate results across episodes"""
+        if not episode_results:
+            return {'accuracy': 0.0, 'macro_f1': 0.0}
+        
+        accuracies = [r['accuracy'] for r in episode_results]
+        f1_scores = [r['macro_f1'] for r in episode_results]
+        
+        return {
+            'accuracy_mean': np.mean(accuracies),
+            'accuracy_std': np.std(accuracies),
+            'f1_mean': np.mean(f1_scores),
+            'f1_std': np.std(f1_scores),
+            'accuracy_ci': self._compute_confidence_interval(accuracies),
+            'f1_ci': self._compute_confidence_interval(f1_scores)
+        }
+    
+    def _compute_confidence_interval(self, values, confidence=0.95):
+        """Compute confidence interval for values"""
+        if len(values) == 0:
+            return (0.0, 0.0)
+        
+        mean = np.mean(values)
+        std = np.std(values)
+        n = len(values)
+        
+        # t-distribution critical value (approximation)
+        t_crit = 1.96  # for 95% confidence, large n
+        margin_error = t_crit * std / np.sqrt(n)
+        
+        return (mean - margin_error, mean + margin_error)
+
+
+# Integration class for complete few-shot learning pipeline
+class CompleteFewShotABSA(nn.Module):
+    """
+    Complete few-shot ABSA system combining all breakthrough methods
+    
+    Integrates DRP, AFML, and CD-ALPHN for comprehensive few-shot learning
     """
     
     def __init__(self, config):
         super().__init__()
         
-        # Core components
         self.drp = DualRelationsPropagation(config)
         self.afml = AspectFocusedMetaLearning(config)
-        self.ipt = InstructionPromptTemplates()
+        self.cd_alphn = CrossDomainAspectLabelPropagation(config)
         
-        # Configuration
-        self.hidden_size = config.hidden_size
-        self.few_shot_k = getattr(config, 'few_shot_k', 5)  # k examples per class
-        self.adaptation_weight = getattr(config, 'adaptation_weight', 0.5)
+        # Method selection
+        self.use_drp = getattr(config, 'use_drp', True)
+        self.use_afml = getattr(config, 'use_afml', True)
+        self.use_cd_alphn = getattr(config, 'use_cd_alphn', True)
         
-        # Final prediction head
-        self.few_shot_classifier = nn.Sequential(
-            nn.Linear(self.hidden_size * 3, self.hidden_size),  # DRP + AFML + original
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(self.hidden_size, 64),
-            nn.ReLU(),
-            nn.Linear(64, 3)  # B, I, O tags
-        )
+        # Ensemble weights
+        self.ensemble_weights = nn.Parameter(torch.tensor([1.0, 1.0, 1.0]))
         
-    def forward(self, support_set, query_set, external_knowledge=None):
+    def forward(self, support_data, query_data, domain_ids=None, external_knowledge=None):
         """
-        Perform few-shot learning on ABSA task
-        
-        Args:
-            support_set: Dictionary with 'embeddings', 'labels', 'texts'
-            query_set: Dictionary with 'embeddings', 'texts'
-            external_knowledge: Optional external knowledge embeddings
-            
-        Returns:
-            Few-shot predictions and adapted representations
+        Complete few-shot forward pass combining all methods
         """
-        support_embeddings = support_set['embeddings']  # [num_support, seq_len, hidden_size]
-        support_labels = support_set['labels']  # [num_support, seq_len]
+        predictions = []
+        weights = F.softmax(self.ensemble_weights, dim=0)
         
-        query_embeddings = query_set['embeddings']  # [num_query, seq_len, hidden_size]
-        
-        # Extract aspect embeddings for DRP
-        support_aspect_embeddings = self._extract_aspect_embeddings(
-            support_embeddings, support_labels
-        )
-        query_aspect_embeddings = self._extract_aspect_embeddings(
-            query_embeddings, None
-        )
-        
-        # Apply Dual Relations Propagation
-        drp_updated_embeddings = self.drp(
-            support_aspect_embeddings,
-            self._extract_aspect_labels(support_labels),
-            query_aspect_embeddings
-        )
-        
-        # Apply Aspect-Focused Meta-Learning
-        afml_results = self.afml(
-            support_embeddings,
-            support_labels,
-            query_embeddings,
-            external_knowledge
-        )
-        
-        # Combine DRP and AFML representations
-        batch_size, seq_len, hidden_size = query_embeddings.shape
-        
-        # Broadcast DRP embeddings to sequence length
-        drp_broadcasted = drp_updated_embeddings.unsqueeze(1).expand(-1, seq_len, -1)
-        
-        # Combine all representations
-        combined_embeddings = torch.cat([
-            query_embeddings,  # Original embeddings
-            drp_broadcasted,   # DRP-enhanced embeddings
-            afml_results['adapted_embeddings']  # AFML-adapted embeddings
-        ], dim=-1)
-        
-        # Final predictions
-        predictions = self.few_shot_classifier(combined_embeddings)
-        
-        return {
-            'predictions': predictions,
-            'drp_embeddings': drp_updated_embeddings,
-            'afml_results': afml_results,
-            'combined_embeddings': combined_embeddings
-        }
-    
-    def generate_few_shot_prompt(self, support_examples, query_text, template_type='ipt_a', **kwargs):
-        """Generate few-shot prompt for instruction-following"""
-        return self.ipt.generate_few_shot_prompt(
-            template_type, support_examples, query_text, **kwargs
-        )
-    
-    def _extract_aspect_embeddings(self, embeddings, labels=None):
-        """Extract aspect-specific embeddings from sequence embeddings"""
-        if labels is not None:
-            # Use labels to identify aspect tokens
-            batch_size, seq_len, hidden_size = embeddings.shape
-            aspect_embeddings = []
-            
-            for b in range(batch_size):
-                # Find aspect tokens (B=1, I=2, O=0)
-                aspect_mask = labels[b] > 0
-                if aspect_mask.any():
-                    aspect_tokens = embeddings[b][aspect_mask]
-                    # Average pooling for aspect representation
-                    aspect_emb = aspect_tokens.mean(dim=0)
-                else:
-                    # Fallback: use mean of all tokens
-                    aspect_emb = embeddings[b].mean(dim=0)
-                aspect_embeddings.append(aspect_emb)
-            
-            return torch.stack(aspect_embeddings)
-        else:
-            # No labels available, use mean pooling
-            return embeddings.mean(dim=1)
-    
-    def _extract_aspect_labels(self, labels):
-        """Extract simplified aspect labels for contrastive learning"""
-        batch_size, seq_len = labels.shape
-        aspect_labels = []
-        
-        for b in range(batch_size):
-            # Check if sample has any aspects
-            has_aspect = (labels[b] > 0).any()
-            aspect_labels.append(1 if has_aspect else 0)
-        
-        return torch.tensor(aspect_labels, device=labels.device)
-    
-    def adapt_to_new_domain(self, domain_support_set, num_adaptation_steps=10):
-        """
-        Adapt the few-shot learner to a new domain using meta-learning
-        
-        Args:
-            domain_support_set: Support set from the new domain
-            num_adaptation_steps: Number of adaptation steps
-            
-        Returns:
-            Adapted model parameters
-        """
-        # Store original parameters
-        original_params = {}
-        for name, param in self.named_parameters():
-            original_params[name] = param.clone()
-        
-        # Define adaptation optimizer
-        adaptation_optimizer = torch.optim.SGD(
-            self.parameters(),
-            lr=0.01
-        )
-        
-        # Adaptation loop
-        for step in range(num_adaptation_steps):
-            # Forward pass on domain support set
-            outputs = self.forward(domain_support_set, domain_support_set)
-            
-            # Compute adaptation loss
-            predictions = outputs['predictions']
-            labels = domain_support_set['labels']
-            
-            # Simple cross-entropy loss for adaptation
-            loss = F.cross_entropy(
-                predictions.view(-1, 3),
-                labels.view(-1),
-                ignore_index=-100
+        # DRP predictions
+        if self.use_drp:
+            drp_outputs = self.drp(
+                support_data['features'], support_data['labels'], 
+                query_data['features']
             )
+            predictions.append(drp_outputs['predictions'])
+        
+        # AFML predictions
+        if self.use_afml:
+            afml_outputs = self.afml(
+                support_data, query_data, external_knowledge
+            )
+            predictions.append(afml_outputs['predictions'])
+        
+        # CD-ALPHN predictions
+        if self.use_cd_alphn and domain_ids is not None:
+            cd_outputs = self.cd_alphn(
+                query_data['features'], domain_ids, training=False
+            )
+            predictions.append(cd_outputs['aspect_predictions'])
+        
+        # Ensemble predictions
+        if predictions:
+            # Weighted ensemble
+            ensemble_pred = torch.zeros_like(predictions[0])
+            total_weight = 0.0
             
-            # Backward pass
-            adaptation_optimizer.zero_grad()
-            loss.backward()
-            adaptation_optimizer.step()
+            for i, pred in enumerate(predictions):
+                if i < len(weights):
+                    ensemble_pred += weights[i] * pred
+                    total_weight += weights[i]
+                else:
+                    ensemble_pred += pred
+                    total_weight += 1.0
             
-            print(f"Adaptation step {step + 1}/{num_adaptation_steps}, Loss: {loss.item():.4f}")
-        
-        # Return adapted parameters
-        adapted_params = {}
-        for name, param in self.named_parameters():
-            adapted_params[name] = param.clone()
-        
-        return adapted_params
-    
-    def evaluate_few_shot_performance(self, support_set, test_set, k_values=[1, 3, 5]):
-        """
-        Evaluate few-shot performance with different k values
-        
-        Args:
-            support_set: Full support set
-            test_set: Test set for evaluation
-            k_values: List of k values to evaluate
-            
-        Returns:
-            Performance metrics for each k value
-        """
-        results = {}
-        
-        for k in k_values:
-            # Sample k examples per class
-            k_shot_support = self._sample_k_shot_support(support_set, k)
-            
-            # Perform few-shot learning
-            outputs = self.forward(k_shot_support, test_set)
-            predictions = outputs['predictions']
-            
-            # Compute metrics
-            test_labels = test_set['labels']
-            accuracy = self._compute_accuracy(predictions, test_labels)
-            f1_score = self._compute_f1_score(predictions, test_labels)
-            
-            results[f'{k}-shot'] = {
-                'accuracy': accuracy,
-                'f1_score': f1_score,
-                'num_support_examples': len(k_shot_support['embeddings'])
-            }
-            
-            print(f"{k}-shot: Accuracy={accuracy:.3f}, F1={f1_score:.3f}")
-        
-        return results
-    
-    def _sample_k_shot_support(self, support_set, k):
-        """Sample k examples per class from support set"""
-        embeddings = support_set['embeddings']
-        labels = support_set['labels']
-        texts = support_set.get('texts', [])
-        
-        # Group by class (simplified - just check if has aspects)
-        has_aspects = []
-        no_aspects = []
-        
-        for i in range(len(embeddings)):
-            if (labels[i] > 0).any():
-                has_aspects.append(i)
-            else:
-                no_aspects.append(i)
-        
-        # Sample k examples from each class
-        sampled_indices = []
-        if has_aspects and len(has_aspects) >= k:
-            sampled_indices.extend(np.random.choice(has_aspects, k, replace=False))
-        if no_aspects and len(no_aspects) >= k:
-            sampled_indices.extend(np.random.choice(no_aspects, k, replace=False))
-        
-        # Create k-shot support set
-        k_shot_support = {
-            'embeddings': embeddings[sampled_indices],
-            'labels': labels[sampled_indices],
-        }
-        
-        if texts:
-            k_shot_support['texts'] = [texts[i] for i in sampled_indices]
-        
-        return k_shot_support
-    
-    def _compute_accuracy(self, predictions, labels):
-        """Compute token-level accuracy"""
-        pred_labels = predictions.argmax(dim=-1)
-        
-        # Mask out padding tokens
-        mask = labels != -100
-        
-        correct = (pred_labels == labels) & mask
-        total = mask.sum()
-        
-        if total > 0:
-            return (correct.sum().float() / total.float()).item()
+            ensemble_pred = ensemble_pred / total_weight
         else:
-            return 0.0
-    
-    def _compute_f1_score(self, predictions, labels):
-        """Compute F1 score for aspect detection (B and I tags)"""
-        pred_labels = predictions.argmax(dim=-1)
-        
-        # Mask out padding tokens
-        mask = labels != -100
-        
-        # Convert to binary (aspect vs non-aspect)
-        pred_binary = (pred_labels > 0) & mask
-        label_binary = (labels > 0) & mask
-        
-        # Compute F1
-        tp = (pred_binary & label_binary).sum().float()
-        fp = (pred_binary & ~label_binary).sum().float()
-        fn = (~pred_binary & label_binary).sum().float()
-        
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-        
-        return f1.item() if isinstance(f1, torch.Tensor) else f1
-
-
-class FewShotDataset:
-    """
-    Dataset handler for few-shot ABSA learning
-    
-    Provides utilities for creating support/query splits and managing
-    few-shot episodes for training and evaluation.
-    """
-    
-    def __init__(self, full_dataset, tokenizer, preprocessor):
-        self.full_dataset = full_dataset
-        self.tokenizer = tokenizer
-        self.preprocessor = preprocessor
-        
-        # Group data by domain/category for few-shot sampling
-        self.domain_groups = self._group_by_domain()
-        
-    def _group_by_domain(self):
-        """Group dataset samples by domain or aspect categories"""
-        # Simple grouping based on common aspects
-        groups = {}
-        
-        for i, (text, span_labels) in enumerate(self.full_dataset):
-            # Extract aspect terms to determine category
-            aspect_terms = []
-            for span_label in span_labels:
-                aspect_indices = span_label.aspect_indices
-                tokens = text.split()
-                aspect_text = ' '.join([tokens[idx] for idx in aspect_indices if idx < len(tokens)])
-                aspect_terms.append(aspect_text.lower())
-            
-            # Simple categorization (can be improved)
-            if any(term in ['food', 'meal', 'dish', 'pizza', 'pasta'] for term in aspect_terms):
-                category = 'food'
-            elif any(term in ['service', 'staff', 'waiter'] for term in aspect_terms):
-                category = 'service'
-            elif any(term in ['atmosphere', 'ambiance', 'decor'] for term in aspect_terms):
-                category = 'atmosphere'
-            else:
-                category = 'general'
-            
-            if category not in groups:
-                groups[category] = []
-            groups[category].append(i)
-        
-        return groups
-    
-    def create_few_shot_episode(self, k_shot=5, q_query=10, target_domain=None):
-        """
-        Create a few-shot learning episode
-        
-        Args:
-            k_shot: Number of support examples per class
-            q_query: Number of query examples
-            target_domain: Specific domain to sample from (if None, random)
-            
-        Returns:
-            Dictionary with support_set and query_set
-        """
-        # Select domain
-        if target_domain is None:
-            domain = np.random.choice(list(self.domain_groups.keys()))
-        else:
-            domain = target_domain
-        
-        domain_indices = self.domain_groups[domain]
-        
-        # Sample support and query sets
-        if len(domain_indices) < k_shot + q_query:
-            # Not enough samples, use all available
-            support_indices = domain_indices[:k_shot]
-            query_indices = domain_indices[k_shot:]
-        else:
-            # Random sampling
-            sampled_indices = np.random.choice(domain_indices, k_shot + q_query, replace=False)
-            support_indices = sampled_indices[:k_shot]
-            query_indices = sampled_indices[k_shot:]
-        
-        # Create support set
-        support_set = {
-            'embeddings': [],
-            'labels': [],
-            'texts': []
-        }
-        
-        for idx in support_indices:
-            text, span_labels = self.full_dataset[idx]
-            processed = self.preprocessor.preprocess(text, span_labels)
-            
-            support_set['embeddings'].append(processed['input_ids'])
-            support_set['labels'].append(processed['aspect_labels'])
-            support_set['texts'].append(text)
-        
-        # Convert to tensors
-        support_set['embeddings'] = torch.stack(support_set['embeddings'])
-        support_set['labels'] = torch.stack([labels[0] for labels in support_set['labels']])  # Take first span
-        
-        # Create query set
-        query_set = {
-            'embeddings': [],
-            'labels': [],
-            'texts': []
-        }
-        
-        for idx in query_indices:
-            text, span_labels = self.full_dataset[idx]
-            processed = self.preprocessor.preprocess(text, span_labels)
-            
-            query_set['embeddings'].append(processed['input_ids'])
-            query_set['labels'].append(processed['aspect_labels'])
-            query_set['texts'].append(text)
-        
-        # Convert to tensors
-        if query_set['embeddings']:
-            query_set['embeddings'] = torch.stack(query_set['embeddings'])
-            query_set['labels'] = torch.stack([labels[0] for labels in query_set['labels']])
+            # Fallback
+            ensemble_pred = torch.zeros(query_data['features'].size(0), 3)
         
         return {
-            'support_set': support_set,
-            'query_set': query_set,
-            'domain': domain
+            'predictions': ensemble_pred,
+            'individual_predictions': predictions,
+            'ensemble_weights': weights.detach().cpu().numpy()
         }
-    
-    def create_cross_domain_episode(self, source_domain, target_domain, k_shot=5):
-        """
-        Create cross-domain few-shot episode
-        
-        Args:
-            source_domain: Source domain for support set
-            target_domain: Target domain for query set
-            k_shot: Number of support examples
-            
-        Returns:
-            Cross-domain episode for domain adaptation testing
-        """
-        # Support set from source domain
-        source_indices = self.domain_groups.get(source_domain, [])
-        support_indices = np.random.choice(source_indices, min(k_shot, len(source_indices)), replace=False)
-        
-        # Query set from target domain
-        target_indices = self.domain_groups.get(target_domain, [])
-        query_indices = np.random.choice(target_indices, min(10, len(target_indices)), replace=False)
-        
-        # Create episode (similar to above)
-        return self._create_episode_from_indices(support_indices, query_indices)
-    
-    def _create_episode_from_indices(self, support_indices, query_indices):
-        """Helper method to create episode from indices"""
-        # Implementation similar to create_few_shot_episode
-        # (Code omitted for brevity - follows same pattern)
-        pass
