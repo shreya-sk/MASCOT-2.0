@@ -13,6 +13,7 @@ import logging
 import os
 from datetime import datetime
 
+from .metrics import enhanced_compute_triplet_metrics_with_bench
 from .losses import EnhancedABSALoss
 from .metrics import compute_metrics, compute_triplet_recovery_score, generate_evaluation_report
 from ..models.absa import LLMABSA
@@ -638,23 +639,9 @@ class EnhancedABSATrainer:
             return {'metrics': {}, 'error': str(e)}
     
     def _compute_triplet_metrics(self, all_triplets: List[Dict]) -> Dict[str, float]:
-        """Compute triplet-level metrics"""
-        metrics = {}
-        
-        total_explicit = sum(len(result.get('explicit_triplets', [])) for result in all_triplets)
-        total_implicit = sum(len(result.get('implicit_results', {}).get('implicit_triplets', [])) 
-                           for result in all_triplets)
-        total_combined = sum(len(result.get('combined_triplets', [])) for result in all_triplets)
-        
-        metrics.update({
-            'total_explicit_triplets': total_explicit,
-            'total_implicit_triplets': total_implicit,
-            'total_combined_triplets': total_combined,
-            'implicit_ratio': total_implicit / (total_explicit + total_implicit + 1e-8)
-        })
-        
-        return metrics
-    
+        """Enhanced triplet metrics with ABSA-Bench integration"""
+        return enhanced_compute_triplet_metrics_with_bench(all_triplets)
+
     def _compute_implicit_metrics(self, all_implicit_results: List[Dict]) -> Dict[str, float]:
         """Compute implicit detection specific metrics"""
         metrics = {}
