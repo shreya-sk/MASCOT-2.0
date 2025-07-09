@@ -11,7 +11,7 @@ import os
 import json
 from typing import List, Dict, Tuple, Optional, Any
 
-class ABSADataset(Dataset):
+class ABSAConfig(Dataset):
     """Clean ABSA dataset implementation"""
     
     def __init__(self, 
@@ -109,10 +109,9 @@ class ABSADataset(Dataset):
         # Map triplets to token positions
         for triplet in example['triplets']:
             if len(triplet) >= 3:
-                # Handle both string and list formats
-                aspect_term = triplet[0] if isinstance(triplet[0], str) else str(triplet[0])
-                opinion_term = triplet[1] if isinstance(triplet[1], str) else str(triplet[1])
-                sentiment = triplet[2] if isinstance(triplet[2], str) else str(triplet[2])
+                aspect_term = triplet[0]
+                opinion_term = triplet[1]
+                sentiment = triplet[2]
                 
                 # Map sentiment to index
                 sentiment_map = {'POS': 2, 'NEG': 0, 'NEU': 1}
@@ -152,10 +151,6 @@ class ABSADataset(Dataset):
     
     def _find_token_positions(self, term: str, sentence: str, encoding) -> List[int]:
         """Find token positions for a term in the sentence"""
-        # Ensure term is a string
-        if not isinstance(term, str):
-            term = str(term)
-        
         if not term or not sentence:
             return []
         
@@ -176,128 +171,3 @@ class ABSADataset(Dataset):
                 break
         
         return positions
-
-
-def create_dataloader(dataset: ABSADataset, 
-                     batch_size: int, 
-                     shuffle: bool = True,
-                     num_workers: int = 0) -> DataLoader:
-    """Create dataloader with proper collation"""
-    
-    def collate_fn(batch):
-        """Custom collate function"""
-        input_ids = torch.stack([item['input_ids'] for item in batch])
-        attention_mask = torch.stack([item['attention_mask'] for item in batch])
-        
-        # Collect all labels
-        labels = {}
-        label_keys = ['aspect_labels', 'opinion_labels', 'sentiment_labels', 
-                     'implicit_aspect_labels', 'implicit_opinion_labels']
-        
-        for key in label_keys:
-            if key in batch[0]['labels']:
-                labels[key] = torch.stack([item['labels'][key] for item in batch])
-        
-        return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'labels': labels,
-            'example_ids': [item['example_id'] for item in batch],
-            'sentences': [item['sentence'] for item in batch],
-            'triplets': [item['triplets'] for item in batch]
-        }
-    
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-        pin_memory=torch.cuda.is_available()
-    )
-
-
-def load_datasets(config) -> Dict[str, Dict[str, ABSADataset]]:
-    """Load all datasets specified in config"""
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    
-    # Add special tokens if needed
-    if not tokenizer.pad_token:
-        tokenizer.pad_token = tokenizer.eos_token or '[PAD]'
-    
-    datasets = {}
-    
-    for dataset_name in config.datasets:
-        dataset_dict = {}
-        
-        for split in ['train', 'dev', 'test']:
-            try:
-                dataset = ABSADataset(
-                    data_dir=config.data_dir,
-                    dataset_name=dataset_name,
-                    split=split,
-                    tokenizer=tokenizer,
-                    max_length=config.max_seq_length
-                )
-                
-                if len(dataset) > 0:
-                    dataset_dict[split] = dataset
-                    print(f"✅ {dataset_name}/{split}: {len(dataset)} examples")
-                else:
-                    print(f"⚠️ {dataset_name}/{split}: empty dataset")
-                    
-            except Exception as e:
-                print(f"❌ Failed to load {dataset_name}/{split}: {e}")
-        
-        if dataset_dict:
-            datasets[dataset_name] = dataset_dict
-    
-    return datasets
-
-
-def create_dataloaders(datasets: Dict[str, Dict[str, ABSADataset]], 
-                      config) -> Dict[str, Dict[str, DataLoader]]:
-    """Create dataloaders for all datasets"""
-    dataloaders = {}
-    
-    for dataset_name, dataset_splits in datasets.items():
-        dataloader_splits = {}
-        
-        for split, dataset in dataset_splits.items():
-            shuffle = (split == 'train')
-            dataloader = create_dataloader(
-                dataset=dataset,
-                batch_size=config.batch_size,
-                shuffle=shuffle,
-                num_workers=config.num_workers
-            )
-            dataloader_splits[split] = dataloader
-        
-        dataloaders[dataset_name] = dataloader_splits
-    
-    return dataloaders
-
-
-# Quick dataset verification
-def verify_datasets(config):
-    """Verify dataset integrity"""
-    print("🔍 Verifying datasets...")
-    
-    total_examples = 0
-    for dataset_name in config.datasets:
-        dataset_path = config.get_dataset_path(dataset_name)
-        
-        for split in ['train', 'dev', 'test']:
-            file_path = os.path.join(dataset_path, f"{split}.txt")
-            
-            if os.path.exists(file_path):
-                with open(file_path, 'r') as f:
-                    lines = f.readlines()
-                    examples = len([l for l in lines if l.strip()])
-                    total_examples += examples
-                    print(f"✅ {dataset_name}/{split}: {examples} examples")
-            else:
-                print(f"❌ Missing: {file_path}")
-    
-    print(f"📊 Total examples found: {total_examples}")
-    return total_examples > 0
