@@ -146,3 +146,261 @@ def create_minimal_config():
         datasets=['laptop14'],
         experiment_name="absa_minimal"
     )
+# src/utils/config.py - Add these domain adversarial configurations
+
+# Add to ABSAConfig class:
+
+# ============================================================================
+# DOMAIN ADVERSARIAL TRAINING CONFIGURATION
+# ============================================================================
+
+# Enable/disable domain adversarial training
+use_domain_adversarial: bool = True
+
+# Domain adversarial training parameters
+num_domains: int = 4  # restaurant, laptop, hotel, general
+domain_loss_weight: float = 0.1
+orthogonal_loss_weight: float = 0.1
+
+# Gradient reversal parameters
+alpha_schedule: str = 'progressive'  # 'progressive', 'fixed', 'cosine'
+initial_alpha: float = 0.0
+final_alpha: float = 1.0
+
+# Domain mapping for datasets
+domain_mapping: Dict[str, int] = field(default_factory=lambda: {
+    'restaurant': 0, 'rest14': 0, 'rest15': 0, 'rest16': 0,
+    'laptop': 1, 'laptop14': 1, 'laptop15': 1, 'laptop16': 1,
+    'hotel': 2, 'hotel_reviews': 2,
+    'general': 3
+})
+
+# Orthogonal constraint parameters
+orthogonal_regularization: bool = True
+orthogonal_lambda: float = 0.01
+
+# Domain classifier architecture
+domain_classifier_hidden_sizes: List[int] = field(default_factory=lambda: [256, 128])
+domain_classifier_dropout: float = 0.1
+
+# ============================================================================
+# UPDATED CONFIGURATION FACTORY FUNCTIONS
+# ============================================================================
+
+def create_development_config():
+    """Development configuration with domain adversarial training"""
+    config = ABSAConfig()
+    
+    # Basic settings
+    config.model_name = "roberta-base"
+    config.batch_size = 16
+    config.num_epochs = 5
+    config.learning_rate = 2e-5
+    
+    # Enable key features for development
+    config.use_implicit_detection = True
+    config.use_few_shot_learning = True
+    config.use_contrastive_learning = True
+    config.use_domain_adversarial = True  # NEW: Enable domain adversarial
+    config.use_generative_framework = False  # Disable for faster training
+    
+    # Domain adversarial settings
+    config.domain_loss_weight = 0.1
+    config.orthogonal_loss_weight = 0.1
+    config.alpha_schedule = 'progressive'
+    
+    # Datasets
+    config.datasets = ['laptop14', 'rest14']  # Multi-domain for adversarial training
+    
+    print("✅ Development config created with domain adversarial training")
+    return config
+
+
+def create_research_config():
+    """Research configuration with all features including domain adversarial"""
+    config = ABSAConfig()
+    
+    # Research settings
+    config.model_name = "roberta-large"
+    config.batch_size = 8  # Smaller due to larger model + domain adversarial
+    config.num_epochs = 10
+    config.learning_rate = 1e-5
+    
+    # Enable ALL features
+    config.use_implicit_detection = True
+    config.use_few_shot_learning = True
+    config.use_contrastive_learning = True
+    config.use_domain_adversarial = True  # NEW: Full domain adversarial
+    config.use_generative_framework = True
+    
+    # Advanced domain adversarial settings
+    config.domain_loss_weight = 0.15
+    config.orthogonal_loss_weight = 0.1
+    config.alpha_schedule = 'cosine'
+    config.orthogonal_lambda = 0.02
+    
+    # Multi-domain datasets for comprehensive evaluation
+    config.datasets = ['laptop14', 'rest14', 'rest15', 'rest16']
+    
+    print("✅ Research config created with full domain adversarial training")
+    return config
+
+
+def create_domain_adversarial_config():
+    """Specialized configuration focused on domain adversarial training"""
+    config = ABSAConfig()
+    
+    # Optimized for domain adversarial training
+    config.model_name = "roberta-base"
+    config.batch_size = 24
+    config.num_epochs = 8
+    config.learning_rate = 3e-5
+    
+    # Focus on domain adversarial features
+    config.use_implicit_detection = True
+    config.use_few_shot_learning = False  # Disable to focus on domain adversarial
+    config.use_contrastive_learning = True
+    config.use_domain_adversarial = True
+    config.use_generative_framework = False
+    
+    # Aggressive domain adversarial settings
+    config.domain_loss_weight = 0.2
+    config.orthogonal_loss_weight = 0.15
+    config.alpha_schedule = 'progressive'
+    config.orthogonal_lambda = 0.03
+    
+    # Maximum domain diversity
+    config.datasets = ['laptop14', 'rest14', 'rest15', 'rest16', 'hotel_reviews']
+    config.num_domains = 5  # Increased for more domains
+    
+    print("✅ Domain adversarial specialized config created")
+    return config
+
+
+# ============================================================================
+# DOMAIN ADVERSARIAL TRAINING SPECIFIC HELPERS
+# ============================================================================
+
+def get_domain_adversarial_experiment_dir(config):
+    """Get experiment directory for domain adversarial training"""
+    base_dir = "outputs/domain_adversarial"
+    
+    # Create descriptive name
+    features = []
+    if config.use_implicit_detection:
+        features.append("implicit")
+    if config.use_domain_adversarial:
+        features.append(f"da_{config.alpha_schedule}")
+    if config.use_contrastive_learning:
+        features.append("contrastive")
+    
+    feature_str = "_".join(features) if features else "basic"
+    model_name = config.model_name.split('/')[-1]  # Get just model name
+    
+    experiment_name = f"{model_name}_{feature_str}_{len(config.datasets)}domains"
+    return os.path.join(base_dir, experiment_name)
+
+
+def validate_domain_adversarial_config(config):
+    """Validate domain adversarial training configuration"""
+    issues = []
+    
+    # Check if domain adversarial is enabled with multi-domain data
+    if config.use_domain_adversarial:
+        if len(config.datasets) < 2:
+            issues.append("Domain adversarial training requires at least 2 domains")
+        
+        if config.domain_loss_weight <= 0:
+            issues.append("Domain loss weight must be positive")
+        
+        if config.orthogonal_loss_weight < 0:
+            issues.append("Orthogonal loss weight must be non-negative")
+        
+        if config.alpha_schedule not in ['progressive', 'fixed', 'cosine']:
+            issues.append("Alpha schedule must be 'progressive', 'fixed', or 'cosine'")
+        
+        if config.num_domains < len(set(get_domain_id(ds) for ds in config.datasets)):
+            issues.append("num_domains should be >= number of unique domains in datasets")
+    
+    # Memory considerations
+    if config.use_domain_adversarial and config.batch_size > 32:
+        issues.append("Large batch size with domain adversarial training may cause OOM")
+    
+    if issues:
+        print("⚠️ Configuration issues found:")
+        for issue in issues:
+            print(f"   - {issue}")
+        return False
+    
+    print("✅ Domain adversarial configuration validated")
+    return True
+
+
+# ============================================================================
+# INTEGRATION TEST FUNCTION
+# ============================================================================
+
+def test_domain_adversarial_integration():
+    """Test domain adversarial training integration"""
+    print("🧪 Testing Domain Adversarial Integration...")
+    
+    # Test development config
+    dev_config = create_development_config()
+    if not validate_domain_adversarial_config(dev_config):
+        print("❌ Development config validation failed")
+        return False
+    
+    # Test research config
+    research_config = create_research_config()
+    if not validate_domain_adversarial_config(research_config):
+        print("❌ Research config validation failed")
+        return False
+    
+    # Test specialized config
+    da_config = create_domain_adversarial_config()
+    if not validate_domain_adversarial_config(da_config):
+        print("❌ Domain adversarial config validation failed")
+        return False
+    
+    print("✅ All domain adversarial configurations validated successfully!")
+    
+    # Test model creation
+    try:
+        from ..models.unified_absa_model import create_unified_absa_model
+        model = create_unified_absa_model(dev_config)
+        
+        if hasattr(model, 'domain_adversarial') and model.domain_adversarial is not None:
+            print("✅ Model created successfully with domain adversarial components")
+        else:
+            print("❌ Model missing domain adversarial components")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Model creation failed: {e}")
+        return False
+    
+    print("🎉 Domain Adversarial Integration Test PASSED!")
+    return True
+
+
+# Helper function to add to existing config class
+def add_domain_adversarial_to_config(config):
+    """Add domain adversarial settings to existing config"""
+    config.use_domain_adversarial = True
+    config.num_domains = 4
+    config.domain_loss_weight = 0.1
+    config.orthogonal_loss_weight = 0.1
+    config.alpha_schedule = 'progressive'
+    config.domain_mapping = {
+        'restaurant': 0, 'rest14': 0, 'rest15': 0, 'rest16': 0,
+        'laptop': 1, 'laptop14': 1, 'laptop15': 1, 'laptop16': 1,
+        'hotel': 2, 'hotel_reviews': 2,
+        'general': 3
+    }
+    config.orthogonal_regularization = True
+    config.orthogonal_lambda = 0.01
+    config.domain_classifier_hidden_sizes = [256, 128]
+    config.domain_classifier_dropout = 0.1
+    
+    print("✅ Domain adversarial settings added to existing config")
+    return config

@@ -1,621 +1,454 @@
-# src/training/domain_adversarial.py
+# src/training/domain_adversarial_trainer.py
 """
-Domain Adversarial Training Framework for Cross-Domain ABSA
-Implements gradient reversal layer, orthogonal constraints, and CD-ALPHN
+Domain Adversarial Trainer Integration
+Integrates domain adversarial training into main training pipeline
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.autograd import Function
-from typing import Dict, List, Optional, Any, Tuple
-import numpy as np
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LinearLR
+from transformers import get_linear_schedule_with_warmup
+import os
+import json
+import time
+from typing import Dict, List, Optional, Any
+from tqdm import tqdm
 import logging
-from dataclasses import dataclass
-from collections import defaultdict
+import numpy as np
 
-logger = logging.getLogger(__name__)
+from ..models.unified_absa_model import UnifiedABSAModel
+from ..models.domain_adversarial import get_domain_id
 
 
-class GradientReversalFunction(Function):
+class DomainAdversarialABSATrainer:
     """
-    Gradient Reversal Layer implementation
-    Forward: identity function
-    Backward: multiply gradients by negative lambda
-    """
-    
-    @staticmethod
-    def forward(ctx, x, lambda_grl=1.0):
-        ctx.lambda_grl = lambda_grl
-        return x.view_as(x)
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output.neg() * ctx.lambda_grl, None
-
-
-class GradientReversalLayer(nn.Module):
-    """Gradient Reversal Layer for domain adversarial training"""
-    
-    def __init__(self, lambda_grl=1.0):
-        super().__init__()
-        self.lambda_grl = lambda_grl
-    
-    def forward(self, x):
-        return GradientReversalFunction.apply(x, self.lambda_grl)
-    
-    def set_lambda(self, lambda_grl):
-        """Dynamically adjust gradient reversal strength"""
-        self.lambda_grl = lambda_grl
-
-
-class DomainClassifier(nn.Module):
-    """Domain discriminator for adversarial training"""
-    
-    def __init__(self, hidden_size: int, num_domains: int, dropout: float = 0.1):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_domains = num_domains
-        
-        # Multi-layer domain classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, hidden_size // 4),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 4, num_domains)
-        )
-        
-        # Initialize weights
-        self._init_weights()
-    
-    def _init_weights(self):
-        """Initialize classifier weights"""
-        for module in self.classifier:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.zeros_(module.bias)
-    
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            features: [batch_size, seq_len, hidden_size] or [batch_size, hidden_size]
-        Returns:
-            domain_logits: [batch_size, num_domains] or [batch_size, seq_len, num_domains]
-        """
-        return self.classifier(features)
-
-
-class OrthogonalConstraint(nn.Module):
-    """
-    Orthogonal constraint for separating domain-invariant and domain-specific features
-    Based on "Domain Knowledge Decoupling" (EMNLP 2024)
+    ABSA Trainer with Domain Adversarial Training Integration
+    Extends the main trainer with domain adversarial capabilities
     """
     
-    def __init__(self, hidden_size: int, constraint_weight: float = 0.1):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.constraint_weight = constraint_weight
-        
-        # Projection matrices for domain-invariant and domain-specific features
-        self.domain_invariant_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.domain_specific_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        
-        # Initialize as orthogonal matrices
-        nn.init.orthogonal_(self.domain_invariant_proj.weight)
-        nn.init.orthogonal_(self.domain_specific_proj.weight)
-    
-    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            features: [batch_size, seq_len, hidden_size]
-        Returns:
-            domain_invariant: Domain-invariant features
-            domain_specific: Domain-specific features  
-            orthogonal_loss: Orthogonality constraint loss
-        """
-        # Project to domain-invariant and domain-specific subspaces
-        domain_invariant = self.domain_invariant_proj(features)
-        domain_specific = self.domain_specific_proj(features)
-        
-        # Compute orthogonality constraint loss
-        # ||W_inv^T * W_spec||_F^2 should be minimized
-        inv_weight = self.domain_invariant_proj.weight  # [hidden_size, hidden_size]
-        spec_weight = self.domain_specific_proj.weight  # [hidden_size, hidden_size]
-        
-        cross_product = torch.mm(inv_weight.T, spec_weight)  # [hidden_size, hidden_size]
-        orthogonal_loss = torch.norm(cross_product, p='fro') ** 2
-        orthogonal_loss = orthogonal_loss * self.constraint_weight
-        
-        return domain_invariant, domain_specific, orthogonal_loss
-
-
-class CDAlphnModule(nn.Module):
-    """
-    Cross-Domain Aspect Label Propagation Network (CD-ALPHN)
-    Unified learning approach for cross-domain transfer
-    """
-    
-    def __init__(self, hidden_size: int, num_domains: int, num_aspects: int):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_domains = num_domains
-        self.num_aspects = num_aspects
-        
-        # Domain-specific aspect embeddings
-        self.domain_aspect_embeddings = nn.Parameter(
-            torch.randn(num_domains, num_aspects, hidden_size)
-        )
-        
-        # Cross-domain attention for aspect propagation
-        self.cross_domain_attention = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=8,
-            dropout=0.1,
-            batch_first=True
-        )
-        
-        # Aspect label propagation network
-        self.propagation_network = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_size, num_aspects)
-        )
-    
-    def forward(self, 
-                features: torch.Tensor, 
-                source_domain_id: int, 
-                target_domain_id: int) -> torch.Tensor:
-        """
-        Args:
-            features: [batch_size, seq_len, hidden_size]
-            source_domain_id: Source domain identifier
-            target_domain_id: Target domain identifier
-        Returns:
-            propagated_logits: [batch_size, seq_len, num_aspects]
-        """
-        batch_size, seq_len, hidden_size = features.shape
-        
-        # Get domain-specific aspect embeddings
-        source_aspects = self.domain_aspect_embeddings[source_domain_id]  # [num_aspects, hidden_size]
-        target_aspects = self.domain_aspect_embeddings[target_domain_id]  # [num_aspects, hidden_size]
-        
-        # Expand for batch processing
-        source_aspects = source_aspects.unsqueeze(0).expand(batch_size, -1, -1)  # [batch, num_aspects, hidden]
-        target_aspects = target_aspects.unsqueeze(0).expand(batch_size, -1, -1)  # [batch, num_aspects, hidden]
-        
-        # Cross-domain attention between source and target aspects
-        attended_aspects, _ = self.cross_domain_attention(
-            query=target_aspects,
-            key=source_aspects,
-            value=source_aspects
-        )  # [batch_size, num_aspects, hidden_size]
-        
-        # Compute similarity between features and attended aspects
-        # Reshape features for broadcasting
-        features_expanded = features.unsqueeze(2)  # [batch, seq_len, 1, hidden]
-        attended_expanded = attended_aspects.unsqueeze(1)  # [batch, 1, num_aspects, hidden]
-        
-        # Concatenate for propagation network
-        combined = torch.cat([
-            features_expanded.expand(-1, -1, self.num_aspects, -1),
-            attended_expanded.expand(-1, seq_len, -1, -1)
-        ], dim=-1)  # [batch, seq_len, num_aspects, hidden*2]
-        
-        # Apply propagation network
-        propagated_logits = self.propagation_network(combined)  # [batch, seq_len, num_aspects, num_aspects]
-        propagated_logits = propagated_logits.mean(dim=2)  # [batch, seq_len, num_aspects]
-        
-        return propagated_logits
-
-
-@dataclass
-class DomainAdversarialConfig:
-    """Configuration for domain adversarial training"""
-    lambda_grl_start: float = 0.0
-    lambda_grl_end: float = 1.0
-    grl_schedule: str = 'linear'  # 'linear', 'exponential', 'constant'
-    orthogonal_weight: float = 0.1
-    domain_loss_weight: float = 1.0
-    cd_alphn_weight: float = 0.5
-    warmup_epochs: int = 2
-    adaptation_steps: int = 3
-
-
-class DomainAdversarialTrainer:
-    """
-    Complete Domain Adversarial Training Framework
-    Implements gradient reversal, orthogonal constraints, and CD-ALPHN
-    """
-    
-    def __init__(self, model, config: DomainAdversarialConfig, device: str = 'cuda'):
+    def __init__(self, model: UnifiedABSAModel, config, train_dataloader, eval_dataloader=None):
         self.model = model
         self.config = config
-        self.device = device
-        self.logger = logging.getLogger(__name__)
+        self.train_dataloader = train_dataloader
+        self.eval_dataloader = eval_dataloader
         
-        # Get model hidden size
-        self.hidden_size = getattr(model.config, 'hidden_size', 768)
+        # Domain adversarial specific config
+        self.use_domain_adversarial = getattr(config, 'use_domain_adversarial', True)
+        self.domain_loss_weight = getattr(config, 'domain_loss_weight', 0.1)
+        self.orthogonal_loss_weight = getattr(config, 'orthogonal_loss_weight', 0.1)
+        self.alpha_schedule = getattr(config, 'alpha_schedule', 'progressive')  # 'progressive', 'fixed', 'cosine'
         
-        # Initialize domain adversarial components
-        self.num_domains = getattr(model.config, 'num_domains', 4)  # restaurant, laptop, hotel, electronics
-        self.num_aspects = getattr(model.config, 'num_aspects', 50)  # Estimated aspect vocabulary
+        # Setup optimizer with domain adversarial components
+        self.optimizer = self._setup_domain_adversarial_optimizer()
         
-        # Core components
-        self.gradient_reversal_layer = GradientReversalLayer(
-            lambda_grl=config.lambda_grl_start
-        ).to(device)
-        
-        self.domain_classifier = DomainClassifier(
-            hidden_size=self.hidden_size,
-            num_domains=self.num_domains
-        ).to(device)
-        
-        self.orthogonal_constraint = OrthogonalConstraint(
-            hidden_size=self.hidden_size,
-            constraint_weight=config.orthogonal_weight
-        ).to(device)
-        
-        self.cd_alphn = CDAlphnModule(
-            hidden_size=self.hidden_size,
-            num_domains=self.num_domains,
-            num_aspects=self.num_aspects
-        ).to(device)
+        # Setup scheduler
+        total_steps = len(train_dataloader) * config.num_epochs
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=config.warmup_steps,
+            num_training_steps=total_steps
+        )
         
         # Training state
-        self.current_epoch = 0
-        self.total_epochs = 0
-        self.domain_mappings = {
-            'restaurant': 0, 'laptop': 1, 'hotel': 2, 'electronics': 3
-        }
+        self.global_step = 0
+        self.epoch = 0
+        self.best_f1 = 0.0
+        self.training_history = []
         
-        self.logger.info("🚀 Domain Adversarial Training Framework initialized")
-        self.logger.info(f"   Domains: {self.num_domains}")
-        self.logger.info(f"   Hidden size: {self.hidden_size}")
-        self.logger.info(f"   Device: {self.device}")
+        # Domain adversarial tracking
+        self.domain_loss_history = []
+        self.orthogonal_loss_history = []
+        self.alpha_history = []
+        
+        # Output directory
+        self.output_dir = config.get_experiment_dir()
+        
+        # Setup logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+        
+        if self.use_domain_adversarial:
+            self.logger.info("🎯 Domain Adversarial Training Enabled")
+            self.logger.info(f"   - Domain loss weight: {self.domain_loss_weight}")
+            self.logger.info(f"   - Orthogonal loss weight: {self.orthogonal_loss_weight}")
+            self.logger.info(f"   - Alpha schedule: {self.alpha_schedule}")
+        
+    def _setup_domain_adversarial_optimizer(self):
+        """Setup optimizer with different learning rates for domain adversarial components"""
+        
+        # Separate parameters for different components
+        backbone_params = []
+        task_params = []  # Aspect, opinion, sentiment classifiers
+        domain_params = []  # Domain adversarial components
+        
+        for name, param in self.model.named_parameters():
+            if 'backbone' in name:
+                backbone_params.append(param)
+            elif 'domain_adversarial' in name:
+                domain_params.append(param)
+            else:
+                task_params.append(param)
+        
+        # Different learning rates for different components
+        param_groups = [
+            {
+                'params': backbone_params,
+                'lr': self.config.learning_rate * 0.1,  # Lower LR for backbone
+                'name': 'backbone'
+            },
+            {
+                'params': task_params,
+                'lr': self.config.learning_rate,
+                'name': 'task_specific'
+            }
+        ]
+        
+        # Add domain adversarial parameters if enabled
+        if self.use_domain_adversarial and domain_params:
+            param_groups.append({
+                'params': domain_params,
+                'lr': self.config.learning_rate * 2.0,  # Higher LR for domain components
+                'name': 'domain_adversarial'
+            })
+        
+        # Filter out empty parameter groups
+        param_groups = [group for group in param_groups if len(group['params']) > 0]
+        
+        optimizer = AdamW(
+            param_groups,
+            lr=self.config.learning_rate,
+            weight_decay=getattr(self.config, 'weight_decay', 0.01),
+            eps=1e-8
+        )
+        
+        return optimizer
     
-    def _get_current_lambda_grl(self) -> float:
-        """Get current gradient reversal lambda based on schedule"""
-        if self.current_epoch < self.config.warmup_epochs:
-            return 0.0
-        
-        progress = (self.current_epoch - self.config.warmup_epochs) / max(1, self.total_epochs - self.config.warmup_epochs)
-        progress = min(1.0, max(0.0, progress))
-        
-        if self.config.grl_schedule == 'linear':
-            return self.config.lambda_grl_start + progress * (self.config.lambda_grl_end - self.config.lambda_grl_start)
-        elif self.config.grl_schedule == 'exponential':
-            return self.config.lambda_grl_start * (self.config.lambda_grl_end / self.config.lambda_grl_start) ** progress
-        else:  # constant
-            return self.config.lambda_grl_end
-    
-    def compute_domain_adversarial_loss(self, 
-                                      features: torch.Tensor,
-                                      domain_ids: torch.Tensor,
-                                      attention_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Compute all domain adversarial losses
-        
-        Args:
-            features: [batch_size, seq_len, hidden_size]
-            domain_ids: [batch_size] domain identifiers
-            attention_mask: [batch_size, seq_len] attention mask
-            
-        Returns:
-            Dictionary of losses
-        """
-        losses = {}
-        
-        # 1. Orthogonal constraint for domain-invariant/specific separation
-        domain_invariant, domain_specific, orthogonal_loss = self.orthogonal_constraint(features)
-        losses['orthogonal_loss'] = orthogonal_loss
-        
-        # 2. Domain adversarial loss using gradient reversal
-        current_lambda = self._get_current_lambda_grl()
-        self.gradient_reversal_layer.set_lambda(current_lambda)
-        
-        # Apply gradient reversal to domain-invariant features
-        reversed_features = self.gradient_reversal_layer(domain_invariant)
-        
-        # Pool features for domain classification (use [CLS] token or mean pooling)
-        if attention_mask is not None:
-            # Mean pooling with attention mask
-            mask_expanded = attention_mask.unsqueeze(-1).expand_as(reversed_features)
-            pooled_features = (reversed_features * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1)
+    def _get_current_alpha(self, epoch: int, total_epochs: int) -> float:
+        """Get current alpha value for gradient reversal"""
+        if self.alpha_schedule == 'fixed':
+            return 1.0
+        elif self.alpha_schedule == 'progressive':
+            # Gradually increase from 0 to 1
+            progress = epoch / total_epochs
+            return 2.0 / (1.0 + np.exp(-10 * progress)) - 1.0
+        elif self.alpha_schedule == 'cosine':
+            # Cosine schedule
+            progress = epoch / total_epochs
+            return 0.5 * (1 + np.cos(np.pi * progress))
         else:
-            # Use [CLS] token (first token)
-            pooled_features = reversed_features[:, 0, :]
-        
-        # Domain classification
-        domain_logits = self.domain_classifier(pooled_features)  # [batch_size, num_domains]
-        
-        # Domain adversarial loss
-        domain_loss = F.cross_entropy(domain_logits, domain_ids)
-        losses['domain_adversarial_loss'] = domain_loss * self.config.domain_loss_weight
-        
-        # 3. Store features for CD-ALPHN (will be used in cross-domain adaptation)
-        losses['domain_invariant_features'] = domain_invariant
-        losses['domain_specific_features'] = domain_specific
-        
-        return losses
+            return 1.0
     
-    def train_with_domain_adaptation(self, 
-                                   source_dataset, 
-                                   target_datasets: List, 
-                                   epochs: int = 10) -> Dict[str, Any]:
+    def train_step(self, batch: Dict[str, torch.Tensor], dataset_name: str) -> Dict[str, float]:
         """
-        Train with cross-domain adaptation using complete framework
+        Single training step with domain adversarial training
         
         Args:
-            source_dataset: Source domain dataset
-            target_datasets: List of target domain datasets
-            epochs: Number of training epochs
+            batch: Training batch
+            dataset_name: Name of dataset for domain identification
             
         Returns:
-            Training results and metrics
+            Dictionary of losses and metrics
         """
-        self.total_epochs = epochs
-        self.logger.info("🚀 Starting domain adversarial training...")
-        self.logger.info(f"   Source domain: {getattr(source_dataset, 'domain', 'unknown')}")
-        self.logger.info(f"   Target domains: {len(target_datasets)}")
-        self.logger.info(f"   Total epochs: {epochs}")
+        self.model.train()
         
+        # Update alpha for gradient reversal
+        current_alpha = self._get_current_alpha(self.epoch, self.config.num_epochs)
+        if self.model.domain_adversarial:
+            self.model.domain_adversarial.current_alpha = current_alpha
+        
+        # Forward pass with dataset name for domain identification
+        outputs = self.model(
+            input_ids=batch['input_ids'],
+            attention_mask=batch['attention_mask'],
+            labels=batch,
+            dataset_name=dataset_name
+        )
+        
+        # Compute losses
+        total_loss, loss_dict = self.model.compute_loss(outputs, batch, dataset_name)
+        
+        # Add domain adversarial specific metrics
+        if 'domain_outputs' in outputs and outputs['domain_outputs']:
+            domain_outputs = outputs['domain_outputs']
+            
+            # Track domain classification accuracy
+            if 'domain_logits' in domain_outputs:
+                domain_logits = domain_outputs['domain_logits']
+                domain_ids = torch.tensor([get_domain_id(dataset_name)] * len(batch['input_ids']), 
+                                        device=domain_logits.device)
+                domain_preds = domain_logits.argmax(dim=-1)
+                domain_acc = (domain_preds == domain_ids).float().mean()
+                loss_dict['domain_accuracy'] = domain_acc.item()
+            
+            # Track alpha value
+            loss_dict['gradient_reversal_alpha'] = current_alpha
+        
+        # Backward pass
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        
+        # Optimizer step
+        self.optimizer.step()
+        if self.scheduler:
+            self.scheduler.step()
+        
+        # Update global step
+        self.global_step += 1
+        
+        return loss_dict
+    
+    def train_epoch(self, epoch: int) -> Dict[str, float]:
+        """
+        Train one epoch with domain adversarial training
+        
+        Args:
+            epoch: Current epoch number
+            
+        Returns:
+            Dictionary of average losses and metrics
+        """
+        self.epoch = epoch
+        self.model.update_training_progress(epoch, self.config.num_epochs)
+        
+        epoch_losses = {}
+        epoch_metrics = {}
+        num_batches = 0
+        
+        # Progress bar
+        pbar = tqdm(self.train_dataloader, desc=f'Epoch {epoch+1}/{self.config.num_epochs}')
+        
+        for batch_idx, batch in enumerate(pbar):
+            # Move batch to device
+            batch = {k: v.to(self.model.device) if torch.is_tensor(v) else v 
+                    for k, v in batch.items()}
+            
+            # Get dataset name (this should be provided in your dataloader)
+            dataset_name = batch.get('dataset_name', 'general')
+            if isinstance(dataset_name, list):
+                dataset_name = dataset_name[0]  # Take first if list
+            
+            # Training step
+            step_losses = self.train_step(batch, dataset_name)
+            
+            # Accumulate losses
+            for loss_name, loss_value in step_losses.items():
+                if loss_name not in epoch_losses:
+                    epoch_losses[loss_name] = []
+                epoch_losses[loss_name].append(loss_value)
+            
+            num_batches += 1
+            
+            # Update progress bar
+            if 'total_loss' in step_losses:
+                current_loss = step_losses['total_loss']
+                avg_loss = np.mean(epoch_losses['total_loss'])
+                
+                # Add domain adversarial info to progress bar
+                postfix = {'Loss': f"{current_loss:.4f}", 'Avg': f"{avg_loss:.4f}"}
+                if 'domain_accuracy' in step_losses:
+                    postfix['DomAcc'] = f"{step_losses['domain_accuracy']:.3f}"
+                if 'gradient_reversal_alpha' in step_losses:
+                    postfix['Alpha'] = f"{step_losses['gradient_reversal_alpha']:.3f}"
+                
+                pbar.set_postfix(postfix)
+        
+        # Calculate average losses
+        avg_losses = {name: np.mean(losses) for name, losses in epoch_losses.items()}
+        
+        # Track domain adversarial specific metrics
+        if 'domain_loss' in avg_losses:
+            self.domain_loss_history.append(avg_losses['domain_loss'])
+        if 'orthogonal_loss' in avg_losses:
+            self.orthogonal_loss_history.append(avg_losses['orthogonal_loss'])
+        if 'gradient_reversal_alpha' in avg_losses:
+            self.alpha_history.append(avg_losses['gradient_reversal_alpha'])
+        
+        self.training_history.append(avg_losses)
+        
+        return avg_losses
+    
+    def evaluate_epoch(self, dataloader, epoch: int) -> Dict[str, float]:
+        """
+        Evaluate model with domain adversarial metrics
+        
+        Args:
+            dataloader: Evaluation dataloader
+            epoch: Current epoch
+            
+        Returns:
+            Dictionary of evaluation metrics
+        """
+        self.model.eval()
+        
+        eval_losses = {}
+        all_predictions = []
+        all_targets = []
+        domain_confusion_matrix = np.zeros((4, 4))  # 4 domains
+        
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc='Evaluating'):
+                # Move batch to device
+                batch = {k: v.to(self.model.device) if torch.is_tensor(v) else v 
+                        for k, v in batch.items()}
+                
+                dataset_name = batch.get('dataset_name', 'general')
+                if isinstance(dataset_name, list):
+                    dataset_name = dataset_name[0]
+                
+                # Forward pass
+                outputs = self.model(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch['attention_mask'],
+                    labels=batch,
+                    dataset_name=dataset_name
+                )
+                
+                # Compute losses
+                total_loss, loss_dict = self.model.compute_loss(outputs, batch, dataset_name)
+                
+                # Accumulate losses
+                for loss_name, loss_value in loss_dict.items():
+                    if loss_name not in eval_losses:
+                        eval_losses[loss_name] = []
+                    eval_losses[loss_name].append(loss_value.item() if torch.is_tensor(loss_value) else loss_value)
+                
+                # Track domain confusion for analysis
+                if 'domain_outputs' in outputs and 'domain_logits' in outputs['domain_outputs']:
+                    domain_logits = outputs['domain_outputs']['domain_logits']
+                    true_domain_id = get_domain_id(dataset_name)
+                    pred_domain_ids = domain_logits.argmax(dim=-1).cpu().numpy()
+                    
+                    for pred_id in pred_domain_ids:
+                        domain_confusion_matrix[true_domain_id, pred_id] += 1
+        
+        # Calculate average losses
+        avg_eval_losses = {name: np.mean(losses) for name, losses in eval_losses.items()}
+        
+        # Calculate domain confusion metrics
+        domain_accuracy = np.trace(domain_confusion_matrix) / np.sum(domain_confusion_matrix)
+        domain_confusion_score = 1.0 - domain_accuracy  # Higher confusion is better for adversarial training
+        
+        # Add domain adversarial specific metrics
+        avg_eval_losses['domain_confusion_score'] = domain_confusion_score
+        avg_eval_losses['domain_accuracy'] = domain_accuracy
+        
+        return avg_eval_losses
+    
+    def train(self) -> Dict[str, Any]:
+        """
+        Main training loop with domain adversarial training
+        
+        Returns:
+            Training results and best model info
+        """
+        print("🚀 Starting Domain Adversarial ABSA Training...")
+        print(f"   Model: {self.config.model_name}")
+        print(f"   Epochs: {self.config.num_epochs}")
+        print(f"   Batch size: {self.config.batch_size}")
+        print(f"   Learning rate: {self.config.learning_rate}")
+        
+        if self.use_domain_adversarial:
+            print(f"   🎯 Domain Adversarial Features:")
+            print(f"     - Gradient reversal: ✅ Enabled")
+            print(f"     - Domain classifier: ✅ 4-domain output")
+            print(f"     - Orthogonal constraints: ✅ Active")
+            print(f"     - Alpha schedule: {self.alpha_schedule}")
+        
+        # Training results tracking
         training_results = {
-            'source_metrics': [],
-            'target_metrics': [],
-            'domain_losses': [],
-            'orthogonal_losses': [],
-            'adaptation_history': []
+            'best_f1': 0.0,
+            'best_epoch': 0,
+            'best_model_path': None,
+            'training_history': [],
+            'domain_adversarial_history': {
+                'domain_losses': [],
+                'orthogonal_losses': [],
+                'alpha_values': [],
+                'confusion_scores': []
+            }
         }
         
-        for epoch in range(epochs):
-            self.current_epoch = epoch
-            current_lambda = self._get_current_lambda_grl()
+        # Training loop
+        for epoch in range(self.config.num_epochs):
+            # Training phase
+            train_losses = self.train_epoch(epoch)
+            training_results['training_history'].append(train_losses)
             
-            self.logger.info(f"Epoch {epoch+1}/{epochs} (λ_GRL={current_lambda:.3f})")
-            
-            # 1. Train on source domain with adversarial loss
-            source_metrics = self._train_source_epoch(source_dataset)
-            training_results['source_metrics'].append(source_metrics)
-            
-            # 2. Adapt to each target domain using CD-ALPHN
-            for i, target_dataset in enumerate(target_datasets):
-                target_domain_name = getattr(target_dataset, 'domain', f'target_{i}')
-                self.logger.info(f"   Adapting to {target_domain_name}...")
+            # Evaluation phase
+            if self.eval_dataloader:
+                eval_metrics = self.evaluate_epoch(self.eval_dataloader, epoch)
                 
-                # Get domain IDs
-                source_domain_id = self.domain_mappings.get(
-                    getattr(source_dataset, 'domain', 'restaurant'), 0
-                )
-                target_domain_id = self.domain_mappings.get(target_domain_name, i + 1)
+                # Check for best model (you may want to use different metric)
+                current_f1 = eval_metrics.get('f1', 0.0)  # Placeholder - use actual F1
+                if current_f1 > training_results['best_f1']:
+                    training_results['best_f1'] = current_f1
+                    training_results['best_epoch'] = epoch
+                    
+                    # Save best model
+                    best_model_path = os.path.join(self.output_dir, 'best_domain_adversarial_model.pt')
+                    self.save_model(best_model_path)
+                    training_results['best_model_path'] = best_model_path
                 
-                # Perform CD-ALPHN adaptation
-                adaptation_metrics = self._adapt_to_target_domain(
-                    source_dataset, target_dataset, 
-                    source_domain_id, target_domain_id
-                )
+                # Log results
+                self.logger.info(f"Epoch {epoch+1}/{self.config.num_epochs}")
+                self.logger.info(f"  Train Loss: {train_losses.get('total_loss', 0):.4f}")
+                self.logger.info(f"  Eval Loss: {eval_metrics.get('total_loss', 0):.4f}")
                 
-                # Evaluate on target domain
-                target_metrics = self._evaluate_target_domain(target_dataset)
-                
-                training_results['target_metrics'].append({
-                    'epoch': epoch,
-                    'domain': target_domain_name,
-                    'adaptation_metrics': adaptation_metrics,
-                    'evaluation_metrics': target_metrics
-                })
-                
-                self.logger.info(f"   Target {target_domain_name} F1: {target_metrics.get('f1', 0.0):.4f}")
+                if self.use_domain_adversarial:
+                    self.logger.info(f"  Domain Confusion: {eval_metrics.get('domain_confusion_score', 0):.4f}")
+                    self.logger.info(f"  Alpha: {train_losses.get('gradient_reversal_alpha', 0):.4f}")
         
-        # Final evaluation across all domains
-        final_results = self._evaluate_cross_domain_performance(source_dataset, target_datasets)
-        training_results['final_cross_domain_results'] = final_results
+        # Save final results
+        self._save_training_results(training_results)
         
-        self.logger.info("✅ Domain adversarial training completed!")
-        self.logger.info(f"   Average cross-domain F1: {final_results.get('avg_cross_domain_f1', 0.0):.4f}")
+        print("🎉 Domain Adversarial Training completed!")
+        print(f"   Best F1: {training_results['best_f1']:.4f} (Epoch {training_results['best_epoch']})")
+        print(f"   Best model: {training_results['best_model_path']}")
         
         return training_results
     
-    def _train_source_epoch(self, source_dataset) -> Dict[str, float]:
-        """Train one epoch on source domain with adversarial loss"""
-        self.model.train()
-        total_loss = 0.0
-        total_steps = 0
-        domain_losses = []
-        orthogonal_losses = []
-        
-        # Create data loader (simplified for demonstration)
-        for batch in source_dataset:  # Assuming iterable dataset
-            # Move to device
-            batch = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            
-            # Forward pass through main model
-            outputs = self.model(
-                input_ids=batch['input_ids'],
-                attention_mask=batch['attention_mask']
-            )
-            
-            # Get features from last hidden state
-            features = outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs[0]
-            
-            # Get domain IDs (assuming single source domain)
-            source_domain_id = self.domain_mappings.get(
-                getattr(source_dataset, 'domain', 'restaurant'), 0
-            )
-            domain_ids = torch.full(
-                (features.size(0),), source_domain_id, 
-                dtype=torch.long, device=self.device
-            )
-            
-            # Compute domain adversarial losses
-            domain_losses_dict = self.compute_domain_adversarial_loss(
-                features, domain_ids, batch['attention_mask']
-            )
-            
-            # Total loss (main task loss would be added by main trainer)
-            batch_loss = (
-                domain_losses_dict['domain_adversarial_loss'] + 
-                domain_losses_dict['orthogonal_loss']
-            )
-            
-            total_loss += batch_loss.item()
-            domain_losses.append(domain_losses_dict['domain_adversarial_loss'].item())
-            orthogonal_losses.append(domain_losses_dict['orthogonal_loss'].item())
-            total_steps += 1
-            
-            # Note: Backward pass would be handled by main trainer
-        
-        return {
-            'avg_loss': total_loss / max(1, total_steps),
-            'avg_domain_loss': np.mean(domain_losses) if domain_losses else 0.0,
-            'avg_orthogonal_loss': np.mean(orthogonal_losses) if orthogonal_losses else 0.0,
-            'lambda_grl': self._get_current_lambda_grl()
-        }
-    
-    def _adapt_to_target_domain(self, 
-                              source_dataset, 
-                              target_dataset, 
-                              source_domain_id: int, 
-                              target_domain_id: int) -> Dict[str, float]:
-        """Adapt to target domain using CD-ALPHN"""
-        self.model.eval()
-        adaptation_losses = []
-        
-        with torch.no_grad():
-            # Sample few examples from target domain for adaptation
-            for i, batch in enumerate(target_dataset):
-                if i >= self.config.adaptation_steps:
-                    break
-                
-                # Move to device
-                batch = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in batch.items()}
-                
-                # Get features
-                outputs = self.model(
-                    input_ids=batch['input_ids'],
-                    attention_mask=batch['attention_mask']
-                )
-                features = outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs[0]
-                
-                # Apply CD-ALPHN for aspect propagation
-                propagated_logits = self.cd_alphn(
-                    features, source_domain_id, target_domain_id
-                )
-                
-                # Compute adaptation loss (would be used for parameter updates)
-                if 'aspect_labels' in batch:
-                    adaptation_loss = F.cross_entropy(
-                        propagated_logits.view(-1, self.num_aspects),
-                        batch['aspect_labels'].view(-1),
-                        ignore_index=-100
-                    )
-                    adaptation_losses.append(adaptation_loss.item())
-        
-        return {
-            'avg_adaptation_loss': np.mean(adaptation_losses) if adaptation_losses else 0.0,
-            'adaptation_steps': len(adaptation_losses)
-        }
-    
-    def _evaluate_target_domain(self, target_dataset) -> Dict[str, float]:
-        """Evaluate performance on target domain"""
-        # Simplified evaluation - would integrate with your existing evaluation pipeline
-        return {
-            'f1': 0.75,  # Placeholder - replace with actual evaluation
-            'precision': 0.73,
-            'recall': 0.77
-        }
-    
-    def _evaluate_cross_domain_performance(self, source_dataset, target_datasets) -> Dict[str, float]:
-        """Evaluate final cross-domain performance"""
-        # Comprehensive cross-domain evaluation
-        return {
-            'avg_cross_domain_f1': 0.72,
-            'domain_variance': 0.05,
-            'transfer_effectiveness': 0.85
-        }
-    
-    def save_domain_adversarial_components(self, save_path: str):
-        """Save all domain adversarial components"""
+    def save_model(self, save_path: str):
+        """Save model with domain adversarial components"""
         checkpoint = {
-            'gradient_reversal_layer': self.gradient_reversal_layer.state_dict(),
-            'domain_classifier': self.domain_classifier.state_dict(),
-            'orthogonal_constraint': self.orthogonal_constraint.state_dict(),
-            'cd_alphn': self.cd_alphn.state_dict(),
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'config': self.config,
-            'domain_mappings': self.domain_mappings
+            'epoch': self.epoch,
+            'global_step': self.global_step,
+            'domain_adversarial_enabled': self.use_domain_adversarial,
+            'domain_loss_history': self.domain_loss_history,
+            'orthogonal_loss_history': self.orthogonal_loss_history,
+            'alpha_history': self.alpha_history
         }
+        
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         torch.save(checkpoint, save_path)
-        self.logger.info(f"💾 Domain adversarial components saved to {save_path}")
+        self.logger.info(f"✅ Model saved with domain adversarial components: {save_path}")
     
-    def load_domain_adversarial_components(self, load_path: str):
-        """Load domain adversarial components"""
-        checkpoint = torch.load(load_path, map_location=self.device)
+    def _save_training_results(self, results: Dict[str, Any]):
+        """Save comprehensive training results"""
+        results_path = os.path.join(self.output_dir, 'domain_adversarial_training_results.json')
         
-        self.gradient_reversal_layer.load_state_dict(checkpoint['gradient_reversal_layer'])
-        self.domain_classifier.load_state_dict(checkpoint['domain_classifier'])
-        self.orthogonal_constraint.load_state_dict(checkpoint['orthogonal_constraint'])
-        self.cd_alphn.load_state_dict(checkpoint['cd_alphn'])
+        # Convert tensors to lists for JSON serialization
+        serializable_results = {}
+        for key, value in results.items():
+            if isinstance(value, (list, dict)):
+                serializable_results[key] = value
+            else:
+                serializable_results[key] = str(value)
         
-        self.domain_mappings = checkpoint['domain_mappings']
+        os.makedirs(os.path.dirname(results_path), exist_ok=True)
+        with open(results_path, 'w') as f:
+            json.dump(serializable_results, f, indent=2)
         
-        self.logger.info(f"📂 Domain adversarial components loaded from {load_path}")
+        self.logger.info(f"✅ Training results saved: {results_path}")
 
 
-# Integration functions for existing codebase
-def create_domain_adversarial_trainer(model, device='cuda', **kwargs) -> DomainAdversarialTrainer:
+def create_domain_adversarial_trainer(model, config, train_dataloader, eval_dataloader=None):
     """Factory function to create domain adversarial trainer"""
-    config = DomainAdversarialConfig(**kwargs)
-    return DomainAdversarialTrainer(model, config, device)
-
-
-def integrate_domain_adversarial_loss(model_outputs: Dict[str, torch.Tensor], 
-                                    domain_trainer: DomainAdversarialTrainer,
-                                    batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """
-    Integration function for adding domain adversarial loss to existing training loop
-    
-    Args:
-        model_outputs: Outputs from main ABSA model
-        domain_trainer: Domain adversarial trainer instance
-        batch: Input batch with domain information
-        
-    Returns:
-        Updated outputs with domain adversarial losses
-    """
-    # Extract features (last hidden state)
-    if 'last_hidden_state' in model_outputs:
-        features = model_outputs['last_hidden_state']
-    elif 'hidden_states' in model_outputs:
-        features = model_outputs['hidden_states']
-    else:
-        # Fallback: assume first output is hidden states
-        features = model_outputs[list(model_outputs.keys())[0]]
-    
-    # Get domain IDs from batch
-    domain_ids = batch.get('domain_ids', torch.zeros(features.size(0), dtype=torch.long, device=features.device))
-    attention_mask = batch.get('attention_mask', torch.ones(features.size(0), features.size(1), device=features.device))
-    
-    # Compute domain adversarial losses
-    domain_losses = domain_trainer.compute_domain_adversarial_loss(features, domain_ids, attention_mask)
-    
-    # Add to model outputs
-    model_outputs.update(domain_losses)
-    
-    return model_outputs
-
-
-# Export key components
-__all__ = [
-    'DomainAdversarialTrainer',
-    'GradientReversalLayer', 
-    'DomainClassifier',
-    'OrthogonalConstraint',
-    'CDAlphnModule',
-    'DomainAdversarialConfig',
-    'create_domain_adversarial_trainer',
-    'integrate_domain_adversarial_loss'
-]
-
+    return DomainAdversarialABSATrainer(model, config, train_dataloader, eval_dataloader)

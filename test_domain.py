@@ -1,273 +1,288 @@
-# test_domain_adversarial_integration.py
+# demo_domain_adversarial.py
 """
-Test script to validate Domain Adversarial Training integration
-Verifies 98/100 publication readiness achievement
+Demo script to test domain adversarial training integration
+Run this to verify everything is working correctly
 """
 
 import torch
 import sys
-import os
+from pathlib import Path
 
 # Add src to path
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+src_path = Path(__file__).parent / "src"
+sys.path.insert(0, str(src_path))
 
-def test_domain_adversarial_integration():
-    """Test complete domain adversarial training integration"""
-    print("🧪 Testing Domain Adversarial Training Integration...")
-    print("="*80)
+from utils.config import create_domain_adversarial_config, test_domain_adversarial_integration
+from models.unified_absa_model import create_unified_absa_model
+from models.domain_adversarial import DomainAdversarialModule, get_domain_id
+from training.domain_adversarial_trainer import DomainAdversarialABSATrainer
+
+
+def demo_gradient_reversal():
+    """Demo gradient reversal layer functionality"""
+    print("🔄 Testing Gradient Reversal Layer...")
     
-    try:
-        # Import required modules
-        from src.training.domain_adversarial import (
-            DomainAdversarialTrainer, 
-            DomainAdversarialConfig,
-            GradientReversalLayer,
-            DomainClassifier,
-            OrthogonalConstraint,
-            CDAlphnModule
-        )
-        print("✅ Domain adversarial modules imported successfully")
-        
-        # Test gradient reversal layer
-        print("\n🔄 Testing Gradient Reversal Layer...")
-        grl = GradientReversalLayer(lambda_grl=1.0)
-        test_input = torch.randn(2, 10, 768)
-        grl_output = grl(test_input)
-        assert grl_output.shape == test_input.shape
-        print(f"   ✅ GRL output shape: {grl_output.shape}")
-        
-        # Test domain classifier
-        print("\n🎯 Testing Domain Classifier...")
-        domain_classifier = DomainClassifier(hidden_size=768, num_domains=4)
-        pooled_features = torch.randn(2, 768)
-        domain_logits = domain_classifier(pooled_features)
-        assert domain_logits.shape == (2, 4)
-        print(f"   ✅ Domain classifier output shape: {domain_logits.shape}")
-        
-        # Test orthogonal constraint
-        print("\n⚡ Testing Orthogonal Constraint...")
-        orthogonal = OrthogonalConstraint(hidden_size=768)
-        features = torch.randn(2, 10, 768)
-        domain_inv, domain_spec, orth_loss = orthogonal(features)
-        assert domain_inv.shape == features.shape
-        assert domain_spec.shape == features.shape
-        assert orth_loss.dim() == 0
-        print(f"   ✅ Orthogonal constraint working")
-        print(f"   📊 Orthogonal loss: {orth_loss.item():.6f}")
-        
-        # Test CD-ALPHN
-        print("\n🔗 Testing CD-ALPHN Module...")
-        cd_alphn = CDAlphnModule(hidden_size=768, num_domains=4, num_aspects=50)
-        propagated = cd_alphn(features, source_domain_id=0, target_domain_id=1)
-        assert propagated.shape == (2, 10, 50)
-        print(f"   ✅ CD-ALPHN output shape: {propagated.shape}")
-        
-        # Test domain adversarial trainer
-        print("\n🚀 Testing Domain Adversarial Trainer...")
-        
-        # Create mock model
-        class MockModel:
-            def __init__(self):
-                self.config = type('Config', (), {
-                    'hidden_size': 768,
-                    'num_domains': 4,
-                    'num_aspects': 50
-                })()
-            
-            def parameters(self):
-                return [torch.randn(10, requires_grad=True)]
-        
-        mock_model = MockModel()
-        config = DomainAdversarialConfig()
-        trainer = DomainAdversarialTrainer(mock_model, config, device='cpu')
-        
-        # Test loss computation
-        features = torch.randn(2, 10, 768)
-        domain_ids = torch.tensor([0, 1])
-        attention_mask = torch.ones(2, 10)
-        
-        losses = trainer.compute_domain_adversarial_loss(features, domain_ids, attention_mask)
-        
-        required_keys = ['orthogonal_loss', 'domain_adversarial_loss', 'domain_invariant_features']
-        for key in required_keys:
-            assert key in losses, f"Missing key: {key}"
-        
-        print(f"   ✅ Domain adversarial loss: {losses['domain_adversarial_loss'].item():.6f}")
-        print(f"   ✅ Orthogonal loss: {losses['orthogonal_loss'].item():.6f}")
-        
-        print("\n🏆 DOMAIN ADVERSARIAL TRAINING INTEGRATION TEST PASSED!")
-        
-        # Test enhanced model integration (if available)
-        try:
-            from src.models.enhanced_absa_domain_adversarial import ABSAModelWithDomainAdversarial
-            print("\n🔧 Testing Enhanced Model Integration...")
-            
-            # Create mock config
-            class MockConfig:
-                def __init__(self):
-                    self.model_name = 'bert-base-uncased'
-                    self.hidden_size = 768
-                    self.num_labels = 3
-                    self.use_domain_adversarial = True
-                    self.use_implicit_detection = True
-                    self.use_few_shot_learning = True
-                    self.use_contrastive_learning = True
-            
-            config = MockConfig()
-            print("   ✅ Enhanced model integration available")
-            
-        except ImportError as e:
-            print(f"   ⚠️ Enhanced model integration not available: {e}")
-        
-        # Test metrics integration
-        try:
-            from src.training.metrics import (
-                evaluate_with_absa_bench,
-                test_absa_bench_integration,
-                enhanced_compute_triplet_metrics_with_bench
-            )
-            print("\n📊 Testing ABSA-Bench Integration...")
-            
-            # Run ABSA-Bench test
-            bench_test_passed = test_absa_bench_integration()
-            if bench_test_passed:
-                print("   ✅ ABSA-Bench integration working")
-            else:
-                print("   ⚠️ ABSA-Bench integration needs attention")
-                
-        except ImportError as e:
-            print(f"   ⚠️ ABSA-Bench integration not available: {e}")
-        
-        # Final assessment
-        print("\n" + "="*80)
-        print("🎯 PUBLICATION READINESS ASSESSMENT")
-        print("="*80)
-        
-        components_status = {
-            "TRS (Triplet Recovery Score)": "✅ IMPLEMENTED",
-            "ABSA-Bench Framework": "✅ IMPLEMENTED", 
-            "Implicit Detection": "✅ IMPLEMENTED",
-            "Few-Shot Learning": "✅ IMPLEMENTED",
-            "Contrastive Learning": "✅ IMPLEMENTED",
-            "Domain Adversarial Training": "✅ IMPLEMENTED",
-            "Cross-Domain Transfer": "✅ IMPLEMENTED",
-            "Orthogonal Constraints": "✅ IMPLEMENTED",
-            "CD-ALPHN": "✅ IMPLEMENTED"
-        }
-        
-        for component, status in components_status.items():
-            print(f"   {component}: {status}")
-        
-        print(f"\n🏆 FINAL SCORE: 98/100 PUBLICATION READY!")
-        print(f"📚 Research Contributions:")
-        print(f"   ✅ State-of-the-art implicit sentiment detection")
-        print(f"   ✅ Advanced few-shot learning capabilities")
-        print(f"   ✅ Cross-domain transfer with gradient reversal")
-        print(f"   ✅ Unified evaluation with TRS + ABSA-Bench")
-        print(f"   ✅ Complete 2024-2025 ABSA framework")
-        
-        print(f"\n🚀 READY FOR TOP-TIER PUBLICATION!")
-        print(f"   Target venues: ACL, EMNLP, NAACL, AAAI")
-        print(f"   Expected impact: High (novel cross-domain approach)")
-        print(f"   Reproducibility: Full (clean codebase)")
-        
+    from models.domain_adversarial import gradient_reversal_layer
+    
+    # Create test tensor
+    x = torch.randn(4, 10, requires_grad=True)
+    
+    # Forward pass through gradient reversal
+    reversed_x = gradient_reversal_layer(x, alpha=1.0)
+    
+    # Compute dummy loss
+    loss = reversed_x.sum()
+    loss.backward()
+    
+    # Check that gradients are reversed (negative)
+    if x.grad is not None and torch.all(x.grad < 0):
+        print("✅ Gradient reversal working correctly")
         return True
-        
-    except Exception as e:
-        print(f"❌ Domain adversarial integration test failed: {e}")
-        import traceback
-        traceback.print_exc()
+    else:
+        print("❌ Gradient reversal not working")
         return False
 
 
-def test_cross_domain_scenario():
-    """Test realistic cross-domain transfer scenario"""
-    print("\n🌍 Testing Cross-Domain Transfer Scenario...")
-    print("-" * 60)
+def demo_domain_classifier():
+    """Demo domain classifier functionality"""
+    print("🎯 Testing Domain Classifier...")
     
-    try:
-        # Simulate cross-domain transfer: Restaurant → Laptop
-        print("📱 Scenario: Restaurant → Laptop domain transfer")
-        
-        # Mock datasets
-        source_domain = "restaurant"
-        target_domain = "laptop"
-        
-        print(f"   Source: {source_domain} domain")
-        print(f"   Target: {target_domain} domain")
-        
-        # Simulate domain IDs
-        domain_mappings = {'restaurant': 0, 'laptop': 1, 'hotel': 2, 'electronics': 3}
-        source_id = domain_mappings[source_domain]
-        target_id = domain_mappings[target_domain]
-        
-        print(f"   Source ID: {source_id}")
-        print(f"   Target ID: {target_id}")
-        
-        # Test gradient reversal strength schedule
-        lambda_schedule = []
-        for epoch in range(10):
-            progress = epoch / 9
-            lambda_grl = progress  # Linear schedule
-            lambda_schedule.append(lambda_grl)
-        
-        print(f"   λ_GRL schedule: {[f'{x:.2f}' for x in lambda_schedule[:5]]}...")
-        
-        # Expected performance gains
-        baseline_f1 = 0.65  # Typical baseline
-        expected_gains = {
-            'implicit_detection': 0.15,
-            'few_shot_learning': 0.10,
-            'cross_domain_transfer': 0.08,
-            'contrastive_learning': 0.05
-        }
-        
-        total_expected_f1 = baseline_f1 + sum(expected_gains.values())
-        
-        print(f"\n📊 Expected Performance:")
-        print(f"   Baseline F1: {baseline_f1:.3f}")
-        for component, gain in expected_gains.items():
-            print(f"   + {component}: +{gain:.3f}")
-        print(f"   = Total Expected F1: {total_expected_f1:.3f}")
-        
-        print("✅ Cross-domain scenario test completed")
+    from models.domain_adversarial import DomainClassifier
+    
+    # Create domain classifier
+    domain_classifier = DomainClassifier(hidden_size=768, num_domains=4)
+    
+    # Test input
+    features = torch.randn(8, 768)  # batch_size=8, hidden_size=768
+    
+    # Forward pass
+    domain_logits = domain_classifier(features, alpha=1.0)
+    
+    # Check output shape
+    if domain_logits.shape == (8, 4):
+        print("✅ Domain classifier output shape correct: (8, 4)")
         return True
-        
-    except Exception as e:
-        print(f"❌ Cross-domain scenario test failed: {e}")
+    else:
+        print(f"❌ Domain classifier output shape incorrect: {domain_logits.shape}")
+        return False
+
+
+def demo_orthogonal_constraint():
+    """Demo orthogonal constraint functionality"""
+    print("📐 Testing Orthogonal Constraint...")
+    
+    from models.domain_adversarial import OrthogonalConstraint
+    
+    # Create orthogonal constraint
+    orthogonal_constraint = OrthogonalConstraint()
+    
+    # Test features from different domains
+    features = torch.randn(12, 256)  # 12 samples, 256 features
+    domain_ids = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3])  # 4 domains, 3 samples each
+    
+    # Compute orthogonal loss
+    orth_loss = orthogonal_constraint(features, domain_ids)
+    
+    if orth_loss.item() >= 0:
+        print(f"✅ Orthogonal constraint computed: {orth_loss.item():.4f}")
+        return True
+    else:
+        print("❌ Orthogonal constraint computation failed")
+        return False
+
+
+def demo_complete_domain_adversarial_module():
+    """Demo complete domain adversarial module"""
+    print("🏗️ Testing Complete Domain Adversarial Module...")
+    
+    # Create config
+    config = create_domain_adversarial_config()
+    config.hidden_size = 768
+    
+    # Create domain adversarial module
+    da_module = DomainAdversarialModule(
+        hidden_size=config.hidden_size,
+        num_domains=config.num_domains,
+        orthogonal_weight=config.orthogonal_loss_weight
+    )
+    
+    # Test input
+    features = torch.randn(8, 20, 768)  # batch, seq_len, hidden_size
+    domain_ids = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])  # Mixed domains
+    
+    # Forward pass
+    outputs = da_module(features, domain_ids, return_losses=True)
+    
+    # Check outputs
+    required_keys = ['domain_logits', 'adapted_features', 'domain_loss', 'orthogonal_loss']
+    missing_keys = [key for key in required_keys if key not in outputs]
+    
+    if not missing_keys:
+        print("✅ Domain adversarial module outputs complete")
+        print(f"   Domain logits shape: {outputs['domain_logits'].shape}")
+        print(f"   Domain loss: {outputs['domain_loss'].item():.4f}")
+        print(f"   Orthogonal loss: {outputs['orthogonal_loss'].item():.4f}")
+        return True
+    else:
+        print(f"❌ Missing outputs: {missing_keys}")
+        return False
+
+
+def demo_unified_model_integration():
+    """Demo unified model with domain adversarial integration"""
+    print("🔗 Testing Unified Model Integration...")
+    
+    # Create config
+    config = create_domain_adversarial_config()
+    config.hidden_size = 768
+    
+    # Create model
+    model = create_unified_absa_model(config)
+    
+    # Test input
+    batch_size = 4
+    seq_len = 16
+    input_ids = torch.randint(0, 1000, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    
+    # Forward pass with dataset name for domain identification
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        dataset_name='laptop14'
+    )
+    
+    # Check that domain adversarial outputs are present
+    if 'domain_outputs' in outputs and outputs['domain_outputs']:
+        domain_outputs = outputs['domain_outputs']
+        print("✅ Domain adversarial integration successful")
+        print(f"   Domain logits shape: {domain_outputs['domain_logits'].shape}")
+        print(f"   Current alpha: {domain_outputs.get('alpha', 'N/A')}")
+        return True
+    else:
+        print("❌ Domain adversarial integration failed")
+        return False
+
+
+def demo_domain_mapping():
+    """Demo domain ID mapping functionality"""
+    print("🗺️ Testing Domain Mapping...")
+    
+    test_datasets = ['laptop14', 'rest14', 'rest15', 'hotel_reviews', 'unknown_dataset']
+    expected_ids = [1, 0, 0, 2, 3]  # Based on DOMAIN_MAPPING
+    
+    all_correct = True
+    for dataset, expected_id in zip(test_datasets, expected_ids):
+        actual_id = get_domain_id(dataset)
+        if actual_id == expected_id:
+            print(f"✅ {dataset} -> Domain {actual_id}")
+        else:
+            print(f"❌ {dataset} -> Domain {actual_id} (expected {expected_id})")
+            all_correct = False
+    
+    return all_correct
+
+
+def demo_loss_computation():
+    """Demo loss computation with domain adversarial components"""
+    print("💰 Testing Loss Computation...")
+    
+    # Create config and model
+    config = create_domain_adversarial_config()
+    config.hidden_size = 768
+    model = create_unified_absa_model(config)
+    
+    # Create mock batch
+    batch_size = 4
+    seq_len = 16
+    
+    # Mock model outputs
+    outputs = {
+        'aspect_logits': torch.randn(batch_size, seq_len, 3),
+        'opinion_logits': torch.randn(batch_size, seq_len, 3),
+        'sentiment_logits': torch.randn(batch_size, seq_len, 3),
+        'domain_outputs': {
+            'domain_logits': torch.randn(batch_size, 4),
+            'domain_loss': torch.tensor(0.5),
+            'orthogonal_loss': torch.tensor(0.3)
+        }
+    }
+    
+    # Mock targets
+    targets = {
+        'aspect_labels': torch.randint(0, 3, (batch_size, seq_len)),
+        'opinion_labels': torch.randint(0, 3, (batch_size, seq_len)),
+        'sentiment_labels': torch.randint(0, 3, (batch_size, seq_len))
+    }
+    
+    # Compute loss
+    total_loss, loss_dict = model.compute_loss(outputs, targets, dataset_name='laptop14')
+    
+    # Check loss components
+    expected_components = ['aspect_loss', 'opinion_loss', 'sentiment_loss', 'domain_loss', 'orthogonal_loss', 'total_loss']
+    present_components = [comp for comp in expected_components if comp in loss_dict]
+    
+    if len(present_components) >= 4:  # At least main losses + some domain losses
+        print("✅ Loss computation successful")
+        print(f"   Total loss: {total_loss.item():.4f}")
+        print(f"   Loss components: {list(loss_dict.keys())}")
+        return True
+    else:
+        print(f"❌ Missing loss components. Present: {present_components}")
+        return False
+
+
+def run_all_demos():
+    """Run all domain adversarial training demos"""
+    print("🚀 Domain Adversarial Training Integration Demo")
+    print("=" * 60)
+    
+    demos = [
+        ("Configuration Integration", test_domain_adversarial_integration),
+        ("Gradient Reversal Layer", demo_gradient_reversal),
+        ("Domain Classifier", demo_domain_classifier),
+        ("Orthogonal Constraint", demo_orthogonal_constraint),
+        ("Complete DA Module", demo_complete_domain_adversarial_module),
+        ("Domain Mapping", demo_domain_mapping),
+        ("Unified Model Integration", demo_unified_model_integration),
+        ("Loss Computation", demo_loss_computation)
+    ]
+    
+    results = []
+    for name, demo_func in demos:
+        print(f"\n🧪 {name}")
+        print("-" * 40)
+        try:
+            success = demo_func()
+            results.append((name, success))
+        except Exception as e:
+            print(f"❌ Demo failed with error: {e}")
+            results.append((name, False))
+    
+    # Summary
+    print("\n📊 Demo Results Summary")
+    print("=" * 60)
+    passed = sum(1 for _, success in results if success)
+    total = len(results)
+    
+    for name, success in results:
+        status = "✅ PASS" if success else "❌ FAIL"
+        print(f"{name:.<40} {status}")
+    
+    print(f"\nOverall: {passed}/{total} demos passed")
+    
+    if passed == total:
+        print("🎉 ALL DEMOS PASSED! Domain adversarial training is ready!")
+        print("\n🚀 Next steps:")
+        print("1. Run training with: python train.py --config domain_adversarial")
+        print("2. Monitor domain confusion metrics during training")
+        print("3. Evaluate cross-domain performance")
+        return True
+    else:
+        print("⚠️ Some demos failed. Please check the implementation.")
         return False
 
 
 if __name__ == "__main__":
-    print("🚀 DOMAIN ADVERSARIAL TRAINING - INTEGRATION TEST")
-    print("="*80)
-    print("Testing complete implementation for 98/100 publication readiness")
-    print()
-    
-    # Run integration test
-    integration_passed = test_domain_adversarial_integration()
-    
-    # Run cross-domain scenario test
-    scenario_passed = test_cross_domain_scenario()
-    
-    print("\n" + "="*80)
-    print("🎯 FINAL TEST RESULTS")
-    print("="*80)
-    
-    if integration_passed and scenario_passed:
-        print("🏆 ALL TESTS PASSED!")
-        print("✅ Domain Adversarial Training: READY")
-        print("✅ Cross-Domain Transfer: READY") 
-        print("✅ Publication Readiness: 98/100")
-        print("\n🚀 Your ABSA system is ready for top-tier publication!")
-        
-    else:
-        print("❌ Some tests failed")
-        if not integration_passed:
-            print("   ❌ Domain adversarial integration needs attention")
-        if not scenario_passed:
-            print("   ❌ Cross-domain scenario needs attention")
-        
-        print("\n💡 Fix the issues above to achieve 98/100 publication readiness")
-    
-    print("="*80)
+    success = run_all_demos()
+    sys.exit(0 if success else 1)
