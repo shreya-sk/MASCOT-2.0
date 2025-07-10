@@ -1,15 +1,26 @@
 # test_instruction_improved.py
 import torch
 from transformers import AutoTokenizer
+<<<<<<< HEAD
 from src.utils.config import LLMGRADIENTConfig
 from src.models.model import GRADIENTModel
+=======
+from src.utils.config import LLMABSAConfig
+from src.models.absa import LLMABSA
+>>>>>>> 4759374cdd56b6504e79b4011c09e61b263436c6
 
 def test_improved_instruction():
     print("🧪 Testing improved InstructABSA...")
     
+<<<<<<< HEAD
     config = LLMGRADIENTConfig()
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     model = GRADIENTModel(config)
+=======
+    config = LLMABSAConfig()
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    model = LLMABSA(config)
+>>>>>>> 4759374cdd56b6504e79b4011c09e61b263436c6
     
     # Test cases
     test_cases = [
