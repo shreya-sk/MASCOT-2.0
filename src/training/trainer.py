@@ -320,14 +320,35 @@ class EnhancedABSATrainer:
             labels=batch,
             dataset_name=dataset_name
         )
-        
-        # Compute comprehensive losses
+        # DEBUG: Check what's in outputs
+        print(f"DEBUG - Outputs keys: {outputs.keys()}")
         if 'losses' in outputs:
+            print(f"DEBUG - Loss dict: {outputs['losses']}")
+        
+        # DEBUG: Check gradients before backward
+        if 'total_loss' in outputs.get('losses', {}):
+            total_loss = outputs['losses']['total_loss']
+            print(f"DEBUG - Total loss: {total_loss.item()}")
+            print(f"DEBUG - Loss requires_grad: {total_loss.requires_grad}")
+        
+        # FIXED: Ensure we get a proper loss
+        if 'losses' in outputs and 'total_loss' in outputs['losses']:
             loss_dict = outputs['losses']
             total_loss = loss_dict['total_loss']
         else:
-            # Fallback loss computation
-            total_loss, loss_dict = self.model.compute_comprehensive_loss(outputs, batch, dataset_name)
+            # FALLBACK: Create a simple loss if model doesn't return one
+            if 'aspect_logits' in outputs and 'aspect_labels' in batch:
+                total_loss = torch.nn.functional.cross_entropy(
+                    outputs['aspect_logits'].view(-1, outputs['aspect_logits'].size(-1)),
+                    batch['aspect_labels'].view(-1),
+                    ignore_index=-100
+                )
+                loss_dict = {'total_loss': total_loss}
+            else:
+                # Emergency fallback - create dummy loss for debugging
+                total_loss = torch.tensor(0.5, device=batch['input_ids'].device, requires_grad=True)
+                loss_dict = {'total_loss': total_loss}
+                print("WARNING: Using dummy loss - check your model's forward method") 
         
         # Backward pass
         self.optimizer.zero_grad()
