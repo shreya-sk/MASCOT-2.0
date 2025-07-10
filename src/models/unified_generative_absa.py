@@ -1,5 +1,15 @@
 # src/models/unified_generative_absa.py
 """
+import sys
+from pathlib import Path
+
+# Add src to path for imports
+current_dir = Path(__file__).parent
+src_dir = current_dir.parent if current_dir.name == 'training' else current_dir.parent.parent if current_dir.name in ['models', 'data', 'utils'] else current_dir / 'src'
+if src_dir.name != 'src':
+    src_dir = src_dir / 'src'
+sys.path.insert(0, str(src_dir))
+
 Unified Generative Framework for ABSA
 Transforms your existing ABSA system into a complete generative framework
 that handles all subtasks through sequence-to-sequence generation
@@ -22,7 +32,7 @@ import json
 from dataclasses import dataclass
 
 from .absa import LLMABSA  # Your existing model
-from ..data.dataset import ABSADataset  # Your existing dataset
+from data.dataset import ABSADataset  # Your existing dataset
 
 
 @dataclass

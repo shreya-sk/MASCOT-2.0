@@ -15,7 +15,7 @@ sys.path.insert(0, str(src_path))
 from utils.config import create_domain_adversarial_config, test_domain_adversarial_integration
 from models.unified_absa_model import create_unified_absa_model
 from models.domain_adversarial import DomainAdversarialModule, get_domain_id
-from training.domain_adversarial_trainer import DomainAdversarialABSATrainer
+from training.domain_adversarial import DomainAdversarialABSATrainer
 
 
 def demo_gradient_reversal():

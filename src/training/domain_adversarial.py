@@ -1,7 +1,7 @@
 # src/training/domain_adversarial_trainer.py
 """
 Domain Adversarial Trainer Integration
-Integrates domain adversarial training into main training pipeline
+Fixed imports for standalone execution
 """
 
 import torch
@@ -16,15 +16,35 @@ from typing import Dict, List, Optional, Any
 from tqdm import tqdm
 import logging
 import numpy as np
+import sys
+from pathlib import Path
 
-from ..models.unified_absa_model import UnifiedABSAModel
-from ..models.domain_adversarial import get_domain_id
+# Add src to path for absolute imports
+current_dir = Path(__file__).parent
+src_dir = current_dir.parent
+sys.path.insert(0, str(src_dir))
+
+# Fixed imports using absolute paths
+try:
+    from models.unified_absa_model import UnifiedABSAModel
+    from models.domain_adversarial import get_domain_id
+except ImportError:
+    # Alternative import path
+    try:
+        from src.models.unified_absa_model import UnifiedABSAModel
+        from src.models.domain_adversarial import get_domain_id
+    except ImportError:
+        # If running from project root
+        import sys
+        sys.path.append('src')
+        from models.unified_absa_model import UnifiedABSAModel
+        from models.domain_adversarial import get_domain_id
 
 
 class DomainAdversarialABSATrainer:
     """
     ABSA Trainer with Domain Adversarial Training Integration
-    Extends the main trainer with domain adversarial capabilities
+    Fixed import version for standalone execution
     """
     
     def __init__(self, model: UnifiedABSAModel, config, train_dataloader, eval_dataloader=None):
@@ -37,16 +57,16 @@ class DomainAdversarialABSATrainer:
         self.use_domain_adversarial = getattr(config, 'use_domain_adversarial', True)
         self.domain_loss_weight = getattr(config, 'domain_loss_weight', 0.1)
         self.orthogonal_loss_weight = getattr(config, 'orthogonal_loss_weight', 0.1)
-        self.alpha_schedule = getattr(config, 'alpha_schedule', 'progressive')  # 'progressive', 'fixed', 'cosine'
+        self.alpha_schedule = getattr(config, 'alpha_schedule', 'progressive')
         
         # Setup optimizer with domain adversarial components
         self.optimizer = self._setup_domain_adversarial_optimizer()
         
         # Setup scheduler
-        total_steps = len(train_dataloader) * config.num_epochs
+        total_steps = len(train_dataloader) * getattr(config, 'num_epochs', 10)
         self.scheduler = get_linear_schedule_with_warmup(
             self.optimizer,
-            num_warmup_steps=config.warmup_steps,
+            num_warmup_steps=getattr(config, 'warmup_steps', int(0.1 * total_steps)),
             num_training_steps=total_steps
         )
         
@@ -62,7 +82,8 @@ class DomainAdversarialABSATrainer:
         self.alpha_history = []
         
         # Output directory
-        self.output_dir = config.get_experiment_dir()
+        self.output_dir = getattr(config, 'output_dir', 'outputs/domain_adversarial')
+        os.makedirs(self.output_dir, exist_ok=True)
         
         # Setup logging
         logging.basicConfig(level=logging.INFO)
@@ -94,12 +115,12 @@ class DomainAdversarialABSATrainer:
         param_groups = [
             {
                 'params': backbone_params,
-                'lr': self.config.learning_rate * 0.1,  # Lower LR for backbone
+                'lr': getattr(self.config, 'learning_rate', 2e-5) * 0.1,  # Lower LR for backbone
                 'name': 'backbone'
             },
             {
                 'params': task_params,
-                'lr': self.config.learning_rate,
+                'lr': getattr(self.config, 'learning_rate', 2e-5),
                 'name': 'task_specific'
             }
         ]
@@ -108,7 +129,7 @@ class DomainAdversarialABSATrainer:
         if self.use_domain_adversarial and domain_params:
             param_groups.append({
                 'params': domain_params,
-                'lr': self.config.learning_rate * 2.0,  # Higher LR for domain components
+                'lr': getattr(self.config, 'learning_rate', 2e-5) * 2.0,  # Higher LR for domain components
                 'name': 'domain_adversarial'
             })
         
@@ -117,7 +138,7 @@ class DomainAdversarialABSATrainer:
         
         optimizer = AdamW(
             param_groups,
-            lr=self.config.learning_rate,
+            lr=getattr(self.config, 'learning_rate', 2e-5),
             weight_decay=getattr(self.config, 'weight_decay', 0.01),
             eps=1e-8
         )
@@ -142,19 +163,12 @@ class DomainAdversarialABSATrainer:
     def train_step(self, batch: Dict[str, torch.Tensor], dataset_name: str) -> Dict[str, float]:
         """
         Single training step with domain adversarial training
-        
-        Args:
-            batch: Training batch
-            dataset_name: Name of dataset for domain identification
-            
-        Returns:
-            Dictionary of losses and metrics
         """
         self.model.train()
         
         # Update alpha for gradient reversal
-        current_alpha = self._get_current_alpha(self.epoch, self.config.num_epochs)
-        if self.model.domain_adversarial:
+        current_alpha = self._get_current_alpha(self.epoch, getattr(self.config, 'num_epochs', 10))
+        if hasattr(self.model, 'domain_adversarial') and self.model.domain_adversarial:
             self.model.domain_adversarial.current_alpha = current_alpha
         
         # Forward pass with dataset name for domain identification
@@ -166,7 +180,12 @@ class DomainAdversarialABSATrainer:
         )
         
         # Compute losses
-        total_loss, loss_dict = self.model.compute_loss(outputs, batch, dataset_name)
+        if hasattr(self.model, 'compute_comprehensive_loss'):
+            total_loss, loss_dict = self.model.compute_comprehensive_loss(outputs, batch, dataset_name)
+        else:
+            # Fallback loss computation
+            total_loss = outputs.get('losses', {}).get('total_loss', torch.tensor(0.0))
+            loss_dict = outputs.get('losses', {'total_loss': total_loss})
         
         # Add domain adversarial specific metrics
         if 'domain_outputs' in outputs and outputs['domain_outputs']:
@@ -199,31 +218,34 @@ class DomainAdversarialABSATrainer:
         # Update global step
         self.global_step += 1
         
-        return loss_dict
+        # Convert tensor values to floats for logging
+        log_dict = {}
+        for key, value in loss_dict.items():
+            if isinstance(value, torch.Tensor):
+                log_dict[key] = value.item()
+            else:
+                log_dict[key] = value
+        
+        return log_dict
     
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """
         Train one epoch with domain adversarial training
-        
-        Args:
-            epoch: Current epoch number
-            
-        Returns:
-            Dictionary of average losses and metrics
         """
         self.epoch = epoch
-        self.model.update_training_progress(epoch, self.config.num_epochs)
+        if hasattr(self.model, 'update_training_progress'):
+            self.model.update_training_progress(epoch, getattr(self.config, 'num_epochs', 10))
         
         epoch_losses = {}
-        epoch_metrics = {}
         num_batches = 0
         
         # Progress bar
-        pbar = tqdm(self.train_dataloader, desc=f'Epoch {epoch+1}/{self.config.num_epochs}')
+        pbar = tqdm(self.train_dataloader, desc=f'Epoch {epoch+1}/{getattr(self.config, "num_epochs", 10)}')
         
         for batch_idx, batch in enumerate(pbar):
             # Move batch to device
-            batch = {k: v.to(self.model.device) if torch.is_tensor(v) else v 
+            device = next(self.model.parameters()).device
+            batch = {k: v.to(device) if torch.is_tensor(v) else v 
                     for k, v in batch.items()}
             
             # Get dataset name (this should be provided in your dataloader)
@@ -274,25 +296,17 @@ class DomainAdversarialABSATrainer:
     def evaluate_epoch(self, dataloader, epoch: int) -> Dict[str, float]:
         """
         Evaluate model with domain adversarial metrics
-        
-        Args:
-            dataloader: Evaluation dataloader
-            epoch: Current epoch
-            
-        Returns:
-            Dictionary of evaluation metrics
         """
         self.model.eval()
         
         eval_losses = {}
-        all_predictions = []
-        all_targets = []
         domain_confusion_matrix = np.zeros((4, 4))  # 4 domains
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc='Evaluating'):
                 # Move batch to device
-                batch = {k: v.to(self.model.device) if torch.is_tensor(v) else v 
+                device = next(self.model.parameters()).device
+                batch = {k: v.to(device) if torch.is_tensor(v) else v 
                         for k, v in batch.items()}
                 
                 dataset_name = batch.get('dataset_name', 'general')
@@ -308,13 +322,19 @@ class DomainAdversarialABSATrainer:
                 )
                 
                 # Compute losses
-                total_loss, loss_dict = self.model.compute_loss(outputs, batch, dataset_name)
+                if hasattr(self.model, 'compute_comprehensive_loss'):
+                    total_loss, loss_dict = self.model.compute_comprehensive_loss(outputs, batch, dataset_name)
+                else:
+                    loss_dict = outputs.get('losses', {'total_loss': torch.tensor(0.0)})
                 
                 # Accumulate losses
                 for loss_name, loss_value in loss_dict.items():
                     if loss_name not in eval_losses:
                         eval_losses[loss_name] = []
-                    eval_losses[loss_name].append(loss_value.item() if torch.is_tensor(loss_value) else loss_value)
+                    if isinstance(loss_value, torch.Tensor):
+                        eval_losses[loss_name].append(loss_value.item())
+                    else:
+                        eval_losses[loss_name].append(loss_value)
                 
                 # Track domain confusion for analysis
                 if 'domain_outputs' in outputs and 'domain_logits' in outputs['domain_outputs']:
@@ -323,14 +343,20 @@ class DomainAdversarialABSATrainer:
                     pred_domain_ids = domain_logits.argmax(dim=-1).cpu().numpy()
                     
                     for pred_id in pred_domain_ids:
-                        domain_confusion_matrix[true_domain_id, pred_id] += 1
+                        if 0 <= true_domain_id < 4 and 0 <= pred_id < 4:
+                            domain_confusion_matrix[true_domain_id, pred_id] += 1
         
         # Calculate average losses
         avg_eval_losses = {name: np.mean(losses) for name, losses in eval_losses.items()}
         
         # Calculate domain confusion metrics
-        domain_accuracy = np.trace(domain_confusion_matrix) / np.sum(domain_confusion_matrix)
-        domain_confusion_score = 1.0 - domain_accuracy  # Higher confusion is better for adversarial training
+        total_predictions = np.sum(domain_confusion_matrix)
+        if total_predictions > 0:
+            domain_accuracy = np.trace(domain_confusion_matrix) / total_predictions
+            domain_confusion_score = 1.0 - domain_accuracy  # Higher confusion is better for adversarial training
+        else:
+            domain_accuracy = 0.0
+            domain_confusion_score = 0.0
         
         # Add domain adversarial specific metrics
         avg_eval_losses['domain_confusion_score'] = domain_confusion_score
@@ -341,15 +367,12 @@ class DomainAdversarialABSATrainer:
     def train(self) -> Dict[str, Any]:
         """
         Main training loop with domain adversarial training
-        
-        Returns:
-            Training results and best model info
         """
         print("🚀 Starting Domain Adversarial ABSA Training...")
-        print(f"   Model: {self.config.model_name}")
-        print(f"   Epochs: {self.config.num_epochs}")
-        print(f"   Batch size: {self.config.batch_size}")
-        print(f"   Learning rate: {self.config.learning_rate}")
+        print(f"   Model: {getattr(self.config, 'model_name', 'Unknown')}")
+        print(f"   Epochs: {getattr(self.config, 'num_epochs', 10)}")
+        print(f"   Batch size: {getattr(self.config, 'batch_size', 16)}")
+        print(f"   Learning rate: {getattr(self.config, 'learning_rate', 2e-5)}")
         
         if self.use_domain_adversarial:
             print(f"   🎯 Domain Adversarial Features:")
@@ -365,15 +388,16 @@ class DomainAdversarialABSATrainer:
             'best_model_path': None,
             'training_history': [],
             'domain_adversarial_history': {
-                'domain_losses': [],
-                'orthogonal_losses': [],
-                'alpha_values': [],
+                'domain_losses': self.domain_loss_history,
+                'orthogonal_losses': self.orthogonal_loss_history,
+                'alpha_values': self.alpha_history,
                 'confusion_scores': []
             }
         }
         
         # Training loop
-        for epoch in range(self.config.num_epochs):
+        num_epochs = getattr(self.config, 'num_epochs', 10)
+        for epoch in range(num_epochs):
             # Training phase
             train_losses = self.train_epoch(epoch)
             training_results['training_history'].append(train_losses)
@@ -383,7 +407,7 @@ class DomainAdversarialABSATrainer:
                 eval_metrics = self.evaluate_epoch(self.eval_dataloader, epoch)
                 
                 # Check for best model (you may want to use different metric)
-                current_f1 = eval_metrics.get('f1', 0.0)  # Placeholder - use actual F1
+                current_f1 = eval_metrics.get('accuracy', eval_metrics.get('total_loss', 0.0))
                 if current_f1 > training_results['best_f1']:
                     training_results['best_f1'] = current_f1
                     training_results['best_epoch'] = epoch
@@ -393,8 +417,14 @@ class DomainAdversarialABSATrainer:
                     self.save_model(best_model_path)
                     training_results['best_model_path'] = best_model_path
                 
+                # Track domain confusion
+                if 'domain_confusion_score' in eval_metrics:
+                    training_results['domain_adversarial_history']['confusion_scores'].append(
+                        eval_metrics['domain_confusion_score']
+                    )
+                
                 # Log results
-                self.logger.info(f"Epoch {epoch+1}/{self.config.num_epochs}")
+                self.logger.info(f"Epoch {epoch+1}/{num_epochs}")
                 self.logger.info(f"  Train Loss: {train_losses.get('total_loss', 0):.4f}")
                 self.logger.info(f"  Eval Loss: {eval_metrics.get('total_loss', 0):.4f}")
                 

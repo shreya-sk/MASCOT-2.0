@@ -1,4 +1,14 @@
 """
+import sys
+from pathlib import Path
+
+# Add src to path for imports
+current_dir = Path(__file__).parent
+src_dir = current_dir.parent if current_dir.name == 'training' else current_dir.parent.parent if current_dir.name in ['models', 'data', 'utils'] else current_dir / 'src'
+if src_dir.name != 'src':
+    src_dir = src_dir / 'src'
+sys.path.insert(0, str(src_dir))
+
 Contrastive Training Pipeline for ABSA
 Integrates all contrastive learning components for 2024-2025 breakthrough training
 """
@@ -20,7 +30,7 @@ from .contrastive_losses import (
     SupervisedContrastiveLoss
 )
 from .negative_sampling import NegativeSamplingManager
-from ..models.implicit_sentiment_detector import ContrastiveImplicitABSA
+from models.implicit_sentiment_detector import ContrastiveImplicitABSA
 
 
 class ContrastiveABSATrainer:

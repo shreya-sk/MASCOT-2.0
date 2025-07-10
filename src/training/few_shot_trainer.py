@@ -1,5 +1,15 @@
 # src/training/few_shot_trainer.py
 """
+import sys
+from pathlib import Path
+
+# Add src to path for imports
+current_dir = Path(__file__).parent
+src_dir = current_dir.parent if current_dir.name == 'training' else current_dir.parent.parent if current_dir.name in ['models', 'data', 'utils'] else current_dir / 'src'
+if src_dir.name != 'src':
+    src_dir = src_dir / 'src'
+sys.path.insert(0, str(src_dir))
+
 Few-Shot Learning Training Integration for ABSA
 Integrates few-shot learning components into main training pipeline
 """
@@ -13,7 +23,7 @@ from tqdm import tqdm
 import logging
 from collections import defaultdict
 
-from ..models.few_shot_learner import (
+from models.few_shot_learner import (
     CompleteFewShotABSA, 
     FewShotEvaluator,
     DualRelationsPropagation,

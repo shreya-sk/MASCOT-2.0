@@ -1,5 +1,15 @@
 # src/models/enhanced_absa_model_complete.py
 """
+import sys
+from pathlib import Path
+
+# Add src to path for imports
+current_dir = Path(__file__).parent
+src_dir = current_dir.parent if current_dir.name == 'training' else current_dir.parent.parent if current_dir.name in ['models', 'data', 'utils'] else current_dir / 'src'
+if src_dir.name != 'src':
+    src_dir = src_dir / 'src'
+sys.path.insert(0, str(src_dir))
+
 Complete Enhanced ABSA Model with Full Implicit Sentiment Detection Integration
 This file replaces/updates your existing enhanced_absa_model.py with complete implicit detection
 """
@@ -14,8 +24,8 @@ from transformers import AutoModel, AutoTokenizer
 from .contrastive_absa_model import ContrastiveABSAModel
 from .few_shot_learner import CompleteFewShotABSA
 from .complete_implicit_detector import CompleteImplicitDetector
-from ..training.contrastive_losses import SupervisedContrastiveLoss
-from ..training.implicit_losses import ImplicitDetectionLoss
+from training.contrastive_losses import SupervisedContrastiveLoss
+from training.implicit_losses import ImplicitDetectionLoss
 
 
 class EnhancedABSAModelComplete(nn.Module):

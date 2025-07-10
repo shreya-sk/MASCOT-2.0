@@ -1,5 +1,15 @@
 # src/training/generative_trainer.py
 """
+import sys
+from pathlib import Path
+
+# Add src to path for imports
+current_dir = Path(__file__).parent
+src_dir = current_dir.parent if current_dir.name == 'training' else current_dir.parent.parent if current_dir.name in ['models', 'data', 'utils'] else current_dir / 'src'
+if src_dir.name != 'src':
+    src_dir = src_dir / 'src'
+sys.path.insert(0, str(src_dir))
+
 Generative Training Pipeline for ABSA
 Specialized trainer for sequence-to-sequence generative models
 """
@@ -22,7 +32,7 @@ import json
 from .trainer import ABSATrainer  # Your existing trainer
 from .generative_losses import GenerativeLoss, TripletRecoveryLoss
 from .generative_metrics import GenerativeMetrics
-from ..models.unified_generative_absa import UnifiedGenerativeABSA
+from models.unified_generative_absa import UnifiedGenerativeABSA
 
 
 class GenerativeABSATrainer:

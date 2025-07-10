@@ -1344,3 +1344,43 @@ def create_complete_unified_absa_model(config):
 def create_unified_absa_model(config):
     """Backwards compatible factory function"""
     return create_complete_unified_absa_model(config)
+
+# Add this method to your UnifiedABSAModel class in unified_absa_model.py
+# Or create a patch file
+
+def add_compute_loss_method():
+    """
+    Add the missing compute_loss method to UnifiedABSAModel
+    """
+    
+    def compute_loss(self, outputs, targets, dataset_name=None):
+        """
+        Simple compute_loss method for compatibility
+        This just calls the comprehensive loss function
+        """
+        return self.compute_comprehensive_loss(outputs, targets, dataset_name)
+    
+    # Try to patch the existing model
+    try:
+        import sys
+        from pathlib import Path
+        
+        # Add src to path
+        current_dir = Path(__file__).parent
+        src_dir = current_dir / 'src' if (current_dir / 'src').exists() else current_dir.parent / 'src'
+        sys.path.insert(0, str(src_dir))
+        
+        from models.unified_absa_model import UnifiedABSAModel
+        
+        # Add the method
+        UnifiedABSAModel.compute_loss = compute_loss
+        
+        print("✅ Model patched with compute_loss method")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Model patch failed: {e}")
+        return False
+
+if __name__ == "__main__":
+    add_compute_loss_method()

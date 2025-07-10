@@ -1,5 +1,15 @@
 # src/training/trainer.py
 """
+import sys
+from pathlib import Path
+
+# Add src to path for imports
+current_dir = Path(__file__).parent
+src_dir = current_dir.parent if current_dir.name == 'training' else current_dir.parent.parent if current_dir.name in ['models', 'data', 'utils'] else current_dir / 'src'
+if src_dir.name != 'src':
+    src_dir = src_dir / 'src'
+sys.path.insert(0, str(src_dir))
+
 Corrected unified training pipeline with complete domain adversarial integration
 Fixes all integration issues and supports all sophisticated features
 """
@@ -17,8 +27,8 @@ from tqdm import tqdm
 import logging
 import numpy as np
 
-from ..data.dataset import load_datasets, create_dataloaders
-from ..models.unified_absa_model import create_complete_unified_absa_model
+from data.dataset import load_datasets, create_dataloaders
+from models.unified_absa_model import create_complete_unified_absa_model
 from .domain_adversarial_trainer import DomainAdversarialABSATrainer
 
 

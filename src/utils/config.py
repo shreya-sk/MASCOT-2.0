@@ -1,5 +1,15 @@
 # src/data/clean_dataset.py
 """
+import sys
+from pathlib import Path
+
+# Add src to path for imports
+current_dir = Path(__file__).parent
+src_dir = current_dir.parent if current_dir.name == 'training' else current_dir.parent.parent if current_dir.name in ['models', 'data', 'utils'] else current_dir / 'src'
+if src_dir.name != 'src':
+    src_dir = src_dir / 'src'
+sys.path.insert(0, str(src_dir))
+
 Clean, simplified dataset handler
 Replaces complex dataset implementations with working version
 """
@@ -366,7 +376,7 @@ def test_domain_adversarial_integration():
     
     # Test model creation
     try:
-        from ..models.unified_absa_model import create_unified_absa_model
+        from models.unified_absa_model import create_unified_absa_model
         model = create_unified_absa_model(dev_config)
         
         if hasattr(model, 'domain_adversarial') and model.domain_adversarial is not None:
@@ -404,3 +414,57 @@ def add_domain_adversarial_to_config(config):
     
     print("✅ Domain adversarial settings added to existing config")
     return config
+
+# Quick fix for src/utils/config.py
+# Add these lines to your ABSAConfig class or create a patch
+
+def patch_config():
+    """
+    Quick patch to add missing domain adversarial attributes to existing config
+    """
+    
+    import sys
+    from pathlib import Path
+    
+    # Add src to path
+    current_dir = Path(__file__).parent
+    src_dir = current_dir / 'src' if (current_dir / 'src').exists() else current_dir.parent / 'src'
+    sys.path.insert(0, str(src_dir))
+    
+    try:
+        from utils.config import ABSAConfig
+        
+        # Add missing attributes to ABSAConfig class
+        def add_domain_adversarial_attrs(self):
+            """Add domain adversarial attributes if missing"""
+            if not hasattr(self, 'num_domains'):
+                self.num_domains = 4
+            if not hasattr(self, 'use_domain_adversarial'):
+                self.use_domain_adversarial = True
+            if not hasattr(self, 'domain_loss_weight'):
+                self.domain_loss_weight = 0.1
+            if not hasattr(self, 'orthogonal_loss_weight'):
+                self.orthogonal_loss_weight = 0.1
+            if not hasattr(self, 'alpha_schedule'):
+                self.alpha_schedule = 'progressive'
+            if not hasattr(self, 'domain_mapping'):
+                self.domain_mapping = {
+                    'restaurant': 0, 'rest14': 0, 'rest15': 0, 'rest16': 0,
+                    'laptop': 1, 'laptop14': 1, 'laptop15': 1, 'laptop16': 1,
+                    'hotel': 2, 'hotel_reviews': 2,
+                    'general': 3
+                }
+            return self
+        
+        # Monkey patch the method
+        ABSAConfig.add_domain_adversarial_attrs = add_domain_adversarial_attrs
+        
+        print("✅ Config patched successfully")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Config patch failed: {e}")
+        return False
+
+if __name__ == "__main__":
+    patch_config()

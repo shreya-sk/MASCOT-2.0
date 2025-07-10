@@ -16,9 +16,19 @@ from datetime import datetime
 from .metrics import enhanced_compute_triplet_metrics_with_bench
 from .losses import EnhancedABSALoss
 from .metrics import compute_metrics, compute_triplet_recovery_score, generate_evaluation_report
-from ..models.absa import LLMABSA
-from ..utils.config import LLMABSAConfig
+from models.absa import LLMABSA
+from utils.config import LLMABSAConfig
 
+
+import sys
+from pathlib import Path
+
+# Add src to path for imports
+current_dir = Path(__file__).parent
+src_dir = current_dir.parent if current_dir.name == 'training' else current_dir.parent.parent if current_dir.name in ['models', 'data', 'utils'] else current_dir / 'src'
+if src_dir.name != 'src':
+    src_dir = src_dir / 'src'
+sys.path.insert(0, str(src_dir))
 
 class EnhancedABSATrainer:
     """
