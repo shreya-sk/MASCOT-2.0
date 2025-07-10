@@ -475,3 +475,82 @@ GRADIENTConfigEnhanced = LLMGRADIENTConfig
 # Backward compatibility aliases
 ABSAConfig = GRADIENTConfig
 GRADIENTModelConfig = GRADIENTConfig
+
+
+def create_development_config():
+    """Create development configuration for GRADIENT"""
+    config = ABSAConfig()
+    
+    # Development settings
+    config.batch_size = 4
+    config.num_epochs = 5
+    config.learning_rate = 3e-5
+    config.max_seq_length = 128
+    
+    # Enable key GRADIENT features
+    config.use_implicit_detection = True
+    config.use_few_shot_learning = True
+    config.use_contrastive_learning = True
+    config.use_domain_adversarial = True
+    config.use_generative_framework = False  # Disable for faster training
+    
+    # Multi-domain datasets for adversarial training
+    config.datasets = ['laptop14', 'rest14']
+    config.experiment_name = "gradient_dev"
+    
+    print("✅ Development config created with GRADIENT features")
+    return config
+
+
+def create_research_config():
+    """Create research configuration with all GRADIENT features"""
+    config = ABSAConfig()
+    
+    # Research settings
+    config.batch_size = 8
+    config.num_epochs = 25
+    config.learning_rate = 1e-5
+    config.max_seq_length = 256
+    
+    # Enable ALL GRADIENT features
+    config.use_implicit_detection = True
+    config.use_few_shot_learning = True
+    config.use_contrastive_learning = True
+    config.use_domain_adversarial = True
+    config.use_generative_framework = True
+    
+    # Full multi-domain training
+    config.datasets = ['laptop14', 'rest14', 'rest15', 'rest16']
+    config.experiment_name = "gradient_research"
+    
+    print("✅ Research config created with all GRADIENT features")
+    return config
+
+
+def create_domain_adversarial_config():
+    """Create specialized config for domain adversarial training"""
+    config = ABSAConfig()
+    
+    # Optimized for domain adversarial training
+    config.batch_size = 16
+    config.num_epochs = 15
+    config.learning_rate = 2e-5
+    
+    # Focus on domain adversarial features
+    config.use_implicit_detection = True
+    config.use_domain_adversarial = True
+    config.use_contrastive_learning = True
+    config.use_few_shot_learning = False  # Focus on domain transfer
+    config.use_generative_framework = False
+    
+    # Maximum domain diversity
+    config.datasets = ['laptop14', 'rest14', 'rest15', 'rest16']
+    config.experiment_name = "gradient_domain_adversarial"
+    
+    # Domain adversarial specific settings
+    config.domain_loss_weight = 0.15
+    config.orthogonal_loss_weight = 0.1
+    config.alpha_schedule = 'progressive'
+    
+    print("✅ Domain adversarial config created")
+    return config
