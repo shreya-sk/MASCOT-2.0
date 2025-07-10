@@ -1,36 +1,25 @@
-# final_fixes.py
-"""
-Final fixes for the domain adversarial integration
-This will fix both issues and get you to 8/8 tests passing
-"""
-
-import os
-from pathlib import Path
-import shutil
-
-def fix_config_file():
-    """Replace the messy config file with a clean one"""
-    
-    config_file = Path('src/utils/config.py')
-    
-    if not config_file.exists():
-        print(f"❌ Config file not found: {config_file}")
-        return False
-    
-    # Create backup
-    backup_file = config_file.with_suffix('.py.backup')
-    shutil.copy2(config_file, backup_file)
-    print(f"📋 Backup created: {backup_file}")
-    
-    # Write clean config
-    clean_config = '''# src/utils/config.py
+# src/utils/config.py
 """
 Clean, unified ABSA configuration with domain adversarial training
+Fixed version - replaces the messy config file
 """
 
+import sys
+from pathlib import Path
+
+# Add src to path for imports
+current_dir = Path(__file__).parent
+src_dir = current_dir.parent if current_dir.name == 'training' else current_dir.parent.parent if current_dir.name in ['models', 'data', 'utils'] else current_dir / 'src'
+if src_dir.name != 'src':
+    src_dir = src_dir / 'src'
+sys.path.insert(0, str(src_dir))
+
 import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
 import os
-from typing import List, Dict, Optional, Any
+import json
+from typing import List, Dict, Tuple, Optional, Any
 from dataclasses import dataclass, field
 
 
@@ -321,177 +310,3 @@ def get_domain_id(dataset_name: str) -> int:
         'general': 3
     }
     return domain_mapping.get(dataset_name.lower(), 3)
-'''
-    
-    with open(config_file, 'w') as f:
-        f.write(clean_config)
-    
-    print("✅ Replaced messy config with clean version")
-    return True
-
-
-def fix_unified_model():
-    """Add missing compute_loss method to UnifiedABSAModel"""
-    
-    model_file = Path('src/models/unified_absa_model.py')
-    
-    if not model_file.exists():
-        print(f"❌ Model file not found: {model_file}")
-        return False
-    
-    # Read current content
-    with open(model_file, 'r') as f:
-        content = f.read()
-    
-    # Check if already fixed
-    if 'def compute_loss(' in content:
-        print("✅ UnifiedABSAModel already has compute_loss method")
-        return True
-    
-    # Find where to insert the method (after _compute_losses method)
-    lines = content.split('\n')
-    new_lines = []
-    inserted = False
-    
-    for i, line in enumerate(lines):
-        new_lines.append(line)
-        
-        # Insert after the _compute_losses method ends
-        if line.strip() == 'return losses' and not inserted:
-            # Check if this is the end of _compute_losses
-            prev_lines = [lines[j].strip() for j in range(max(0, i-10), i)]
-            if any('def _compute_losses(' in pline for pline in prev_lines):
-                compute_loss_method = [
-                    "",
-                    "    def compute_loss(self, outputs, targets, dataset_name=None):",
-                    "        \"\"\"",
-                    "        Compatibility method for compute_loss",
-                    "        Calls the internal _compute_losses method",
-                    "        \"\"\"",
-                    "        return self._compute_losses(outputs, targets)",
-                    ""
-                ]
-                new_lines.extend(compute_loss_method)
-                inserted = True
-    
-    if not inserted:
-        # Try to insert before predict_triplets method
-        new_lines = []
-        for i, line in enumerate(lines):
-            if line.strip().startswith('def predict_triplets(') and not inserted:
-                compute_loss_method = [
-                    "    def compute_loss(self, outputs, targets, dataset_name=None):",
-                    "        \"\"\"",
-                    "        Compatibility method for compute_loss",
-                    "        Calls the internal _compute_losses method", 
-                    "        \"\"\"",
-                    "        return self._compute_losses(outputs, targets)",
-                    "",
-                    ""
-                ]
-                new_lines.extend(compute_loss_method)
-                inserted = True
-            new_lines.append(line)
-    
-    if inserted:
-        # Write back the modified content
-        new_content = '\n'.join(new_lines)
-        with open(model_file, 'w') as f:
-            f.write(new_content)
-        
-        print("✅ Added compute_loss method to UnifiedABSAModel")
-        return True
-    else:
-        print("❌ Could not find insertion point in UnifiedABSAModel")
-        print("   Trying alternative approach...")
-        
-        # Alternative: append at end of class
-        lines = content.split('\n')
-        
-        # Find the last method in UnifiedABSAModel class
-        in_unified_class = False
-        last_method_line = -1
-        
-        for i, line in enumerate(lines):
-            if 'class UnifiedABSAModel(' in line:
-                in_unified_class = True
-            elif line.startswith('class ') and in_unified_class:
-                break
-            elif in_unified_class and line.strip().startswith('def '):
-                last_method_line = i
-        
-        if last_method_line > 0:
-            # Find the end of the last method
-            indent_level = len(lines[last_method_line]) - len(lines[last_method_line].lstrip())
-            
-            for j in range(last_method_line + 1, len(lines)):
-                if (lines[j].strip() and 
-                    not lines[j].startswith(' ' * (indent_level + 1)) and
-                    not lines[j].strip().startswith('#') and
-                    not lines[j].strip().startswith('"""') and
-                    not lines[j].strip().startswith("'''")
-                   ):
-                    # Insert before this line
-                    compute_loss_method = [
-                        "",
-                        "    def compute_loss(self, outputs, targets, dataset_name=None):",
-                        "        \"\"\"",
-                        "        Compatibility method for compute_loss",
-                        "        Calls the internal _compute_losses method",
-                        "        \"\"\"",
-                        "        return self._compute_losses(outputs, targets)",
-                        ""
-                    ]
-                    
-                    new_lines = lines[:j] + compute_loss_method + lines[j:]
-                    new_content = '\n'.join(new_lines)
-                    
-                    with open(model_file, 'w') as f:
-                        f.write(new_content)
-                    
-                    print("✅ Added compute_loss method to UnifiedABSAModel (alternative approach)")
-                    return True
-        
-        print("❌ Could not add compute_loss method automatically")
-        return False
-
-
-def main():
-    """Run all final fixes"""
-    
-    print("🔧 Final Fixes for Domain Adversarial Integration")
-    print("=" * 60)
-    
-    # Fix 1: Clean up the messy config file
-    print("\\n1. Fixing config file...")
-    config_fixed = fix_config_file()
-    
-    # Fix 2: Add missing compute_loss method
-    print("\\n2. Fixing UnifiedABSAModel...")
-    model_fixed = fix_unified_model()
-    
-    # Summary
-    print(f"\\n📊 Final Fix Results:")
-    print(f"   Config fixed: {'✅' if config_fixed else '❌'}")
-    print(f"   Model fixed: {'✅' if model_fixed else '❌'}")
-    
-    if config_fixed and model_fixed:
-        print(f"\\n🎉 All fixes completed successfully!")
-        print(f"🧪 Now run: python test_domain.py")
-        print(f"✨ Expected result: 8/8 demos passed")
-        print(f"🚀 Then run: python train.py --config dev")
-    else:
-        print(f"\\n⚠️ Some fixes failed.")
-        
-        if not model_fixed:
-            print("\\n📋 Manual model fix needed:")
-            print("Add this method to your UnifiedABSAModel class:")
-            print("```python")
-            print("def compute_loss(self, outputs, targets, dataset_name=None):")
-            print('    """Compatibility method for compute_loss"""')
-            print("    return self._compute_losses(outputs, targets)")
-            print("```")
-
-
-if __name__ == "__main__":
-    main()
