@@ -11,9 +11,10 @@ from typing import Dict, List, Tuple, Optional, Any, Union
 import numpy as np
 from transformers import AutoModel, AutoTokenizer, T5ForConditionalGeneration
 import json
+from .domain_adversarial import DomainAdversarialModule, get_domain_id
 
 # Import domain adversarial components
-from .domain_adversarial import DomainAdversarialModule, get_domain_id
+
 
 
 class ImplicitDetectionModule(nn.Module):
@@ -475,126 +476,144 @@ class GenerativeABSAModule(nn.Module):
         # Constrained vocabulary projection
         self.vocab_projection = nn.Linear(self.t5_model.config.d_model, self.t5_model.config.vocab_size)
     
-    def forward(self, hidden_states, input_ids, task_type='triplet_extraction', target_text=None):
-        if not self.available:
-            return {'available': False, 'loss': torch.tensor(0.0, device=hidden_states.device)}
+    def forward(self, 
+                input_ids, 
+                attention_mask=None, 
+                labels=None,
+                aspect_labels=None,
+                opinion_labels=None, 
+                sentiment_labels=None,
+                domain_ids=None,
+                task_type='triplet_extraction', 
+                target_text=None,
+                dataset_name=None,
+                **kwargs):
+        """
+        Forward pass with all GRADIENT features
+        """
+        batch_size, seq_len = input_ids.shape
         
-        batch_size = hidden_states.size(0)
+        # Combine individual labels into labels dict if provided separately
+        if labels is None and (aspect_labels is not None or opinion_labels is not None or sentiment_labels is not None):
+            labels = {}
+            if aspect_labels is not None:
+                labels['aspect_labels'] = aspect_labels
+            if opinion_labels is not None:
+                labels['opinion_labels'] = opinion_labels
+            if sentiment_labels is not None:
+                labels['sentiment_labels'] = sentiment_labels
         
-        # Bridge features to T5 dimension
-        bridged_features = self.feature_bridge(hidden_states.mean(dim=1))  # [B, t5_dim]
+        # 1. Get base representations
+        backbone_outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        hidden_states = backbone_outputs.last_hidden_state
         
-        # Create enhanced input text based on task type
-        template = self.task_templates.get(task_type, self.task_templates['triplet_extraction'])
-        input_text = [template.format(text="[INPUT_TEXT]")] * batch_size
-        
-        # Tokenize input
-        inputs = self.tokenizer(
-            input_text, 
-            return_tensors='pt', 
-            padding=True, 
-            truncation=True,
-            max_length=128
-        ).to(hidden_states.device)
-        
-        # Get T5 encoder outputs
-        encoder_outputs = self.t5_model.encoder(**inputs)
-        
-        # Apply ABSA-aware attention
-        aspect_aware_states, _ = self.aspect_opinion_attention(
-            encoder_outputs.last_hidden_state,
-            bridged_features.unsqueeze(1).expand(-1, encoder_outputs.last_hidden_state.size(1), -1),
-            bridged_features.unsqueeze(1).expand(-1, encoder_outputs.last_hidden_state.size(1), -1)
+        # 2. Implicit detection with all sophisticated features
+        implicit_outputs = self.implicit_detector(
+            hidden_states, 
+            attention_mask,
+            explicit_features=None
         )
         
-        # Modify encoder outputs with ABSA features
-        modified_hidden_states = encoder_outputs.last_hidden_state + aspect_aware_states
+        # 3. Few-shot learning with domain awareness
+        if dataset_name and domain_ids is None:
+            domain_ids = torch.tensor([get_domain_id(dataset_name)] * batch_size, 
+                                    device=hidden_states.device)
         
-        if target_text is not None and self.training:
-            # Training mode - compute generation loss
-            target_inputs = self.tokenizer(
-                target_text if isinstance(target_text, list) else [target_text] * batch_size,
-                return_tensors='pt',
-                padding=True,
-                truncation=True,
-                max_length=64
-            ).to(hidden_states.device)
-            
-            # Prepare decoder inputs
-            decoder_input_ids = target_inputs.input_ids
-            decoder_input_ids = torch.cat([
-                torch.full((batch_size, 1), self.tokenizer.pad_token_id, device=hidden_states.device),
-                decoder_input_ids[:, :-1]
-            ], dim=1)
-            
-            # Forward through decoder
-            decoder_outputs = self.t5_model.decoder(
-                input_ids=decoder_input_ids,
-                encoder_hidden_states=modified_hidden_states,
-                encoder_attention_mask=inputs.attention_mask
+        few_shot_outputs = self.few_shot_learner(
+            hidden_states, 
+            labels, 
+            domain_ids
+        )
+        
+        # 4. Domain adversarial training
+        domain_outputs = {}
+        if self.domain_adversarial and domain_ids is not None:
+            domain_outputs = self.domain_adversarial(
+                hidden_states, 
+                domain_ids=domain_ids,
+                return_losses=self.training
             )
-            
-            # Apply multi-level sequence decoder
-            decoded_states = self.sequence_decoder(
-                decoder_outputs.last_hidden_state,
-                modified_hidden_states,
-                memory_key_padding_mask=~inputs.attention_mask.bool()
-            )
-            
-            # Task-specific head
-            if task_type in self.task_heads:
-                task_logits = self.task_heads[task_type](decoded_states)
-            else:
-                task_logits = self.vocab_projection(decoded_states)
-            
-            # Apply copy mechanism
-            copy_scores = self.copy_attention(decoded_states).squeeze(-1)
-            copy_probs = torch.sigmoid(self.copy_gate(decoded_states)).squeeze(-1)
-            
-            # Compute generation loss with curriculum weighting
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            generation_loss = loss_fct(
-                task_logits.view(-1, task_logits.size(-1)),
-                target_inputs.input_ids.view(-1)
-            )
-            
-            # Apply curriculum weighting
-            weighted_loss = generation_loss * self.curriculum_weight
-            
-            return {
-                'available': True,
-                'loss': weighted_loss,
-                'logits': task_logits,
-                'copy_scores': copy_scores,
-                'copy_probs': copy_probs,
-                'hidden_states': decoded_states
-            }
+        
+        # 5. Advanced feature fusion
+        fusion_features = [
+            hidden_states,  # Base features
+            implicit_outputs['contrastive_features'],  # Implicit contrastive
+            implicit_outputs['hidden_states'],  # Contextualized implicit features
+            few_shot_outputs['domain_adapted_features']  # Few-shot adapted features
+        ]
+        
+        # Add domain-adapted features if available
+        if self.domain_adversarial and 'adapted_features' in domain_outputs:
+            fusion_features.append(domain_outputs['adapted_features'])
         else:
-            # Inference mode - generate text
-            generated_ids = self.t5_model.generate(
-                encoder_outputs=type('', (), {
-                    'last_hidden_state': modified_hidden_states,
-                    'hidden_states': None,
-                    'attentions': None
-                })(),
-                attention_mask=inputs.attention_mask,
-                max_length=64,
-                num_beams=2,
-                do_sample=False,
-                early_stopping=True
+            # Add zeros if domain adversarial not used
+            fusion_features.append(torch.zeros_like(hidden_states))
+        
+        # Concatenate all features
+        fused_features = torch.cat(fusion_features, dim=-1)
+        fused_features = self.feature_fusion(fused_features)
+        
+        # Apply feature attention for better integration
+        attended_features, _ = self.feature_attention(
+            fused_features, fused_features, fused_features,
+            key_padding_mask=~attention_mask.bool() if attention_mask is not None else None
+        )
+        
+        final_features = fused_features + attended_features
+        final_features = self.dropout(final_features)
+        
+        # 6. Main predictions with sophisticated heads
+        aspect_logits = self.aspect_classifier(final_features)
+        opinion_logits = self.opinion_classifier(final_features)
+        sentiment_logits = self.sentiment_classifier(final_features)
+        
+        # 7. Boundary detection for better span extraction
+        boundary_logits = self.boundary_detector(final_features)
+        
+        # 8. Confidence estimation
+        confidence_scores = self.confidence_estimator(final_features).squeeze(-1)
+        if attention_mask is not None:
+            confidence_scores = confidence_scores * attention_mask.float()
+        
+        # 9. Advanced contrastive learning
+        contrastive_features = self.contrastive_projector(final_features)
+        
+        # 10. Generative module (if available)
+        generative_outputs = {}
+        if self.has_generative:
+            generative_outputs = self.generative_module(
+                final_features, input_ids, task_type, target_text
             )
+        
+        # 11. Compile comprehensive outputs
+        outputs = {
+            # Main predictions
+            'aspect_logits': aspect_logits,
+            'opinion_logits': opinion_logits,
+            'sentiment_logits': sentiment_logits,
+            'boundary_logits': boundary_logits,
+            'confidence_scores': confidence_scores,
             
-            generated_text = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            # Features
+            'hidden_states': final_features,
+            'contrastive_features': contrastive_features,
             
-            # Post-process generated text based on task type
-            processed_text = self._post_process_generation(generated_text, task_type)
+            # Component outputs
+            'implicit_outputs': implicit_outputs,
+            'few_shot_outputs': few_shot_outputs,
+            'domain_outputs': domain_outputs,
+            'generative_outputs': generative_outputs,
             
-            return {
-                'available': True,
-                'generated_text': processed_text,
-                'generated_ids': generated_ids,
-                'raw_text': generated_text
-            }
+            # Meta information
+            'task_weights': self.task_weights,
+            'attention_mask': attention_mask
+        }
+        
+        # 12. Compute comprehensive losses if training
+        if labels is not None:
+            outputs['losses'] = self.compute_comprehensive_loss(outputs, labels, dataset_name)
+        
+        return outputs
     
     def _post_process_generation(self, generated_text, task_type):
         """Post-process generated text based on task type"""
@@ -764,127 +783,146 @@ class UnifiedABSAModel(nn.Module):
         if self.domain_adversarial:
             self.domain_adversarial.update_alpha(epoch, total_epochs)
     
-    def forward(self, 
-                input_ids, 
-                attention_mask=None, 
-                labels=None, 
-                task_type='triplet_extraction', 
-                target_text=None,
-                dataset_name=None):
-        batch_size, seq_len = input_ids.shape
-        
-        # 1. Get base representations
-        backbone_outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = backbone_outputs.last_hidden_state
-        
-        # 2. Implicit detection with all sophisticated features
-        implicit_outputs = self.implicit_detector(
+    # In src/models/unified_absa_model.py, replace the forward method with this:
+
+def forward(self, 
+            input_ids, 
+            attention_mask=None, 
+            labels=None,
+            aspect_labels=None,
+            opinion_labels=None, 
+            sentiment_labels=None,
+            domain_ids=None,
+            task_type='triplet_extraction', 
+            target_text=None,
+            dataset_name=None,
+            **kwargs):  # Add **kwargs to catch any extra arguments
+    batch_size, seq_len = input_ids.shape
+    
+    # Combine individual labels into labels dict if provided separately
+    if labels is None and (aspect_labels is not None or opinion_labels is not None or sentiment_labels is not None):
+        labels = {}
+        if aspect_labels is not None:
+            labels['aspect_labels'] = aspect_labels
+        if opinion_labels is not None:
+            labels['opinion_labels'] = opinion_labels
+        if sentiment_labels is not None:
+            labels['sentiment_labels'] = sentiment_labels
+    
+    # Rest of your existing forward method code...
+    # (Keep everything else the same, just change the method signature)
+    
+    # 1. Get base representations
+    backbone_outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+    hidden_states = backbone_outputs.last_hidden_state
+    
+    # 2. Implicit detection with all sophisticated features
+    implicit_outputs = self.implicit_detector(
+        hidden_states, 
+        attention_mask,
+        explicit_features=None  # Could pass aspect/opinion features here
+    )
+    
+    # 3. Few-shot learning with domain awareness
+    if dataset_name and domain_ids is None:
+        domain_ids = torch.tensor([get_domain_id(dataset_name)] * batch_size, 
+                                device=hidden_states.device)
+    
+    few_shot_outputs = self.few_shot_learner(
+        hidden_states, 
+        labels, 
+        domain_ids
+    )
+    
+    # 4. Domain adversarial training
+    domain_outputs = {}
+    if self.domain_adversarial and domain_ids is not None:
+        domain_outputs = self.domain_adversarial(
             hidden_states, 
-            attention_mask,
-            explicit_features=None  # Could pass aspect/opinion features here
+            domain_ids=domain_ids,
+            return_losses=self.training
         )
-        
-        # 3. Few-shot learning with domain awareness
-        domain_ids = None
-        if dataset_name:
-            domain_ids = torch.tensor([get_domain_id(dataset_name)] * batch_size, 
-                                    device=hidden_states.device)
-        
-        few_shot_outputs = self.few_shot_learner(
-            hidden_states, 
-            labels, 
-            domain_ids
+    
+    # 5. Advanced feature fusion
+    fusion_features = [
+        hidden_states,  # Base features
+        implicit_outputs['contrastive_features'],  # Implicit contrastive
+        implicit_outputs['hidden_states'],  # Contextualized implicit features
+        few_shot_outputs['domain_adapted_features']  # Few-shot adapted features
+    ]
+    
+    # Add domain-adapted features if available
+    if self.domain_adversarial and 'adapted_features' in domain_outputs:
+        fusion_features.append(domain_outputs['adapted_features'])
+    else:
+        # Add zeros if domain adversarial not used
+        fusion_features.append(torch.zeros_like(hidden_states))
+    
+    # Concatenate all features
+    fused_features = torch.cat(fusion_features, dim=-1)
+    fused_features = self.feature_fusion(fused_features)
+    
+    # Apply feature attention for better integration
+    attended_features, _ = self.feature_attention(
+        fused_features, fused_features, fused_features,
+        key_padding_mask=~attention_mask.bool() if attention_mask is not None else None
+    )
+    
+    final_features = fused_features + attended_features
+    final_features = self.dropout(final_features)
+    
+    # 6. Main predictions with sophisticated heads
+    aspect_logits = self.aspect_classifier(final_features)
+    opinion_logits = self.opinion_classifier(final_features)
+    sentiment_logits = self.sentiment_classifier(final_features)
+    
+    # 7. Boundary detection for better span extraction
+    boundary_logits = self.boundary_detector(final_features)
+    
+    # 8. Confidence estimation
+    confidence_scores = self.confidence_estimator(final_features).squeeze(-1)
+    if attention_mask is not None:
+        confidence_scores = confidence_scores * attention_mask.float()
+    
+    # 9. Advanced contrastive learning
+    contrastive_features = self.contrastive_projector(final_features)
+    
+    # 10. Generative module (if available)
+    generative_outputs = {}
+    if self.has_generative:
+        generative_outputs = self.generative_module(
+            final_features, input_ids, task_type, target_text
         )
+    
+    # 11. Compile comprehensive outputs
+    outputs = {
+        # Main predictions
+        'aspect_logits': aspect_logits,
+        'opinion_logits': opinion_logits,
+        'sentiment_logits': sentiment_logits,
+        'boundary_logits': boundary_logits,
+        'confidence_scores': confidence_scores,
         
-        # 4. NEW: Domain adversarial training
-        domain_outputs = {}
-        if self.domain_adversarial and dataset_name:
-            domain_outputs = self.domain_adversarial(
-                hidden_states, 
-                domain_ids=domain_ids,
-                return_losses=self.training
-            )
+        # Features
+        'hidden_states': final_features,
+        'contrastive_features': contrastive_features,
         
-        # 5. Advanced feature fusion
-        fusion_features = [
-            hidden_states,  # Base features
-            implicit_outputs['contrastive_features'],  # Implicit contrastive
-            implicit_outputs['hidden_states'],  # Contextualized implicit features
-            few_shot_outputs['domain_adapted_features']  # Few-shot adapted features
-        ]
+        # Component outputs
+        'implicit_outputs': implicit_outputs,
+        'few_shot_outputs': few_shot_outputs,
+        'domain_outputs': domain_outputs,  # Domain adversarial outputs
+        'generative_outputs': generative_outputs,
         
-        # Add domain-adapted features if available
-        if self.domain_adversarial and 'adapted_features' in domain_outputs:
-            fusion_features.append(domain_outputs['adapted_features'])
-        else:
-            # Add zeros if domain adversarial not used
-            fusion_features.append(torch.zeros_like(hidden_states))
-        
-        # Concatenate all features
-        fused_features = torch.cat(fusion_features, dim=-1)
-        fused_features = self.feature_fusion(fused_features)
-        
-        # Apply feature attention for better integration
-        attended_features, _ = self.feature_attention(
-            fused_features, fused_features, fused_features,
-            key_padding_mask=~attention_mask.bool() if attention_mask is not None else None
-        )
-        
-        final_features = fused_features + attended_features
-        final_features = self.dropout(final_features)
-        
-        # 6. Main predictions with sophisticated heads
-        aspect_logits = self.aspect_classifier(final_features)
-        opinion_logits = self.opinion_classifier(final_features)
-        sentiment_logits = self.sentiment_classifier(final_features)
-        
-        # 7. Boundary detection for better span extraction
-        boundary_logits = self.boundary_detector(final_features)
-        
-        # 8. Confidence estimation
-        confidence_scores = self.confidence_estimator(final_features).squeeze(-1)
-        if attention_mask is not None:
-            confidence_scores = confidence_scores * attention_mask.float()
-        
-        # 9. Advanced contrastive learning
-        contrastive_features = self.contrastive_projector(final_features)
-        
-        # 10. Generative module (if available)
-        generative_outputs = {}
-        if self.has_generative:
-            generative_outputs = self.generative_module(
-                final_features, input_ids, task_type, target_text
-            )
-        
-        # 11. Compile comprehensive outputs
-        outputs = {
-            # Main predictions
-            'aspect_logits': aspect_logits,
-            'opinion_logits': opinion_logits,
-            'sentiment_logits': sentiment_logits,
-            'boundary_logits': boundary_logits,
-            'confidence_scores': confidence_scores,
-            
-            # Features
-            'hidden_states': final_features,
-            'contrastive_features': contrastive_features,
-            
-            # Component outputs
-            'implicit_outputs': implicit_outputs,
-            'few_shot_outputs': few_shot_outputs,
-            'domain_outputs': domain_outputs,  # NEW: Domain adversarial outputs
-            'generative_outputs': generative_outputs,
-            
-            # Meta information
-            'task_weights': self.task_weights,
-            'attention_mask': attention_mask
-        }
-        
-        # 12. Compute comprehensive losses if training
-        if labels is not None:
-            outputs['losses'] = self.compute_comprehensive_loss(outputs, labels, dataset_name)
-        
-        return outputs
+        # Meta information
+        'task_weights': self.task_weights,
+        'attention_mask': attention_mask
+    }
+    
+    # 12. Compute comprehensive losses if training
+    if labels is not None:
+        outputs['losses'] = self.compute_comprehensive_loss(outputs, labels, dataset_name)
+    
+    return outputs
     
     def compute_comprehensive_loss(self, outputs, targets, dataset_name=None):
         """

@@ -499,3 +499,127 @@ class DomainAdversarialABSATrainer:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         torch.save(checkpoint, save_path)
         print(f"✅ Model saved: {save_path}")
+
+
+class GradientReversalLayer(torch.autograd.Function):
+    """Gradient Reversal Layer for Domain Adversarial Training"""
+    
+    @staticmethod
+    def forward(ctx, x, alpha=1.0):
+        ctx.alpha = alpha
+        return x.view_as(x)
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.alpha * grad_output, None
+
+
+class DomainAdversarialModule(nn.Module):
+    """Domain Adversarial Module - PyTorch component for unified_absa_model.py"""
+    
+    def __init__(self, hidden_size, num_domains=4, dropout=0.1, orthogonal_weight=0.1):
+        super().__init__()
+        
+        self.hidden_size = hidden_size
+        self.num_domains = num_domains
+        self.orthogonal_weight = orthogonal_weight
+        
+        # Domain-invariant feature extractor
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        
+        # Domain classifier (applied after gradient reversal)
+        self.domain_classifier = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, num_domains)
+        )
+        
+        # Orthogonal projection layer
+        self.orthogonal_projector = nn.Linear(hidden_size, hidden_size, bias=False)
+        
+        # Dynamic alpha parameter for gradient reversal
+        self.register_buffer('alpha', torch.tensor(1.0))
+        
+    def update_alpha(self, epoch, total_epochs, schedule='progressive'):
+        """Update alpha for gradient reversal scheduling"""
+        if schedule == 'progressive':
+            self.alpha = 2.0 / (1.0 + np.exp(-10 * epoch / total_epochs)) - 1.0
+        elif schedule == 'cosine':
+            self.alpha = 0.5 * (1 + np.cos(np.pi * epoch / total_epochs))
+        elif schedule == 'fixed':
+            self.alpha = torch.tensor(1.0)
+        else:
+            self.alpha = torch.tensor(1.0)
+        
+        # Ensure alpha is on the right device
+        if not isinstance(self.alpha, torch.Tensor):
+            self.alpha = torch.tensor(self.alpha, device=next(self.parameters()).device)
+    
+    def forward(self, features, domain_ids=None, return_losses=False):
+        """Forward pass with gradient reversal"""
+        batch_size = features.size(0)
+        
+        # 1. Extract domain-invariant features
+        domain_features = self.feature_extractor(features)
+        
+        # 2. Apply orthogonal constraints
+        orthogonal_features = self.orthogonal_projector(domain_features)
+        
+        # 3. Apply gradient reversal for domain classification
+        reversed_features = GradientReversalLayer.apply(orthogonal_features, self.alpha)
+        
+        # 4. Domain classification on reversed features
+        if len(reversed_features.shape) == 3:  # [batch, seq, hidden]
+            pooled_features = reversed_features.mean(dim=1)  # [batch, hidden]
+        else:
+            pooled_features = reversed_features
+        
+        domain_logits = self.domain_classifier(pooled_features)
+        
+        # Prepare outputs
+        outputs = {
+            'domain_features': domain_features,
+            'orthogonal_features': orthogonal_features,
+            'domain_logits': domain_logits,
+            'adapted_features': orthogonal_features,
+            'alpha': self.alpha.item()
+        }
+        
+        # 5. Compute losses if requested
+        if return_losses and domain_ids is not None:
+            # Domain classification loss
+            domain_loss = F.cross_entropy(domain_logits, domain_ids)
+            
+            # Orthogonal constraint loss
+            W = self.orthogonal_projector.weight
+            gram_matrix = torch.mm(W, W.t())
+            identity = torch.eye(W.size(0), device=W.device)
+            orthogonal_loss = torch.norm(gram_matrix - identity, p='fro')
+            
+            # Total domain adversarial loss
+            total_domain_loss = domain_loss + self.orthogonal_weight * orthogonal_loss
+            
+            outputs.update({
+                'domain_loss': domain_loss,
+                'orthogonal_loss': orthogonal_loss,
+                'total_domain_loss': total_domain_loss
+            })
+        
+        return outputs
+
+
+def get_domain_id(dataset_name: str) -> int:
+    """Get domain ID for dataset name"""
+    domain_mapping = {
+        'laptop14': 0, 'laptop15': 0, 'laptop16': 0, 'laptop': 0,
+        'rest14': 1, 'rest15': 1, 'rest16': 1, 'restaurant': 1,
+        'hotel': 2, 'hotel_reviews': 2,
+        'electronics': 3, 'general': 3
+    }
+    return domain_mapping.get(dataset_name.lower(), 3)
