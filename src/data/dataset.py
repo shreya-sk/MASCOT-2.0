@@ -322,3 +322,58 @@ def verify_datasets(config) -> bool:
     except Exception as e:
         print(f"❌ Dataset verification failed: {e}")
         return False
+# Add these to the END of your existing src/data/dataset.py file:
+
+def load_absa_datasets(dataset_names: List[str]) -> Dict[str, Dict[str, Dataset]]:
+    """Load ABSA datasets - MISSING FUNCTION"""
+    datasets = {}
+    tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+    
+    for dataset_name in dataset_names:
+        dataset_path = f"Datasets/aste/{dataset_name}"
+        
+        if not os.path.exists(dataset_path):
+            print(f"Warning: Dataset directory not found: {dataset_path}")
+            continue
+        
+        train_path = f"{dataset_path}/train.txt"
+        dev_path = f"{dataset_path}/dev.txt" 
+        test_path = f"{dataset_path}/test.txt"
+        
+        dataset_dict = {}
+        
+        if os.path.exists(train_path):
+            dataset_dict['train'] = FixedABSADataset(train_path, tokenizer)
+        if os.path.exists(dev_path):
+            dataset_dict['dev'] = FixedABSADataset(dev_path, tokenizer)
+        if os.path.exists(test_path):
+            dataset_dict['test'] = FixedABSADataset(test_path, tokenizer)
+        
+        if dataset_dict:
+            datasets[dataset_name] = dataset_dict
+    
+    return datasets
+
+def create_data_loaders(config, dataset_name: str = None) -> Tuple[DataLoader, DataLoader]:
+    """Create data loaders - MISSING FUNCTION"""
+    if dataset_name is None:
+        dataset_name = getattr(config, 'dataset_name', 'laptop14')
+    
+    datasets = load_absa_datasets([dataset_name])
+    
+    if dataset_name not in datasets:
+        raise ValueError(f"Dataset {dataset_name} not found")
+    
+    train_loader = DataLoader(
+        datasets[dataset_name]['train'],
+        batch_size=getattr(config, 'batch_size', 4),
+        shuffle=True
+    )
+    
+    dev_loader = DataLoader(
+        datasets[dataset_name]['dev'], 
+        batch_size=getattr(config, 'batch_size', 4),
+        shuffle=False
+    )
+    
+    return train_loader, dev_loader

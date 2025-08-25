@@ -554,3 +554,42 @@ def create_domain_adversarial_config():
     
     print("✅ Domain adversarial config created")
     return config
+# Add these to your src/utils/config.py file:
+
+def load_config(config_name: str):
+    """Load configuration by name - MISSING FUNCTION"""
+    
+    class ABSAConfig:
+        def __init__(self):
+            self.model_name = 'bert-base-uncased'
+            self.hidden_size = 768
+            self.batch_size = 4
+            self.learning_rate = 2e-5
+            self.num_epochs = 5
+            self.dataset_name = 'laptop14'
+            self.output_dir = 'outputs'
+            self.use_domain_adversarial = True
+            self.domain_loss_weight = 0.1
+            self.orthogonal_loss_weight = 0.1
+            self.alpha_schedule = 'progressive'
+            self.initial_alpha = 0.0
+            self.final_alpha = 1.0
+    
+    config = ABSAConfig()
+    
+    if config_name == 'dev':
+        config.batch_size = 4
+        config.num_epochs = 5
+        config.learning_rate = 3e-5
+    elif config_name == 'research':
+        config.batch_size = 8
+        config.num_epochs = 25
+        config.learning_rate = 1e-5
+    
+    return config
+
+def create_output_directory(output_dir: str) -> str:
+    """Create output directory - MISSING FUNCTION"""
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
