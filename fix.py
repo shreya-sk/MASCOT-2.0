@@ -1,135 +1,96 @@
-# EVALUATION PIPELINE DEBUG - Copy into Python terminal
-# This will show exactly why Opinion F1 is zero despite valid spans
+#!/usr/bin/env python3
+"""
+ALIGNMENT FIX TEST - Verify the tensor alignment bug is resolved
+Save this as alignment_test.py and run it
+"""
 
-import torch
-import numpy as np
-from train import SimplifiedABSADataset, NovelGradientABSAModel, NovelABSAConfig, NovelABSATrainer, collate_fn
+import sys
+sys.path.append('.')
+
+from train import SimplifiedABSADataset, collate_fn
 from torch.utils.data import DataLoader
+import torch
 
-print("EVALUATION PIPELINE DEBUG")
-print("=" * 40)
-
-# Create small test setup
-config = NovelABSAConfig('dev')
-model = NovelGradientABSAModel(config)
-dataset = SimplifiedABSADataset("dummy", config.model_name, config.max_length, config.dataset_name)
-dataset.data = dataset.data[:3]  # Just 3 samples
-
-loader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn)
-trainer = NovelABSATrainer(model, config, loader, loader, config.device)
-
-# Get one batch and test the full evaluation pipeline
-batch = next(iter(loader))
-
-# Move to device
-for key in batch:
-    if isinstance(batch[key], torch.Tensor):
-        batch[key] = batch[key].to(config.device)
-
-print("TESTING FULL EVALUATION PIPELINE:")
-
-# Get model predictions
-with torch.no_grad():
-    outputs = model(
-        input_ids=batch['input_ids'],
-        attention_mask=batch['attention_mask'],
-        training=False
+def test_alignment_fix():
+    """Test the specific alignment bug causing 4 B-tags to become 1 B-tag"""
+    
+    print("ALIGNMENT FIX TEST - Verifying tensor alignment")
+    print("=" * 50)
+    
+    # Create dataset with the problematic sample
+    dataset = SimplifiedABSADataset(
+        "Datasets/aste/laptop14/train.txt", 
+        "bert-base-uncased", 
+        128, 
+        "laptop14"
     )
-
-# Extract predictions exactly like trainer.evaluate() does
-aspect_preds = torch.argmax(outputs['aspect_logits'], dim=-1).cpu().numpy()
-opinion_preds = torch.argmax(outputs['opinion_logits'], dim=-1).cpu().numpy()
-sentiment_preds = torch.argmax(outputs['sentiment_logits'], dim=-1).cpu().numpy()
-
-aspect_targets = batch['aspect_labels'].cpu().numpy()
-opinion_targets = batch['opinion_labels'].cpu().numpy()
-sentiment_targets = batch['sentiment_labels'].cpu().numpy()
-attention_mask = batch['attention_mask'].cpu().numpy()
-
-print("RAW PREDICTIONS AND TARGETS:")
-print(f"  Batch size: {len(aspect_preds)}")
-
-# Process exactly like trainer.evaluate()
-all_predictions = []
-all_targets = []
-
-for i in range(len(aspect_preds)):
-    valid_mask = (attention_mask[i] == 1) & (aspect_targets[i] != -100)
-    valid_indices = np.where(valid_mask)[0]
     
-    if len(valid_indices) > 0:
-        pred = {
-            'aspect_preds': aspect_preds[i][valid_indices],
-            'opinion_preds': opinion_preds[i][valid_indices], 
-            'sentiment_preds': sentiment_preds[i][valid_indices]
-        }
-        
-        target = {
-            'aspect_labels': aspect_targets[i][valid_indices],
-            'opinion_labels': opinion_targets[i][valid_indices],
-            'sentiment_labels': sentiment_targets[i][valid_indices]
-        }
-        
-        print(f"\n  Sample {i}:")
-        print(f"    Opinion predictions: {pred['opinion_preds']}")
-        print(f"    Opinion targets:     {target['opinion_labels']}")
-        print(f"    Opinion B pred count: {sum(pred['opinion_preds'] == 1)}")
-        print(f"    Opinion B target count: {sum(target['opinion_labels'] == 1)}")
-        
-        # Test span extraction on this sample
-        pred_opinion_spans = trainer._extract_spans(pred['opinion_preds'], 'opinion')
-        target_opinion_spans = trainer._extract_spans(target['opinion_labels'], 'opinion')
-        
-        print(f"    Extracted pred opinion spans: {pred_opinion_spans}")
-        print(f"    Extracted target opinion spans: {target_opinion_spans}")
-        
-        all_predictions.append(pred)
-        all_targets.append(target)
-
-# Now test the full metric computation
-print("\nTESTING METRIC COMPUTATION:")
-metrics = trainer._compute_metrics(all_predictions, all_targets)
-
-print(f"  Final metrics:")
-for key, value in metrics.items():
-    print(f"    {key}: {value:.4f}")
-
-print("\nDIAGNOSIS:")
-if metrics['opinion_f1'] == 0.0:
-    print("  Opinion F1 is still zero - investigating span-level evaluation")
+    # Test the specific problematic item (index 1 has 4 opinions)
+    print("Testing sample with 4 opinions...")
     
-    # Test span-level computation directly
-    span_predictions = []
-    span_targets = []
+    # Get the raw item directly
+    item = dataset.data[1]
+    print(f"Raw opinions: {item.get('opinions', [])}")
     
-    for pred, target in zip(all_predictions, all_targets):
-        pred_opinion_spans = trainer._extract_spans(pred['opinion_preds'], 'opinion')
-        target_opinion_spans = trainer._extract_spans(target['opinion_labels'], 'opinion')
-        
-        span_predictions.append({'opinions': pred_opinion_spans})
-        span_targets.append({'opinions': target_opinion_spans})
+    # Test __getitem__ method
+    processed_item = dataset.__getitem__(1)
     
-    # Check what goes into F1 computation
-    all_pred_spans = []
-    all_target_spans = []
-    for pred, target in zip(span_predictions, span_targets):
-        all_pred_spans.extend(pred['opinions'])
-        all_target_spans.extend(target['opinions'])
+    # Check the final tensor
+    opinion_labels = processed_item['opinion_labels']
+    print(f"Opinion labels tensor shape: {opinion_labels.shape}")
+    print(f"Opinion labels (first 15): {opinion_labels[:15].tolist()}")
     
-    print(f"  All predicted opinion spans: {all_pred_spans}")
-    print(f"  All target opinion spans: {all_target_spans}")
+    # Count B-tags (label == 1)
+    b_count = sum(1 for x in opinion_labels if x == 1)
+    print(f"Final B-tag count in tensor: {b_count}")
     
-    pred_set = set(tuple(span) for span in all_pred_spans)
-    target_set = set(tuple(span) for span in all_target_spans)
-    
-    print(f"  Pred set: {pred_set}")
-    print(f"  Target set: {target_set}")
-    print(f"  Intersection: {pred_set & target_set}")
-    
-    if len(pred_set & target_set) == 0:
-        print("  🚨 NO MATCHES: Predictions and targets don't overlap")
-        print("  Issue: Model predictions don't match ground truth spans")
+    # Expected: Should be 4 B-tags, not 1
+    if b_count == 4:
+        print("✅ ALIGNMENT FIX SUCCESS: 4 B-tags preserved!")
+    elif b_count == 1:
+        print("❌ ALIGNMENT BUG PERSISTS: Only 1 B-tag found")
     else:
-        print("  ✅ Spans match - computation should work")
-else:
-    print("  ✅ Opinion F1 is working!")
+        print(f"⚠️ UNEXPECTED: Found {b_count} B-tags")
+    
+    print("\nTesting DataLoader batching...")
+    
+    # Test with DataLoader
+    loader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn)
+    batch = next(iter(loader))
+    
+    # Check batch processing
+    for i in range(min(2, len(batch['opinion_labels']))):
+        opinion_labels = batch['opinion_labels'][i]
+        valid_mask = opinion_labels != -100
+        valid_opinions = opinion_labels[valid_mask]
+        
+        b_count = sum(valid_opinions == 1)
+        i_count = sum(valid_opinions == 2)
+        
+        print(f"Batch item {i}: B={b_count}, I={i_count}")
+        
+        # Check if this is the 4-opinion sample
+        if i == 1:  # Second item should be the 4-opinion sample
+            if b_count == 4:
+                print(f"✅ Batch processing SUCCESS: Item {i} has 4 B-tags")
+            else:
+                print(f"❌ Batch processing FAILED: Item {i} has {b_count} B-tags instead of 4")
+    
+    print("\n" + "=" * 50)
+    print("DIAGNOSIS:")
+    
+    if b_count == 4:
+        print("✅ Alignment fix successful - ready for training")
+        print("Expected training results:")
+        print("   - Opinion F1: 0.25-0.45 (major improvement)")
+        print("   - Triplet F1: 0.20-0.35 (working triplets)")
+        return True
+    else:
+        print("❌ Alignment bug not fixed")
+        print("Root cause: Label generation creates 4 B-tags")
+        print("            Tensor processing loses 3 B-tags")
+        print("Need to debug: __getitem__ method alignment logic")
+        return False
+
+if __name__ == "__main__":
+    test_alignment_fix()

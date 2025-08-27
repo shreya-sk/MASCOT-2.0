@@ -26,6 +26,9 @@ deactivate () {
 
     unset VIRTUAL_ENV
     unset VIRTUAL_ENV_PROMPT
+    unset MallocStackLogging
+    unset MallocStackLoggingNoCompact
+
     if [ ! "${1:-}" = "nondestructive" ] ; then
     # Self destruct!
         unset -f deactivate
@@ -67,4 +70,10 @@ fi
 
 # Call hash to forget past commands. Without forgetting
 # past commands the $PATH changes we made may not be respected
+# Ensure malloc logging is disabled when activating this venv
+
 hash -r 2> /dev/null
+# Ensure malloc logging is disabled when activating this venv
+unset MallocStackLogging
+unset MallocStackLoggingNoCompact
+export MallocLogFile=/dev/null

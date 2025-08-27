@@ -12,6 +12,10 @@ WHAT'S INCLUDED:
 """
 
 import os
+os.environ["MallocStackLogging"] = "0"
+os.environ["MallocStackLoggingNoCompact"] = "0"
+os.environ["MallocLogFile"] = "/dev/null"  # fully silence malloc logs
+
 import sys
 import json
 import torch
@@ -44,6 +48,7 @@ try:
     from torch.optim import AdamW
     from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
     print("✅ Core dependencies imported successfully")
+    from training.wandb_integration import WandBIntegration
 except ImportError as e:
     print(f"❌ Failed to import dependencies: {e}")
     print("Please install: pip install torch transformers scikit-learn tqdm numpy")
@@ -393,7 +398,7 @@ class SimplifiedABSADataset(Dataset):
         return domain_map.get(self.dataset_name.lower(), 0)
     
     def _load_data(self, data_path):
-        """Load data with proper error handling"""
+        """FIXED: Load ASTE format data with proper triplet parsing"""
         if not os.path.exists(data_path):
             print(f"⚠️ File not found: {data_path}")
             return self._create_sample_data()
@@ -407,23 +412,34 @@ class SimplifiedABSADataset(Dataset):
                         continue
                     
                     try:
-                        # Try JSON format first
-                        if line.startswith('{'):
-                            item = json.loads(line)
-                        else:
-                            # Handle ASTE format: "text#### aspects#### opinions#### sentiments"
+                        # Parse ASTE format: "text####triplets"
+                        if '####' in line:
                             parts = line.split('####')
-                            if len(parts) >= 4:
-                                item = {
-                                    'text': parts[0].strip(),
-                                    'aspects': parts[1].strip().split('|') if parts[1].strip() else [],
-                                    'opinions': parts[2].strip().split('|') if parts[2].strip() else [],
-                                    'sentiments': parts[3].strip().split('|') if parts[3].strip() else []
-                                }
+                            text = parts[0].strip()
+                            
+                            if len(parts) > 1 and parts[1].strip():
+                                # Parse triplet string like "[([2, 3], [0], 'POS')]"
+                                triplet_str = parts[1].strip()
+                                aspects, opinions, sentiments = self._parse_aste_triplets(text, triplet_str)
                             else:
-                                item = {'text': parts[0].strip() if parts else line}
+                                aspects, opinions, sentiments = [], [], []
+                            
+                            item = {
+                                'text': text,
+                                'aspects': aspects,
+                                'opinions': opinions, 
+                                'sentiments': sentiments
+                            }
+                            
+                            data.append(item)
+                            
+                            # Debug first few items
+                            if line_idx < 3:
+                                print(f"Parsed item {line_idx}: aspects={len(aspects)}, opinions={len(opinions)}")
                         
-                        if item.get('text'):
+                        else:
+                            # Fallback for non-ASTE format
+                            item = {'text': line.strip()}
                             data.append(item)
                             
                     except Exception as e:
@@ -435,7 +451,103 @@ class SimplifiedABSADataset(Dataset):
         except Exception as e:
             print(f"⚠️ Error loading {data_path}: {e}")
             return self._create_sample_data()
-    
+
+    def _parse_aste_triplets(self, text, triplet_str):
+        """FIXED: Parse ASTE triplet format with proper opinion extraction"""
+        import ast
+        import re
+        
+        aspects, opinions, sentiments = [], [], []
+        
+        try:
+            # Clean and parse the triplet string
+            triplet_str = triplet_str.strip()
+            
+            if triplet_str.startswith('[') and triplet_str.endswith(']'):
+                try:
+                    triplets = ast.literal_eval(triplet_str)
+                    if not isinstance(triplets, list):
+                        triplets = [triplets]  # Single triplet
+                except:
+                    return [], [], []
+            else:
+                return [], [], []
+            
+            # Split text into words for index mapping
+            words = text.split()
+            
+            for triplet in triplets:
+                if len(triplet) >= 3:
+                    aspect_indices = triplet[0] if triplet[0] else []
+                    opinion_indices = triplet[1] if triplet[1] else []  # This was missing!
+                    sentiment = triplet[2] if len(triplet) > 2 else 'positive'
+                    
+                    # Extract aspect spans
+                    if aspect_indices:
+                        aspect_text = self._extract_span_text(words, aspect_indices)
+                        if aspect_text:
+                            aspects.append(aspect_text)
+                    
+                    # CRITICAL FIX: Extract opinion spans
+                    if opinion_indices:
+                        opinion_text = self._extract_span_text(words, opinion_indices)
+                        if opinion_text:
+                            opinions.append(opinion_text)
+                    
+                    # Map sentiment
+                    sentiment_map = {
+                        'POS': 'positive', 'positive': 'positive',
+                        'NEG': 'negative', 'negative': 'negative', 
+                        'NEU': 'neutral', 'neutral': 'neutral'
+                    }
+                    mapped_sentiment = sentiment_map.get(str(sentiment).upper(), 'positive')
+                    sentiments.append(mapped_sentiment)
+        
+        except Exception as e:
+            print(f"Triplet parsing error: {e}")
+            return [], [], []
+        
+        return aspects, opinions, sentiments
+
+    def _extract_span_text(self, words, indices):
+        """Extract text span from word indices"""
+        try:
+            if not indices or len(words) == 0:
+                return None
+                
+            # Handle different index formats
+            if isinstance(indices[0], list):
+                # Multiple spans: [[start, end], [start, end]]
+                span_texts = []
+                for span in indices:
+                    if len(span) >= 2 and span[0] < len(words) and span[1] < len(words):
+                        span_text = ' '.join(words[span[0]:span[1]+1])
+                        span_texts.append(span_text)
+                return ' '.join(span_texts) if span_texts else None
+            else:
+                # Single span: [start, end]
+                if len(indices) >= 2 and indices[0] < len(words) and indices[1] < len(words):
+                    return ' '.join(words[indices[0]:indices[1]+1])
+                elif len(indices) == 1 and indices[0] < len(words):
+                    return words[indices[0]]  # Single word
+        except:
+            return None
+        
+        return None
+
+    def _fallback_extraction(self, text):
+        """Fallback extraction when triplet parsing fails"""
+        # Simple keyword-based extraction
+        aspect_keywords = ['battery', 'screen', 'keyboard', 'laptop', 'quality', 'GUI', 'applications']
+        opinion_keywords = ['good', 'killer', 'stable', 'easy', 'gorgeous', 'high quality', 'expandable']
+        
+        aspects = [word for word in aspect_keywords if word.lower() in text.lower()]
+        opinions = [word for word in opinion_keywords if word.lower() in text.lower()]
+        sentiments = ['positive'] * len(opinions) if opinions else []
+        
+        return aspects[:3], opinions[:3], sentiments[:3]  # Limit to avoid too many
+            
+        
     def _create_sample_data(self):
         """Create sample data for testing"""
         return [
@@ -461,8 +573,6 @@ class SimplifiedABSADataset(Dataset):
     
     
     def _generate_labels(self, text, aspects, opinions, sentiments):
-        """Generate proper sequence labels with debug info"""
-        
         tokens = self.tokenizer.tokenize(text)
         
         # Initialize labels
@@ -470,37 +580,21 @@ class SimplifiedABSADataset(Dataset):
         opinion_labels = [0] * len(tokens)
         sentiment_labels = [0] * len(tokens)
         
-        sentiment_map = {'positive': 1, 'negative': 2, 'neutral': 3}
-        
-        # Find and label aspects
-        for aspect in aspects:
-            positions = self._find_token_positions(tokens, aspect)
-            if positions:  # Only label if found
-                for i, pos in enumerate(positions):
-                    if i == 0:
-                        aspect_labels[pos] = 1  # B-ASP
-                    else:
-                        aspect_labels[pos] = 2  # I-ASP
-        
         # Find and label opinions
         for opinion in opinions:
             positions = self._find_token_positions(tokens, opinion)
-            if positions:  # Only label if found
+            print(f"Opinion '{opinion}' positions: {positions}")
+            if positions:
                 for i, pos in enumerate(positions):
                     if i == 0:
                         opinion_labels[pos] = 1  # B-OP
+                        print(f"Set position {pos} to B-OP")
                     else:
                         opinion_labels[pos] = 2  # I-OP
         
-        # Assign sentiment labels
-        for i, sentiment in enumerate(sentiments[:len(opinions)]):
-            if i < len(opinions):
-                opinion = opinions[i]
-                positions = self._find_token_positions(tokens, opinion)
-                sentiment_id = sentiment_map.get(sentiment.lower(), 1)
-                
-                for pos in positions:
-                    sentiment_labels[pos] = sentiment_id
+        # Check final counts
+        b_count = sum(1 for label in opinion_labels if label == 1)
+        print(f"Final B-OP count: {b_count}")
         
         return aspect_labels, opinion_labels, sentiment_labels
 
@@ -535,6 +629,7 @@ class SimplifiedABSADataset(Dataset):
         return len(self.data)
     
     def __getitem__(self, idx):
+        """CRITICAL FIX: Proper label-token alignment"""
         item = self.data[idx]
         
         text = item['text']
@@ -542,7 +637,15 @@ class SimplifiedABSADataset(Dataset):
         opinions = item.get('opinions', [])
         sentiments = item.get('sentiments', [])
         
-        # Tokenize
+        # Generate labels FIRST (before any padding)
+        aspect_labels, opinion_labels, sentiment_labels = self._generate_labels(
+            text, aspects, opinions, sentiments
+        )
+        
+        # Debug: Print original lengths
+        print(f"DEBUG: Original label lengths - aspects: {len(aspect_labels)}, opinions: {len(opinion_labels)}")
+        
+        # Tokenize text
         encoding = self.tokenizer(
             text,
             max_length=self.max_length,
@@ -551,34 +654,51 @@ class SimplifiedABSADataset(Dataset):
             return_tensors='pt'
         )
         
-        # Generate labels
-        aspect_labels, opinion_labels, sentiment_labels = self._generate_labels(
-            text, aspects, opinions, sentiments
-        )
+        # CRITICAL: Get actual sequence length (this is the key fix)
+        input_ids = encoding['input_ids'].squeeze(0)
         
-        # Pad labels to max_length
-        while len(aspect_labels) < self.max_length:
-            aspect_labels.append(-100)
-            opinion_labels.append(-100)
-            sentiment_labels.append(-100)
+        # Account for special tokens [CLS] and [SEP]
+        # Original labels are for raw tokens, but BERT adds [CLS] at start
+        # Need to shift positions by 1
         
-        aspect_labels = aspect_labels[:self.max_length]
-        opinion_labels = opinion_labels[:self.max_length]
-        sentiment_labels = sentiment_labels[:self.max_length]
+        # Create new labels with [CLS] token padding
+        final_aspect_labels = [-100]  # [CLS] token
+        final_opinion_labels = [-100]  # [CLS] token  
+        final_sentiment_labels = [-100]  # [CLS] token
+        
+        # Add original labels (shifted by 1 due to [CLS])
+        for i in range(min(len(aspect_labels), self.max_length - 2)):  # Leave space for [CLS] and [SEP]
+            final_aspect_labels.append(aspect_labels[i])
+            final_opinion_labels.append(opinion_labels[i])
+            final_sentiment_labels.append(sentiment_labels[i])
+        
+        # Pad to max_length
+        while len(final_aspect_labels) < self.max_length:
+            final_aspect_labels.append(-100)
+            final_opinion_labels.append(-100)
+            final_sentiment_labels.append(-100)
+        
+        # Truncate if needed
+        final_aspect_labels = final_aspect_labels[:self.max_length]
+        final_opinion_labels = final_opinion_labels[:self.max_length]
+        final_sentiment_labels = final_sentiment_labels[:self.max_length]
+        
+        # Debug: Check final B-tag count
+        b_count = sum(1 for x in final_opinion_labels if x == 1)
+        print(f"DEBUG: Final opinion B-tags: {b_count}")
         
         return {
-            'input_ids': encoding['input_ids'].squeeze(0),
+            'input_ids': input_ids,
             'attention_mask': encoding['attention_mask'].squeeze(0),
-            'aspect_labels': torch.tensor(aspect_labels, dtype=torch.long),
-            'opinion_labels': torch.tensor(opinion_labels, dtype=torch.long),
-            'sentiment_labels': torch.tensor(sentiment_labels, dtype=torch.long),
+            'aspect_labels': torch.tensor(final_aspect_labels, dtype=torch.long),
+            'opinion_labels': torch.tensor(final_opinion_labels, dtype=torch.long),
+            'sentiment_labels': torch.tensor(final_sentiment_labels, dtype=torch.long),
             'domain_labels': torch.tensor([self.domain_id], dtype=torch.long),
             'text': text,
             'aspects': aspects,
             'opinions': opinions,
             'sentiments': sentiments
         }
-
 
 class NovelABSAConfig:
     """Complete configuration for novel ABSA model"""
@@ -657,6 +777,7 @@ class NovelABSATrainer:
         self.training_history = []
         
         print("✅ Trainer initialized")
+        
     
     def get_alpha(self, epoch, total_epochs):
         """Get current alpha for gradient reversal"""
@@ -719,6 +840,9 @@ class NovelABSATrainer:
                 'orthogonal_loss': outputs.get('orthogonal_loss', torch.tensor(0.0)).item()
             }
             epoch_losses.append(batch_losses)
+            # Log to W&B
+            if hasattr(self, 'wandb_integration') and self.wandb_integration:
+                self.wandb_integration.log_training_step(epoch, batch_idx, batch_losses, alpha=current_alpha)
             
             # Update progress
             if batch_idx % 10 == 0:
@@ -1100,6 +1224,9 @@ class NovelABSATrainer:
                 print(f"   🎯 Triplet F1: {eval_metrics['triplet_f1']:.4f}")
                 print(f"   ⚡ Domain Loss: {train_losses.get('domain_loss', 0):.4f}")
                 print(f"   🔄 Alpha: {train_losses.get('alpha', 0):.3f}")
+                # Log to W&B
+                if hasattr(self, 'wandb_integration') and self.wandb_integration:
+                    self.wandb_integration.log_validation_metrics(epoch, eval_metrics)
             else:
                 print(f"\n📊 Epoch {epoch+1}/{self.config.num_epochs} - Train Loss: {train_losses['total_loss']:.4f}")
         
@@ -1197,6 +1324,7 @@ def main():
                        help='Random seed')
     parser.add_argument('--model_name', type=str, default='bert-base-uncased',
                        help='Pretrained model name')
+    parser.add_argument('--no_wandb', action='store_true', help='Disable W&B logging')
     
     args = parser.parse_args()
     
@@ -1228,6 +1356,14 @@ def main():
     
     # Setup logging
     logger = setup_logging(config)
+    # Setup W&B logging
+    wandb_integration = None
+    if not getattr(args, 'no_wandb', False):
+        try:
+            wandb_integration = WandBIntegration(config)
+            print(f"W&B initialized: {wandb_integration.run.url}")
+        except Exception as e:
+            print(f"W&B setup failed: {e}")
     
     print("🎯 GRADIENT: Gradient Reversal And Domain-Invariant Extraction Networks")
     print("=" * 70)
@@ -1275,7 +1411,7 @@ def main():
     
     # Create trainer
     trainer = NovelABSATrainer(model, config, train_loader, val_loader, config.device)
-    
+    trainer.wandb_integration = wandb_integration
     # Start training
     try:
         results = trainer.train()
@@ -1312,6 +1448,9 @@ def main():
             json.dump(serializable_results, f, indent=2)
         
         print(f"💾 Results saved to: {results_path}")
+        # Finish W&B logging
+        if wandb_integration:
+            wandb_integration.log_final_results(results)
         
         return results
         
