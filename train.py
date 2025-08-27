@@ -881,12 +881,12 @@ class NovelABSATrainer:
         return {'precision': precision, 'recall': recall, 'f1': f1}
     
     def _compute_triplet_f1(self, span_predictions, span_targets):
-        """CRITICAL: Compute triplet-level F1 scores - THIS WAS MISSING!"""
+        """Compute triplet-level F1 scores using proper span alignment"""
         pred_triplets = []
         target_triplets = []
         
         for pred, target in zip(span_predictions, span_targets):
-            # Extract aspects, opinions, sentiments from spans
+            # Extract spans from each component
             pred_aspects = pred.get('aspects', [])
             pred_opinions = pred.get('opinions', [])
             pred_sentiments = pred.get('sentiments', [])
@@ -895,28 +895,73 @@ class NovelABSATrainer:
             target_opinions = target.get('opinions', [])
             target_sentiments = target.get('sentiments', [])
             
-            # Form triplets (simplified alignment)
-            min_pred_len = min(len(pred_aspects), len(pred_opinions), len(pred_sentiments))
-            for i in range(min_pred_len):
-                if (i < len(pred_aspects) and i < len(pred_opinions) and 
-                    i < len(pred_sentiments)):
-                    pred_triplets.append((
-                        tuple(pred_aspects[i]) if isinstance(pred_aspects[i], list) else pred_aspects[i],
-                        tuple(pred_opinions[i]) if isinstance(pred_opinions[i], list) else pred_opinions[i],
-                        pred_sentiments[i]
-                    ))
+            # FIXED: Form triplets using span proximity rather than index alignment
+            # For predicted triplets
+            for asp_span in pred_aspects:
+                for op_span in pred_opinions:
+                    # Find overlapping or nearby sentiment
+                    best_sentiment = None
+                    min_distance = float('inf')
+                    
+                    for sent_span in pred_sentiments:
+                        if len(sent_span) >= 3:  # (start, end, sentiment_class)
+                            sent_start, sent_end, sent_class = sent_span
+                            
+                            # Calculate distance between opinion and sentiment spans
+                            if len(op_span) >= 2:
+                                op_start, op_end = op_span[0], op_span[1]
+                                
+                                # Check for overlap or proximity
+                                distance = 0
+                                if sent_end < op_start:  # sentiment before opinion
+                                    distance = op_start - sent_end
+                                elif sent_start > op_end:  # sentiment after opinion
+                                    distance = sent_start - op_end
+                                # else: overlapping (distance = 0)
+                                
+                                if distance < min_distance:
+                                    min_distance = distance
+                                    best_sentiment = sent_class
+                    
+                    # Form triplet if sentiment found within reasonable distance
+                    if best_sentiment is not None and min_distance <= 3:  # Within 3 tokens
+                        pred_triplets.append((
+                            tuple(asp_span) if isinstance(asp_span, (list, tuple)) else asp_span,
+                            tuple(op_span) if isinstance(op_span, (list, tuple)) else op_span,
+                            int(best_sentiment)
+                        ))
             
-            min_target_len = min(len(target_aspects), len(target_opinions), len(target_sentiments))
-            for i in range(min_target_len):
-                if (i < len(target_aspects) and i < len(target_opinions) and 
-                    i < len(target_sentiments)):
-                    target_triplets.append((
-                        tuple(target_aspects[i]) if isinstance(target_aspects[i], list) else target_aspects[i],
-                        tuple(target_opinions[i]) if isinstance(target_opinions[i], list) else target_opinions[i],
-                        target_sentiments[i]
-                    ))
+            # FIXED: Form target triplets using the same logic
+            for asp_span in target_aspects:
+                for op_span in target_opinions:
+                    best_sentiment = None
+                    min_distance = float('inf')
+                    
+                    for sent_span in target_sentiments:
+                        if len(sent_span) >= 3:
+                            sent_start, sent_end, sent_class = sent_span
+                            
+                            if len(op_span) >= 2:
+                                op_start, op_end = op_span[0], op_span[1]
+                                
+                                distance = 0
+                                if sent_end < op_start:
+                                    distance = op_start - sent_end
+                                elif sent_start > op_end:
+                                    distance = sent_start - op_end
+                                
+                                if distance < min_distance:
+                                    min_distance = distance
+                                    best_sentiment = sent_class
+                    
+                    if best_sentiment is not None and min_distance <= 3:
+                        target_triplets.append((
+                            tuple(asp_span) if isinstance(asp_span, (list, tuple)) else asp_span,
+                            tuple(op_span) if isinstance(op_span, (list, tuple)) else op_span,
+                            int(best_sentiment)
+                        ))
         
-        # Compute F1
+        # Compute F1 on the formed triplets
         if not pred_triplets and not target_triplets:
             return {'precision': 0.0, 'recall': 0.0, 'f1': 0.0}
         
@@ -927,6 +972,13 @@ class NovelABSATrainer:
         precision = matches / len(pred_set) if pred_set else 0.0
         recall = matches / len(target_set) if target_set else 0.0
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        
+        # Debug output
+        print(f"\nTRIPLET FORMATION DEBUG:")
+        print(f"  Predicted triplets: {pred_triplets}")
+        print(f"  Target triplets: {target_triplets}")
+        print(f"  Matches: {matches}")
+        print(f"  Triplet F1: {f1:.4f}")
         
         return {'precision': precision, 'recall': recall, 'f1': f1}
     
