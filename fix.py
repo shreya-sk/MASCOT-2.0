@@ -1,169 +1,64 @@
-#!/usr/bin/env python3
-"""
-QUICK TEST - Run this to verify your F1 fix works before full training
-Save as quick_test.py and run: python quick_test.py
-"""
+# DEBUG SPAN EXTRACTION - Copy this into Python terminal
+# This will show you exactly why Opinion F1 is zero
 
 import torch
-import sys
-from pathlib import Path
+import numpy as np
+from train import NovelABSATrainer, NovelABSAConfig, NovelGradientABSAModel
 
-# Add src to path
-current_dir = Path(__file__).parent.absolute()
-src_dir = current_dir / 'src'
-sys.path.insert(0, str(current_dir))
-sys.path.insert(0, str(src_dir))
+# Create trainer to test span extraction
+config = NovelABSAConfig('dev')
+model = NovelGradientABSAModel(config)
 
-def quick_f1_test():
-    """Test F1 computation in 30 seconds"""
-    
-    print("QUICK F1 TEST - Testing your fixes")
-    print("="*40)
-    
-    try:
-        # Import your classes
-        from train import NovelABSAConfig, NovelGradientABSAModel, NovelABSATrainer, SimplifiedABSADataset
-        from torch.utils.data import DataLoader
-        
-        print("✓ Imports successful")
-        
-        # Create minimal config
-        config = NovelABSAConfig('dev')
-        config.num_epochs = 1  # Just one epoch for testing
-        config.batch_size = 2
-        
-        print("✓ Config created")
-        
-        # Create model
-        model = NovelGradientABSAModel(config)
-        print("✓ Model created")
-        
-        # Create tiny dataset
-        dataset = SimplifiedABSADataset("dummy", config.model_name, config.max_length, config.dataset_name)
-        # Limit to just 10 samples for quick test
-        dataset.data = dataset.data[:10]
-        
-        dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=False)
-        print("✓ Dataset created (10 samples)")
-        
-        # Create trainer
-        trainer = NovelABSATrainer(model, config, dataloader, dataloader, config.device)
-        print("✓ Trainer created")
-        
-        # Test evaluation function
-        print("\nTesting evaluation function...")
-        eval_metrics = trainer.evaluate()
-        
-        print("\nQUICK TEST RESULTS:")
-        print(f"   Aspect F1: {eval_metrics.get('aspect_f1', 'MISSING')}")
-        print(f"   Opinion F1: {eval_metrics.get('opinion_f1', 'MISSING')}")
-        print(f"   Sentiment F1: {eval_metrics.get('sentiment_f1', 'MISSING')}")
-        print(f"   Triplet F1: {eval_metrics.get('triplet_f1', 'MISSING')}")
-        
-        # Check if fix worked
-        aspect_f1 = eval_metrics.get('aspect_f1', 0)
-        
-        if isinstance(aspect_f1, (int, float)) and aspect_f1 >= 0:
-            print("\n✓ SUCCESS: F1 computation working!")
-            if aspect_f1 > 0:
-                print("✓ Getting non-zero F1 scores - fix complete!")
-            else:
-                print("✓ F1 function works, but scores still 0 - may need training")
-        else:
-            print("\n✗ FAILED: F1 computation still broken")
-            print(f"   Got: {aspect_f1} (type: {type(aspect_f1)})")
-        
-        return eval_metrics
-        
-    except ImportError as e:
-        print(f"✗ Import error: {e}")
-        print("Check your imports and make sure _compute_metrics is added to NovelABSATrainer")
-        return None
-        
-    except AttributeError as e:
-        print(f"✗ Attribute error: {e}")
-        if "_compute_metrics" in str(e):
-            print("SOLUTION: You need to add the _compute_metrics function to your NovelABSATrainer class")
-        return None
-        
-    except Exception as e:
-        print(f"✗ Other error: {e}")
-        return None
+# Create dummy dataloaders to avoid None error
+from train import SimplifiedABSADataset, collate_fn
+from torch.utils.data import DataLoader
 
-def test_one_training_step():
-    """Test just one training step to see if everything works"""
-    
-    print("\nTEST ONE TRAINING STEP:")
-    print("-" * 25)
-    
-    try:
-        from train import NovelABSAConfig, NovelGradientABSAModel, NovelABSATrainer, SimplifiedABSADataset
-        from torch.utils.data import DataLoader
-        
-        # Minimal setup
-        config = NovelABSAConfig('dev')
-        config.num_epochs = 1
-        config.batch_size = 2
-        
-        model = NovelGradientABSAModel(config)
-        dataset = SimplifiedABSADataset("dummy", config.model_name, config.max_length, config.dataset_name)
-        dataset.data = dataset.data[:4]  # Just 4 samples
-        
-        train_loader = DataLoader(dataset, batch_size=2, shuffle=False)
-        val_loader = DataLoader(dataset, batch_size=2, shuffle=False)
-        
-        trainer = NovelABSATrainer(model, config, train_loader, val_loader, config.device)
-        
-        print("Testing one training epoch...")
-        
-        # Run one training epoch
-        train_losses = trainer.train_epoch(0)
-        print(f"✓ Training step successful - Loss: {train_losses['total_loss']:.4f}")
-        
-        # Test evaluation
-        eval_metrics = trainer.evaluate()
-        print(f"✓ Evaluation step successful")
-        
-        # Show results
-        print(f"\nONE-STEP RESULTS:")
-        print(f"   Train Loss: {train_losses['total_loss']:.4f}")
-        print(f"   Aspect F1: {eval_metrics.get('aspect_f1', 'ERROR')}")
-        print(f"   Opinion F1: {eval_metrics.get('opinion_f1', 'ERROR')}")
-        print(f"   Triplet F1: {eval_metrics.get('triplet_f1', 'ERROR')}")
-        
-        # Check if everything looks good for full training
-        if (eval_metrics.get('aspect_f1', -1) >= 0 and 
-            train_losses['total_loss'] > 0 and 
-            train_losses['total_loss'] < 100):
-            print("\n✓ ALL SYSTEMS READY - You can run full training!")
-            return True
-        else:
-            print("\n✗ Issues detected - check above output")
-            return False
-            
-    except Exception as e:
-        print(f"✗ Training step failed: {e}")
-        return False
+dummy_dataset = SimplifiedABSADataset("dummy", config.model_name, config.max_length, config.dataset_name)
+dummy_dataset.data = dummy_dataset.data[:2]  # Minimal data
+dummy_loader = DataLoader(dummy_dataset, batch_size=1, collate_fn=collate_fn)
 
-if __name__ == "__main__":
-    # Run both tests
-    print("RUNNING QUICK DIAGNOSTIC TESTS")
-    print("="*50)
-    
-    # Test 1: Evaluation function
-    eval_result = quick_f1_test()
-    
-    # Test 2: One training step
-    if eval_result is not None:
-        training_ready = test_one_training_step()
-        
-        if training_ready:
-            print("\n🎯 FINAL RECOMMENDATION:")
-            print("✓ All fixes verified - run full training with:")
-            print("   python train.py --config dev --num_epochs 3")
-            print("   (Use dev config for faster testing)")
-        else:
-            print("\n🔧 ISSUES REMAIN:")
-            print("   Fix the errors shown above before full training")
-    
-    print("\nTest completed.")
+trainer = NovelABSATrainer(model, config, dummy_loader, dummy_loader, config.device)
+
+print("DEBUG: Span Extraction Analysis")
+print("=" * 40)
+
+# Test with sample labels that should produce spans
+test_opinion_labels = np.array([0, 1, 0, 1, 2, 0, 1, 0, 0, 0])  # Should give 3 opinion spans
+test_aspect_labels = np.array([0, 1, 2, 0, 0, 1, 0, 0, 0, 0])   # Should give 2 aspect spans
+
+print("TEST LABELS:")
+print(f"  Opinion labels: {test_opinion_labels}")
+print(f"  Aspect labels:  {test_aspect_labels}")
+
+# Test current span extraction
+opinion_spans = trainer._extract_spans(test_opinion_labels, 'opinion')
+aspect_spans = trainer._extract_spans(test_aspect_labels, 'aspect')
+
+print(f"\nCURRENT SPAN EXTRACTION RESULTS:")
+print(f"  Opinion spans extracted: {opinion_spans}")
+print(f"  Aspect spans extracted:  {aspect_spans}")
+
+# Check for invalid spans
+invalid_opinion_spans = [span for span in opinion_spans if len(span) >= 2 and span[0] > span[1]]
+invalid_aspect_spans = [span for span in aspect_spans if len(span) >= 2 and span[0] > span[1]]
+
+if invalid_opinion_spans:
+    print(f"  🚨 INVALID OPINION SPANS: {invalid_opinion_spans}")
+    print("     These spans have start > end, causing zero F1!")
+else:
+    print(f"  ✅ All opinion spans valid")
+
+if invalid_aspect_spans:
+    print(f"  🚨 INVALID ASPECT SPANS: {invalid_aspect_spans}")
+else:
+    print(f"  ✅ All aspect spans valid")
+
+print(f"\nEXPECTED RESULTS:")
+print(f"  Opinion spans should be: [(1, 1), (3, 4), (6, 6)]")
+print(f"  Aspect spans should be:  [(1, 2), (5, 5)]")
+
+print(f"\nFIX NEEDED:")
+if invalid_opinion_spans or len(opinion_spans) == 0:
+    print("  Replace _extract_spans method with the fixed version from the artifact")
+else:
+    print("  Span extraction looks correct - issue might be elsewhere")

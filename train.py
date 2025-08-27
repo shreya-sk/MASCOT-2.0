@@ -50,38 +50,30 @@ except ImportError as e:
     sys.exit(1)
 
 def collate_fn(batch):
-    """Fix batching issues"""
-    max_len = 128
+    """Fixed collate function that handles all fields including domain_labels"""
     
-    # Stack tensors properly
+    # Stack tensor fields
     batch_dict = {}
     
-    # Handle each field
+    # Handle sequence-level tensor fields (shape: [seq_len])
     for key in ['input_ids', 'attention_mask', 'aspect_labels', 'opinion_labels', 'sentiment_labels']:
-        tensors = [item[key] for item in batch]
-        
-        # Ensure all same length
-        fixed_tensors = []
-        for tensor in tensors:
-            if len(tensor) == max_len:
-                fixed_tensors.append(tensor)
-            elif len(tensor) < max_len:
-                pad_value = -100 if 'labels' in key else 0
-                padded = torch.cat([tensor, torch.full((max_len - len(tensor),), pad_value, dtype=tensor.dtype)])
-                fixed_tensors.append(padded)
-            else:
-                fixed_tensors.append(tensor[:max_len])
-        
-        batch_dict[key] = torch.stack(fixed_tensors)
+        if key in batch[0]:
+            batch_dict[key] = torch.stack([item[key] for item in batch])
     
-    # Handle domain_labels
-    batch_dict['domain_labels'] = torch.stack([item['domain_labels'] for item in batch])
+    # Handle domain_labels (shape: [1]) -> stack and squeeze to [batch_size]
+    if 'domain_labels' in batch[0]:
+        domain_tensors = [item['domain_labels'] for item in batch]
+        batch_dict['domain_labels'] = torch.stack(domain_tensors).squeeze(-1)  # [batch_size, 1] -> [batch_size]
     
-    # Handle text fields
-    batch_dict['texts'] = [item.get('text', '') for item in batch]
-    batch_dict['aspects'] = [item.get('aspects', []) for item in batch]
-    batch_dict['opinions'] = [item.get('opinions', []) for item in batch]
-    batch_dict['sentiments'] = [item.get('sentiments', []) for item in batch]
+    # Handle text fields (lists)
+    for key in ['texts', 'dataset_name', 'aspects', 'opinions', 'sentiments']:
+        if key in batch[0]:
+            batch_dict[key] = [item[key] for item in batch]
+    
+    # Handle optional fields
+    for key in ['text', 'raw_text']:
+        if key in batch[0]:
+            batch_dict[key] = [item[key] for item in batch]
     
     return batch_dict
 
@@ -803,7 +795,7 @@ class NovelABSATrainer:
         return metrics
     
     def _extract_spans(self, labels, label_type):
-        """Extract spans from BIO labels"""
+        """Extract spans from BIO labels - corrects invalid span bug"""
         spans = []
         current_span_start = None
         
@@ -813,37 +805,53 @@ class NovelABSATrainer:
                 
             if label_type == 'aspect':
                 # 0=O, 1=B-ASP, 2=I-ASP
-                if label == 1:  # B-ASP (beginning)
+                if label == 1:  # B-ASP (beginning of new span)
+                    # Close previous span if exists
                     if current_span_start is not None:
                         spans.append((current_span_start, i-1))
                     current_span_start = i
-                elif label == 0:  # O (outside) 
+                elif label == 0:  # O (outside - end current span)
                     if current_span_start is not None:
                         spans.append((current_span_start, i-1))
                         current_span_start = None
+                # label == 2 (I-ASP) continues current span - no action needed
                         
             elif label_type == 'opinion':
-                # 0=O, 1=B-OP, 2=I-OP
-                if label == 1:  # B-OP
+                # 0=O, 1=B-OP, 2=I-OP  
+                if label == 1:  # B-OP (beginning of new span)
+                    # Close previous span if exists
                     if current_span_start is not None:
                         spans.append((current_span_start, i-1))
                     current_span_start = i
-                elif label == 0:  # O
+                elif label == 0:  # O (outside - end current span)
                     if current_span_start is not None:
                         spans.append((current_span_start, i-1))
                         current_span_start = None
+                # label == 2 (I-OP) continues current span - no action needed
                         
             elif label_type == 'sentiment':
                 # 0=O, 1=POS, 2=NEG, 3=NEU
-                if label > 0:  # Any sentiment
+                if label > 0:  # Any sentiment (individual token labeling)
                     spans.append((i, i, int(label)))  # (start, end, sentiment_class)
         
         # Close final span if exists
         if current_span_start is not None:
             spans.append((current_span_start, len(labels)-1))
         
-        return spans
-    
+        # CRITICAL FIX: Filter out invalid spans where start > end
+        valid_spans = []
+        for span in spans:
+            if len(span) == 2:  # (start, end) format
+                start, end = span
+                if start <= end:  # Only keep valid spans
+                    valid_spans.append(span)
+            elif len(span) == 3:  # (start, end, sentiment) format
+                start, end, sentiment = span
+                if start <= end:
+                    valid_spans.append(span)
+        
+        return valid_spans
+        
     def _compute_span_f1(self, predictions, targets, component):
         """Compute span-level F1 scores - REALISTIC evaluation"""
         all_pred_spans = []
