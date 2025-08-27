@@ -49,6 +49,41 @@ except ImportError as e:
     print("Please install: pip install torch transformers scikit-learn tqdm numpy")
     sys.exit(1)
 
+def collate_fn(batch):
+    """Fix batching issues"""
+    max_len = 128
+    
+    # Stack tensors properly
+    batch_dict = {}
+    
+    # Handle each field
+    for key in ['input_ids', 'attention_mask', 'aspect_labels', 'opinion_labels', 'sentiment_labels']:
+        tensors = [item[key] for item in batch]
+        
+        # Ensure all same length
+        fixed_tensors = []
+        for tensor in tensors:
+            if len(tensor) == max_len:
+                fixed_tensors.append(tensor)
+            elif len(tensor) < max_len:
+                pad_value = -100 if 'labels' in key else 0
+                padded = torch.cat([tensor, torch.full((max_len - len(tensor),), pad_value, dtype=tensor.dtype)])
+                fixed_tensors.append(padded)
+            else:
+                fixed_tensors.append(tensor[:max_len])
+        
+        batch_dict[key] = torch.stack(fixed_tensors)
+    
+    # Handle domain_labels
+    batch_dict['domain_labels'] = torch.stack([item['domain_labels'] for item in batch])
+    
+    # Handle text fields
+    batch_dict['texts'] = [item.get('text', '') for item in batch]
+    batch_dict['aspects'] = [item.get('aspects', []) for item in batch]
+    batch_dict['opinions'] = [item.get('opinions', []) for item in batch]
+    batch_dict['sentiments'] = [item.get('sentiments', []) for item in batch]
+    
+    return batch_dict
 
 # NOVEL MODEL COMPONENTS
 class GradientReversalFunction(torch.autograd.Function):
@@ -888,7 +923,8 @@ class NovelABSATrainer:
         return {'precision': precision, 'recall': recall, 'f1': f1}
     
     def _compute_metrics(self, predictions, targets):
-        """FIXED: Realistic ABSA metrics"""
+        """Compute realistic ABSA metrics - MISSING FUNCTION"""
+        
         if not predictions or not targets:
             return {
                 'aspect_f1': 0.0, 'opinion_f1': 0.0, 'sentiment_f1': 0.0, 'triplet_f1': 0.0,
@@ -917,7 +953,7 @@ class NovelABSATrainer:
             
             span_predictions.append({
                 'aspects': pred_aspect_spans,
-                'opinions': pred_opinion_spans, 
+                'opinions': pred_opinion_spans,
                 'sentiments': pred_sentiment_spans
             })
             
@@ -939,7 +975,7 @@ class NovelABSATrainer:
         # Opinion F1
         opinion_metrics = self._compute_span_f1(span_predictions, span_targets, 'opinions')
         metrics['opinion_f1'] = opinion_metrics['f1']
-        metrics['opinion_precision'] = opinion_metrics['precision'] 
+        metrics['opinion_precision'] = opinion_metrics['precision']
         metrics['opinion_recall'] = opinion_metrics['recall']
         
         # Sentiment F1
@@ -948,14 +984,14 @@ class NovelABSATrainer:
         metrics['sentiment_precision'] = sentiment_metrics['precision']
         metrics['sentiment_recall'] = sentiment_metrics['recall']
         
-        # Triplet F1 - NOW PROPERLY IMPLEMENTED
+        # Triplet F1
         triplet_metrics = self._compute_triplet_f1(span_predictions, span_targets)
         metrics['triplet_f1'] = triplet_metrics['f1']
         
         # Overall accuracy (token-level)
         all_preds = np.concatenate([p['aspect_preds'] for p in predictions] +
-                                  [p['opinion_preds'] for p in predictions] +
-                                  [p['sentiment_preds'] for p in predictions])
+                                [p['opinion_preds'] for p in predictions] +
+                                [p['sentiment_preds'] for p in predictions])
         all_targets = np.concatenate([t['aspect_labels'] for t in targets] +
                                     [t['opinion_labels'] for t in targets] +
                                     [t['sentiment_labels'] for t in targets])
@@ -967,6 +1003,7 @@ class NovelABSATrainer:
             metrics['overall_accuracy'] = 0.0
         
         return metrics
+    
 
     def train(self):
         """Complete training loop"""
@@ -1154,14 +1191,16 @@ def main():
         train_dataset, 
         batch_size=config.batch_size, 
         shuffle=True,
-        num_workers=0
+        num_workers=0,
+        collate_fn=collate_fn  # ADD THIS LINE
     )
-    
+
     val_loader = DataLoader(
         val_dataset, 
         batch_size=config.batch_size, 
         shuffle=False,
-        num_workers=0
+        num_workers=0,
+        collate_fn=collate_fn  # ADD THIS LINE
     ) if val_dataset else None
     
     print(f"✅ Train samples: {len(train_dataset)}")

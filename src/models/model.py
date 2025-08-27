@@ -30,24 +30,23 @@ class GRADIENTModel(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
     
     def forward(self, input_ids, attention_mask=None, **kwargs):
-        """Simple forward pass"""
+        """Fixed forward pass - all token-level predictions"""
         outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
         
-        # Pool the sequence
-        pooled_output = outputs.last_hidden_state.mean(dim=1)
-        pooled_output = self.dropout(pooled_output)
+        # Use token-level features for ALL classifiers
+        token_features = outputs.last_hidden_state              # [batch, seq_len, hidden]
+        token_features = self.dropout(token_features)
         
-        # Classifications
-        aspect_logits = self.aspect_classifier(pooled_output)
-        opinion_logits = self.opinion_classifier(pooled_output)
-        sentiment_logits = self.sentiment_classifier(pooled_output)
+        # ALL predictions are now token-level
+        aspect_logits = self.aspect_classifier(token_features)   # [batch, seq_len, 3]
+        opinion_logits = self.opinion_classifier(token_features) # [batch, seq_len, 3] 
+        sentiment_logits = self.sentiment_classifier(token_features) # [batch, seq_len, 4]
         
         return {
             'aspect_logits': aspect_logits,
             'opinion_logits': opinion_logits,
             'sentiment_logits': sentiment_logits,
-            'last_hidden_state': outputs.last_hidden_state
+            'last_hidden_state': token_features
         }
-
 # Backward compatibility
 GRADIENTModel = GRADIENTModel

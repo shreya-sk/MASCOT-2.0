@@ -427,48 +427,59 @@ class EnhancedABSATrainer:
         
         return avg_losses
     
-    def evaluate_epoch(self, dataloader, epoch: int) -> Dict[str, float]:
-        """Enhanced evaluation with sophisticated metrics"""
+    def fixed_evaluate_epoch(self, dataloader, epoch: int):
+        """
+        FIXED: Enhanced evaluation that actually computes F1 scores
+        Replace your current evaluate_epoch method with this
+        """
         self.model.eval()
         
         eval_losses = {}
         all_predictions = []
         all_targets = []
         
+        # Collect predictions in the format your _compute_metrics expects
+        batch_predictions = []
+        batch_targets = []
+        
+        print(f"🔍 Starting evaluation with F1 computation...")
+        
         with torch.no_grad():
-            for batch in tqdm(dataloader, desc='Evaluating'):
+            for batch_idx, batch in enumerate(tqdm(dataloader, desc='Evaluating')):
                 # Move batch to device
                 batch = {k: v.to(self.model.device) if torch.is_tensor(v) else v 
                         for k, v in batch.items()}
                 
-                dataset_name = batch.get('dataset_name', 'general')
-                if isinstance(dataset_name, list):
-                    dataset_name = dataset_name[0]
-                
                 # Forward pass
                 outputs = self.model(
                     input_ids=batch['input_ids'],
-                    attention_mask=batch['attention_mask'],
-                    labels=batch,
-                    dataset_name=dataset_name
+                    attention_mask=batch['attention_mask']
                 )
                 
-                # Compute losses
-                if 'losses' in outputs:
-                    loss_dict = outputs['losses']
-                else:
-                    total_loss, loss_dict = self.model.compute_comprehensive_loss(outputs, batch, dataset_name)
+                # FIXED: Extract predictions in the format _compute_metrics expects
+                batch_size = outputs['aspect_logits'].size(0)
                 
-                # Accumulate losses
-                for loss_name, loss_value in loss_dict.items():
-                    if loss_name not in eval_losses:
-                        eval_losses[loss_name] = []
-                    if isinstance(loss_value, torch.Tensor):
-                        eval_losses[loss_name].append(loss_value.item())
-                    else:
-                        eval_losses[loss_name].append(loss_value)
+                for b in range(batch_size):
+                    # Get predictions for this sample
+                    seq_len = batch['attention_mask'][b].sum().item() if 'attention_mask' in batch else outputs['aspect_logits'].size(1)
+                    
+                    pred_dict = {
+                        'aspect_preds': torch.argmax(outputs['aspect_logits'][b][:seq_len], dim=-1).cpu().numpy(),
+                        'opinion_preds': torch.argmax(outputs['opinion_logits'][b][:seq_len], dim=-1).cpu().numpy(),
+                        'sentiment_preds': torch.argmax(outputs['sentiment_logits'][b][:seq_len], dim=-1).cpu().numpy()
+                    }
+                    
+                    # Get targets for this sample
+                    target_dict = {
+                        'aspect_labels': batch['aspect_labels'][b][:seq_len].cpu().numpy(),
+                        'opinion_labels': batch['opinion_labels'][b][:seq_len].cpu().numpy(),
+                        'sentiment_labels': batch['sentiment_labels'][b][:seq_len].cpu().numpy()
+                    }
+                    
+                    batch_predictions.append(pred_dict)
+                    batch_targets.append(target_dict)
                 
-                # Extract predictions for metrics (simplified)
+                # For loss computation (keep existing logic)
                 if 'aspect_logits' in outputs:
                     aspect_preds = torch.argmax(outputs['aspect_logits'], dim=-1)
                     all_predictions.append(aspect_preds.cpu())
@@ -476,21 +487,34 @@ class EnhancedABSATrainer:
                 if 'aspect_labels' in batch:
                     all_targets.append(batch['aspect_labels'].cpu())
         
-        # Calculate average losses
-        avg_eval_losses = {name: np.mean(losses) for name, losses in eval_losses.items()}
+        print(f"✅ Collected {len(batch_predictions)} samples for F1 evaluation")
         
-        # Add basic accuracy metrics
+        # CRITICAL: Now call your _compute_metrics function!
+        f1_metrics = self._compute_metrics(batch_predictions, batch_targets)
+        
+        # Also compute basic accuracy (for compatibility)
+        avg_eval_losses = {}
         if all_predictions and all_targets:
             all_preds = torch.cat(all_predictions, dim=0)
             all_targs = torch.cat(all_targets, dim=0)
             
-            # Calculate accuracy for non-padded tokens
             mask = all_targs != -100
             if mask.any():
                 accuracy = (all_preds[mask] == all_targs[mask]).float().mean().item()
                 avg_eval_losses['accuracy'] = accuracy
         
+        # FIXED: Combine F1 metrics with other metrics
+        avg_eval_losses.update(f1_metrics)
+        
+        print(f"\n📊 EVALUATION RESULTS:")
+        print(f"   Token Accuracy: {avg_eval_losses.get('accuracy', 0.0):.4f}")
+        print(f"   Aspect F1: {f1_metrics.get('aspect_f1', 0.0):.4f}")
+        print(f"   Opinion F1: {f1_metrics.get('opinion_f1', 0.0):.4f}")
+        print(f"   Sentiment F1: {f1_metrics.get('sentiment_f1', 0.0):.4f}")
+        print(f"   Triplet F1: {f1_metrics.get('triplet_f1', 0.0):.4f}")
+        
         return avg_eval_losses
+
     
     def train(self) -> Dict[str, Any]:
         """Main training loop for enhanced trainer"""

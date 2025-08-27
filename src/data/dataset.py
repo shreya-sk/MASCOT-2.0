@@ -8,11 +8,11 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import json
 import os
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from transformers import AutoTokenizer
 import numpy as np
 
-class FixedABSADataset(Dataset):
+class SimplifiedABSADataset(Dataset):
     """Fixed ABSA Dataset that properly generates labels"""
     
     def __init__(self, data_path: str, tokenizer_name: str = 'roberta-base', 
@@ -224,7 +224,7 @@ class FixedABSADataset(Dataset):
         }
 
 def load_absa_datasets(dataset_names: List[str], tokenizer_name: str = 'roberta-base',
-                      max_length: int = 128) -> Dict[str, Dict[str, FixedABSADataset]]:
+                      max_length: int = 128) -> Dict[str, Dict[str, SimplifiedABSADataset]]:
     """Load ABSA datasets with proper label generation"""
     datasets = {}
     
@@ -244,7 +244,7 @@ def load_absa_datasets(dataset_names: List[str], tokenizer_name: str = 'roberta-
             if not os.path.exists(data_path):
                 data_path = f'{base_path}/{dataset_name}_{split}.json'
             
-            datasets[dataset_name][split] = FixedABSADataset(
+            datasets[dataset_name][split] = SimplifiedABSADataset(
                 data_path=data_path,
                 tokenizer_name=tokenizer_name,
                 max_length=max_length,
@@ -253,7 +253,7 @@ def load_absa_datasets(dataset_names: List[str], tokenizer_name: str = 'roberta-
     
     return datasets
 
-def create_data_loaders(datasets: Dict[str, Dict[str, FixedABSADataset]], 
+def create_data_loaders(datasets: Dict[str, Dict[str, SimplifiedABSADataset]], 
                        batch_size: int = 16) -> Dict[str, DataLoader]:
     """Create data loaders"""
     all_train_datasets = []
@@ -343,11 +343,11 @@ def load_absa_datasets(dataset_names: List[str]) -> Dict[str, Dict[str, Dataset]
         dataset_dict = {}
         
         if os.path.exists(train_path):
-            dataset_dict['train'] = FixedABSADataset(train_path, tokenizer)
+            dataset_dict['train'] = SimplifiedABSADataset(train_path, tokenizer)
         if os.path.exists(dev_path):
-            dataset_dict['dev'] = FixedABSADataset(dev_path, tokenizer)
+            dataset_dict['dev'] = SimplifiedABSADataset(dev_path, tokenizer)
         if os.path.exists(test_path):
-            dataset_dict['test'] = FixedABSADataset(test_path, tokenizer)
+            dataset_dict['test'] = SimplifiedABSADataset(test_path, tokenizer)
         
         if dataset_dict:
             datasets[dataset_name] = dataset_dict
