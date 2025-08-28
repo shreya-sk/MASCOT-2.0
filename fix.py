@@ -1,96 +1,73 @@
 #!/usr/bin/env python3
-"""
-ALIGNMENT FIX TEST - Verify the tensor alignment bug is resolved
-Save this as alignment_test.py and run it
-"""
 
 import sys
-sys.path.append('.')
+import os
+sys.path.insert(0, '.')
 
-from train import SimplifiedABSADataset, collate_fn
-from torch.utils.data import DataLoader
 import torch
+from train import NovelGradientABSAModel, NovelABSAConfig, SimplifiedABSADataset, collate_fn
+from torch.utils.data import DataLoader
 
-def test_alignment_fix():
-    """Test the specific alignment bug causing 4 B-tags to become 1 B-tag"""
+def test_class_balancing():
+    print("TESTING CLASS WEIGHT INTEGRATION")
+    print("=" * 40)
     
-    print("ALIGNMENT FIX TEST - Verifying tensor alignment")
-    print("=" * 50)
+    # Create config and model
+    config = NovelABSAConfig('dev')
+    model = NovelGradientABSAModel(config)
     
-    # Create dataset with the problematic sample
-    dataset = SimplifiedABSADataset(
-        "Datasets/aste/laptop14/train.txt", 
-        "bert-base-uncased", 
-        128, 
-        "laptop14"
-    )
-    
-    # Test the specific problematic item (index 1 has 4 opinions)
-    print("Testing sample with 4 opinions...")
-    
-    # Get the raw item directly
-    item = dataset.data[1]
-    print(f"Raw opinions: {item.get('opinions', [])}")
-    
-    # Test __getitem__ method
-    processed_item = dataset.__getitem__(1)
-    
-    # Check the final tensor
-    opinion_labels = processed_item['opinion_labels']
-    print(f"Opinion labels tensor shape: {opinion_labels.shape}")
-    print(f"Opinion labels (first 15): {opinion_labels[:15].tolist()}")
-    
-    # Count B-tags (label == 1)
-    b_count = sum(1 for x in opinion_labels if x == 1)
-    print(f"Final B-tag count in tensor: {b_count}")
-    
-    # Expected: Should be 4 B-tags, not 1
-    if b_count == 4:
-        print("✅ ALIGNMENT FIX SUCCESS: 4 B-tags preserved!")
-    elif b_count == 1:
-        print("❌ ALIGNMENT BUG PERSISTS: Only 1 B-tag found")
-    else:
-        print(f"⚠️ UNEXPECTED: Found {b_count} B-tags")
-    
-    print("\nTesting DataLoader batching...")
-    
-    # Test with DataLoader
+    # Create small test dataset
+    dataset = SimplifiedABSADataset("dummy", config.model_name, config.max_length, config.dataset_name)
     loader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn)
+    
+    # Get one batch
     batch = next(iter(loader))
     
-    # Check batch processing
-    for i in range(min(2, len(batch['opinion_labels']))):
-        opinion_labels = batch['opinion_labels'][i]
-        valid_mask = opinion_labels != -100
-        valid_opinions = opinion_labels[valid_mask]
-        
-        b_count = sum(valid_opinions == 1)
-        i_count = sum(valid_opinions == 2)
-        
-        print(f"Batch item {i}: B={b_count}, I={i_count}")
-        
-        # Check if this is the 4-opinion sample
-        if i == 1:  # Second item should be the 4-opinion sample
-            if b_count == 4:
-                print(f"✅ Batch processing SUCCESS: Item {i} has 4 B-tags")
-            else:
-                print(f"❌ Batch processing FAILED: Item {i} has {b_count} B-tags instead of 4")
+    # Move to device
+    for key in batch:
+        if isinstance(batch[key], torch.Tensor):
+            batch[key] = batch[key].to(config.device)
     
-    print("\n" + "=" * 50)
-    print("DIAGNOSIS:")
+    # Test class weight computation
+    print("Testing class weight computation:")
+    opinion_weights = model._compute_class_weights(batch['opinion_labels'].view(-1))
+    print(f"Opinion class weights: {opinion_weights}")
     
-    if b_count == 4:
-        print("✅ Alignment fix successful - ready for training")
-        print("Expected training results:")
-        print("   - Opinion F1: 0.25-0.45 (major improvement)")
-        print("   - Triplet F1: 0.20-0.35 (working triplets)")
+    # Expected: Higher weights for B/I classes (indices 1,2)
+    if opinion_weights[1] > opinion_weights[0] and opinion_weights[2] > opinion_weights[0]:
+        print("✅ Class weights correctly prioritize B/I tags")
+    else:
+        print("❌ Class weights not working correctly")
+    
+    # Test forward pass with loss computation
+    print("\nTesting forward pass with class balancing:")
+    outputs = model(
+        input_ids=batch['input_ids'],
+        attention_mask=batch['attention_mask'],
+        aspect_labels=batch['aspect_labels'],
+        opinion_labels=batch['opinion_labels'],
+        sentiment_labels=batch['sentiment_labels'],
+        domain_labels=batch['domain_labels'].squeeze(-1),
+        training=True
+    )
+    
+    print(f"Loss computation successful:")
+    print(f"  Total loss: {outputs['total_loss'].item():.4f}")
+    print(f"  Opinion loss: {outputs['opinion_loss'].item():.4f}")
+    print(f"  Aspect loss: {outputs['aspect_loss'].item():.4f}")
+    
+    # The key test: losses should be computed without error
+    if 'total_loss' in outputs and outputs['total_loss'].item() > 0:
+        print("✅ Class-balanced loss computation working")
         return True
     else:
-        print("❌ Alignment bug not fixed")
-        print("Root cause: Label generation creates 4 B-tags")
-        print("            Tensor processing loses 3 B-tags")
-        print("Need to debug: __getitem__ method alignment logic")
+        print("❌ Loss computation failed")
         return False
 
 if __name__ == "__main__":
-    test_alignment_fix()
+    success = test_class_balancing()
+    if success:
+        print("\n🎉 Class balancing integration successful!")
+        print("Ready to proceed with training.")
+    else:
+        print("\n❌ Integration failed. Check the implementation.")

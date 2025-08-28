@@ -323,40 +323,62 @@ class NovelGradientABSAModel(nn.Module):
             outputs.update(losses)
         
         return outputs
+    def _compute_class_weights(self, labels):
+        """Compute class weights to handle imbalance"""
+        # Remove padding tokens
+        valid_labels = labels[labels != -100]
+        if len(valid_labels) == 0:
+            return torch.ones(3).to(labels.device)  # Default weights
+        
+        # Count each class (0=O, 1=B, 2=I)
+        class_counts = torch.bincount(valid_labels, minlength=3).float()
+        
+        # Compute inverse frequency weights
+        total = class_counts.sum()
+        class_weights = total / (len(class_counts) * class_counts + 1e-6)  # +1e-6 to avoid division by zero
+        
+        return class_weights
     
     def _compute_losses(self, outputs, batch):
-        """Compute all loss components"""
+        """Compute all loss components with class balancing"""
         losses = {}
         total_loss = 0.0
         
-        # Aspect loss
+        # Aspect loss with class balancing
         if batch['aspect_labels'] is not None:
-            aspect_loss = nn.CrossEntropyLoss(ignore_index=-100)(
+            aspect_weights = self._compute_class_weights(batch['aspect_labels'].view(-1))
+            aspect_loss = nn.CrossEntropyLoss(ignore_index=-100, weight=aspect_weights)(
                 outputs['aspect_logits'].view(-1, 3),
                 batch['aspect_labels'].view(-1)
             )
             losses['aspect_loss'] = aspect_loss
             total_loss += aspect_loss
         
-        # Opinion loss  
+        # Opinion loss with class balancing
         if batch['opinion_labels'] is not None:
-            opinion_loss = nn.CrossEntropyLoss(ignore_index=-100)(
+            opinion_weights = self._compute_class_weights(batch['opinion_labels'].view(-1))
+            opinion_loss = nn.CrossEntropyLoss(ignore_index=-100, weight=opinion_weights)(
                 outputs['opinion_logits'].view(-1, 3),
                 batch['opinion_labels'].view(-1)
             )
             losses['opinion_loss'] = opinion_loss
             total_loss += opinion_loss
         
-        # Sentiment loss
+        # Sentiment loss with class balancing (4 classes)
         if batch['sentiment_labels'] is not None:
-            sentiment_loss = nn.CrossEntropyLoss(ignore_index=-100)(
+            sentiment_weights = self._compute_class_weights(batch['sentiment_labels'].view(-1))
+            # Extend weights to 4 classes if needed
+            if sentiment_weights.size(0) < 4:
+                padding = torch.ones(4 - sentiment_weights.size(0)).to(sentiment_weights.device)
+                sentiment_weights = torch.cat([sentiment_weights, padding])
+            sentiment_loss = nn.CrossEntropyLoss(ignore_index=-100, weight=sentiment_weights)(
                 outputs['sentiment_logits'].view(-1, 4),
                 batch['sentiment_labels'].view(-1)
             )
             losses['sentiment_loss'] = sentiment_loss
             total_loss += sentiment_loss
         
-        # Domain adversarial loss
+        # Domain adversarial loss (unchanged)
         if batch['domain_labels'] is not None and outputs['domain_logits'] is not None:
             domain_loss = nn.CrossEntropyLoss()(
                 outputs['domain_logits'],
@@ -365,7 +387,7 @@ class NovelGradientABSAModel(nn.Module):
             losses['domain_loss'] = domain_loss
             total_loss += domain_loss
         
-        # Orthogonal constraint loss
+        # Orthogonal constraint loss (unchanged)
         orthogonal_loss = outputs['orthogonal_loss']
         losses['orthogonal_loss'] = orthogonal_loss
         total_loss += 0.01 * orthogonal_loss
@@ -588,7 +610,7 @@ class SimplifiedABSADataset(Dataset):
                 for i, pos in enumerate(positions):
                     if i == 0:
                         opinion_labels[pos] = 1  # B-OP
-                        print(f"Set position {pos} to B-OP")
+                        #print(f"Set position {pos} to B-OP")
                     else:
                         opinion_labels[pos] = 2  # I-OP
         
@@ -643,7 +665,7 @@ class SimplifiedABSADataset(Dataset):
         )
         
         # Debug: Print original lengths
-        print(f"DEBUG: Original label lengths - aspects: {len(aspect_labels)}, opinions: {len(opinion_labels)}")
+        #print(f"DEBUG: Original label lengths - aspects: {len(aspect_labels)}, opinions: {len(opinion_labels)}")
         
         # Tokenize text
         encoding = self.tokenizer(
@@ -685,7 +707,7 @@ class SimplifiedABSADataset(Dataset):
         
         # Debug: Check final B-tag count
         b_count = sum(1 for x in final_opinion_labels if x == 1)
-        print(f"DEBUG: Final opinion B-tags: {b_count}")
+        # print(f"DEBUG: Final opinion B-tags: {b_count}")
         
         return {
             'input_ids': input_ids,
@@ -1098,11 +1120,11 @@ class NovelABSATrainer:
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
         
         # Debug output
-        print(f"\nTRIPLET FORMATION DEBUG:")
-        print(f"  Predicted triplets: {pred_triplets}")
-        print(f"  Target triplets: {target_triplets}")
-        print(f"  Matches: {matches}")
-        print(f"  Triplet F1: {f1:.4f}")
+        # print(f"\nTRIPLET FORMATION DEBUG:")
+        # print(f"  Predicted triplets: {pred_triplets}")
+        # print(f"  Target triplets: {target_triplets}")
+        # print(f"  Matches: {matches}")
+        # print(f"  Triplet F1: {f1:.4f}")
         
         return {'precision': precision, 'recall': recall, 'f1': f1}
     
