@@ -199,6 +199,9 @@ class OrthogonalConstraintModule(nn.Module):
         correlation = torch.mm(domain_flat.t(), sentiment_flat)
         orthogonal_loss = torch.norm(correlation, 'fro') ** 2 / (domain_flat.size(0) * hidden_size)
         
+        # Add numerical stability and reasonable bounds
+        orthogonal_loss = torch.clamp(orthogonal_loss / 1000.0, 0, 1.0)  # Scale down drastically
+        
         return {
             'domain_features': domain_features,
             'sentiment_features': sentiment_features,
@@ -347,7 +350,7 @@ class NovelGradientABSAModel(nn.Module):
         # Aspect loss with class balancing
         if batch['aspect_labels'] is not None:
             aspect_weights = self._compute_class_weights(batch['aspect_labels'].view(-1))
-            print(f"DEBUG: Aspect weights: {aspect_weights}")
+            # print(f"DEBUG: Aspect weights: {aspect_weights}")
             aspect_loss = nn.CrossEntropyLoss(ignore_index=-100, weight=aspect_weights)(
                 outputs['aspect_logits'].view(-1, 3),
                 batch['aspect_labels'].view(-1)
@@ -368,7 +371,7 @@ class NovelGradientABSAModel(nn.Module):
         # Sentiment loss with class balancing
         if batch['sentiment_labels'] is not None:
             sentiment_weights = self._compute_class_weights(batch['sentiment_labels'].view(-1))
-            print(f"DEBUG: Sentiment weights: {sentiment_weights}")  # Add debug here too
+            # print(f"DEBUG: Sentiment weights: {sentiment_weights}")  # Add debug here too
             if sentiment_weights.size(0) < 4:
                 padding = torch.ones(4 - sentiment_weights.size(0)).to(sentiment_weights.device)
                 sentiment_weights = torch.cat([sentiment_weights, padding])
@@ -595,56 +598,143 @@ class SimplifiedABSADataset(Dataset):
     
     
     def _generate_labels(self, text, aspects, opinions, sentiments):
+        """COMPLETE FIX: Generate ALL labels - aspects, opinions, AND sentiments"""
         tokens = self.tokenizer.tokenize(text)
         
-        # Initialize labels
-        aspect_labels = [0] * len(tokens)
-        opinion_labels = [0] * len(tokens)
-        sentiment_labels = [0] * len(tokens)
+        # Initialize labels - all O/neutral by default
+        aspect_labels = [0] * len(tokens)     # 0 = O
+        opinion_labels = [0] * len(tokens)    # 0 = O  
+        sentiment_labels = [0] * len(tokens)  # 0 = neutral/O
         
-        # Find and label opinions
+        # print(f"DEBUG: Processing text: {text}")
+        # print(f"DEBUG: Tokenized to {len(tokens)} tokens: {tokens}")
+        # print(f"DEBUG: Aspects: {aspects}, Opinions: {opinions}, Sentiments: {sentiments}")
+        
+        # ========== ASPECT LABELING (THE MISSING PIECE) ==========
+        for aspect in aspects:
+            positions = self._find_token_positions(tokens, aspect)
+            # print(f"Aspect '{aspect}' positions: {positions}")
+            if positions:
+                for i, pos in enumerate(positions):
+                    if i == 0:
+                        aspect_labels[pos] = 1  # B-ASP
+                    else:
+                        aspect_labels[pos] = 2  # I-ASP
+        
+        # ========== OPINION LABELING (ALREADY WORKING) ==========
         for opinion in opinions:
             positions = self._find_token_positions(tokens, opinion)
-            print(f"Opinion '{opinion}' positions: {positions}")
+            # print(f"Opinion '{opinion}' positions: {positions}")
             if positions:
                 for i, pos in enumerate(positions):
                     if i == 0:
                         opinion_labels[pos] = 1  # B-OP
-                        #print(f"Set position {pos} to B-OP")
                     else:
                         opinion_labels[pos] = 2  # I-OP
         
-        # Check final counts
-        b_count = sum(1 for label in opinion_labels if label == 1)
-        print(f"Final B-OP count: {b_count}")
+        # ========== SENTIMENT LABELING (THE OTHER MISSING PIECE) ==========
+        # Map sentiment strings to integers
+        sentiment_map = {
+            'positive': 1, 'pos': 1, 'POS': 1,
+            'negative': 2, 'neg': 2, 'NEG': 2,
+            'neutral': 3, 'neu': 3, 'NEU': 3
+        }
+        
+        # Approach 1: Assign sentiments to opinion positions
+        for i, (opinion, sentiment) in enumerate(zip(opinions, sentiments)):
+            if i < len(sentiments):  # Safety check
+                positions = self._find_token_positions(tokens, opinion)
+                sentiment_value = sentiment_map.get(sentiment.lower(), 0)  # Default to 0
+                
+                # print(f"Sentiment '{sentiment}' -> {sentiment_value} for opinion '{opinion}' at positions: {positions}")
+                
+                for pos in positions:
+                    sentiment_labels[pos] = sentiment_value
+        
+        # Approach 2: Also assign sentiments to aspect positions (optional)
+        for i, (aspect, sentiment) in enumerate(zip(aspects, sentiments)):
+            if i < len(sentiments):  # Safety check
+                positions = self._find_token_positions(tokens, aspect)
+                sentiment_value = sentiment_map.get(sentiment.lower(), 0)
+                
+                for pos in positions:
+                    # Only assign if not already assigned by opinion
+                    if sentiment_labels[pos] == 0:
+                        sentiment_labels[pos] = sentiment_value
+        
+        # Debug: Check final counts
+        aspect_b_count = sum(1 for label in aspect_labels if label == 1)
+        opinion_b_count = sum(1 for label in opinion_labels if label == 1)
+        sentiment_pos_count = sum(1 for label in sentiment_labels if label == 1)
+        sentiment_neg_count = sum(1 for label in sentiment_labels if label == 2)
+        
+        # print(f"Final counts - Aspects B-tags: {aspect_b_count}, Opinions B-tags: {opinion_b_count}")
+        # print(f"Final counts - Sentiment POS: {sentiment_pos_count}, NEG: {sentiment_neg_count}")
         
         return aspect_labels, opinion_labels, sentiment_labels
 
     def _find_token_positions(self, tokens, term):
-        """FIXED: Find token positions with proper subword handling"""
-        if not term or not tokens:
+        """IMPROVED: Find token positions with comprehensive matching strategies"""
+        if not term or not tokens or term.strip().lower() == 'null':
             return []
         
         term = term.strip().lower()
         tokens_lower = [t.lower() for t in tokens]
         
-        # Method 1: Exact tokenized sequence matching
+        # print(f"  DEBUG: Looking for term '{term}' in tokens: {tokens_lower}")
+        
+        # Strategy 1: Exact tokenized sequence matching (BEST for multi-word terms)
         term_tokens = self.tokenizer.tokenize(term)
         if term_tokens:
             term_tokens_lower = [t.lower() for t in term_tokens]
+            # print(f"  DEBUG: Term tokenizes to: {term_tokens_lower}")
+            
             for i in range(len(tokens_lower) - len(term_tokens_lower) + 1):
                 if tokens_lower[i:i+len(term_tokens_lower)] == term_tokens_lower:
-                    return list(range(i, i + len(term_tokens_lower)))
+                    positions = list(range(i, i + len(term_tokens_lower)))
+                   #  print(f"  DEBUG: Found exact match at positions {positions}")
+                    return positions
         
-        # Method 2: Substring matching for single words
+        # Strategy 2: Single word exact matching
+        if ' ' not in term:  # Single word
+            for i, token in enumerate(tokens_lower):
+                # Remove subword prefixes for comparison
+                clean_token = token.replace('##', '')
+                clean_term = term.replace('##', '')
+                
+                if clean_term == clean_token:
+                    # print(f"  DEBUG: Found exact single word match at position {i}")
+                    return [i]
+        
+        # Strategy 3: Substring matching for compound words
         if ' ' not in term:  # Single word
             for i, token in enumerate(tokens_lower):
                 clean_token = token.replace('##', '')
                 clean_term = term.replace('##', '')
                 
-                if clean_term == clean_token or clean_term in clean_token:
+                # Check if term is contained in token or vice versa
+                if clean_term in clean_token or clean_token in clean_term:
+                    # print(f"  DEBUG: Found substring match at position {i}")
                     return [i]
         
+        # Strategy 4: Fuzzy matching for multi-word terms
+        if ' ' in term:
+            words = term.split()
+            if len(words) <= 3:  # Only for reasonable length terms
+                # Look for consecutive word matches
+                for i in range(len(tokens_lower) - len(words) + 1):
+                    match_count = 0
+                    for j, word in enumerate(words):
+                        token = tokens_lower[i + j].replace('##', '')
+                        if word in token or token in word:
+                            match_count += 1
+                    
+                    if match_count == len(words):  # All words matched
+                        positions = list(range(i, i + len(words)))
+                        # print(f"  DEBUG: Found fuzzy multi-word match at positions {positions}")
+                        return positions
+        
+        # print(f"  DEBUG: No match found for term '{term}'")
         return []
     
     def __len__(self):
@@ -814,13 +904,19 @@ class NovelABSATrainer:
             return self.config.final_alpha
     
     def train_epoch(self, epoch):
-        """Train one epoch"""
+        """Enhanced train epoch with better logging - DROP-IN REPLACEMENT"""
         self.model.train()
         epoch_losses = []
         
         current_alpha = self.get_alpha(epoch, self.config.num_epochs)
         
+        # Enhanced progress bar with more metrics
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}")
+        
+        # Running averages for smoother reporting
+        running_loss = 0.0
+        running_count = 0
+        log_interval = max(1, len(self.train_loader) // 10)  # Log 10 times per epoch
         
         for batch_idx, batch in enumerate(pbar):
             # Move to device
@@ -862,38 +958,67 @@ class NovelABSATrainer:
                 'orthogonal_loss': outputs.get('orthogonal_loss', torch.tensor(0.0)).item()
             }
             epoch_losses.append(batch_losses)
+            
+            # Running averages
+            running_loss += total_loss.item()
+            running_count += 1
+            
+            # Enhanced progress bar updates
+            pbar.set_postfix({
+                'Loss': f"{total_loss.item():.4f}",
+                'AspL': f"{batch_losses['aspect_loss']:.3f}",
+                'OpL': f"{batch_losses['opinion_loss']:.3f}",
+                'SentL': f"{batch_losses['sentiment_loss']:.3f}",
+                'DomL': f"{batch_losses['domain_loss']:.3f}",
+                'Alpha': f"{current_alpha:.3f}",
+                'LR': f"{self.optimizer.param_groups[0]['lr']:.2e}"
+            })
+            
+            # Periodic detailed logging
+            if batch_idx % log_interval == 0 and batch_idx > 0:
+                avg_loss = running_loss / running_count
+                
+                # Quick F1 evaluation
+                quick_metrics = self.quick_evaluate(num_batches=3)
+                
+                print(f"\n Batch {batch_idx}/{len(self.train_loader)} Report:")
+                print(f"   Avg Loss: {avg_loss:.4f}")
+                print(f"   Quick Aspect F1: {quick_metrics['aspect_f1']:.3f}")
+                print(f"   Quick Opinion F1: {quick_metrics['opinion_f1']:.3f}")
+                print(f"   Quick Sentiment F1: {quick_metrics['sentiment_f1']:.3f}")
+                print(f"   Quick Triplet F1: {quick_metrics['triplet_f1']:.3f}")
+                print(f"   Domain Alpha: {current_alpha:.4f}")
+                print(f"   Learning Rate: {self.optimizer.param_groups[0]['lr']:.2e}")
+                print("-" * 60)
+                
+                # Reset running averages
+                running_loss = 0.0
+                running_count = 0
+            
             # Log to W&B
             if hasattr(self, 'wandb_integration') and self.wandb_integration:
                 self.wandb_integration.log_training_step(epoch, batch_idx, batch_losses, alpha=current_alpha)
-            
-            # Update progress
-            # Update progress with quick F1 evaluation every 20 batches
-            if batch_idx % 20 == 0:
-                # Quick evaluation
-                quick_metrics = self.quick_evaluate(num_batches=3)
-                
-                pbar.set_postfix({
-                    'loss': f"{total_loss.item():.4f}",
-                    'OpF1': f"{quick_metrics['opinion_f1']:.3f}",
-                    'AspF1': f"{quick_metrics['aspect_f1']:.3f}",
-                    'SentF1': f"{quick_metrics['sentiment_f1']:.3f}",
-                    'alpha': f"{current_alpha:.3f}"
-                })
-                
-                # Print detailed results
-                if batch_idx % 40 == 0:  # Every 40 batches
-                    print(f"\nBatch {batch_idx}/227 Quick F1 Results:")
-                    print(f"  Opinion F1: {quick_metrics['opinion_f1']:.4f}")
-                    print(f"  Aspect F1: {quick_metrics['aspect_f1']:.4f}")
-                    print(f"  Sentiment F1: {quick_metrics['sentiment_f1']:.4f}")
-                    print(f"  Triplet F1: {quick_metrics['triplet_f1']:.4f}")
         
-        # Average losses
+        # Calculate epoch averages
         avg_losses = {}
         for key in epoch_losses[0].keys():
             avg_losses[key] = np.mean([loss[key] for loss in epoch_losses])
         
         avg_losses['alpha'] = current_alpha
+        
+        # Final epoch summary
+        print(f"\n🏁 EPOCH {epoch+1} SUMMARY:")
+        print("=" * 60)
+        print(f" Total Batches: {len(self.train_loader)}")
+        print(f" Avg Total Loss: {avg_losses['total_loss']:.4f}")
+        print(f" Avg Aspect Loss: {avg_losses['aspect_loss']:.4f}")
+        print(f" Avg Opinion Loss: {avg_losses['opinion_loss']:.4f}")
+        print(f" Avg Sentiment Loss: {avg_losses['sentiment_loss']:.4f}")
+        print(f" Avg Domain Loss: {avg_losses['domain_loss']:.4f}")
+        print(f" Avg Orthogonal Loss: {avg_losses['orthogonal_loss']:.4f}")
+        print(f" Final Alpha: {current_alpha:.4f}")
+        print(f" Loss Std Dev: {np.std([loss['total_loss'] for loss in epoch_losses]):.4f}")
+        print("=" * 60)
         
         return avg_losses
     

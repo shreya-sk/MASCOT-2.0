@@ -1,35 +1,21 @@
-#!/usr/bin/env python3
-import sys
-sys.path.insert(0, '.')
-
-import torch
+# inference_cli.py
+import argparse
+from predict import ABSAInference
 from train import NovelGradientABSAModel, NovelABSAConfig
 
-def test_integration():
-    print("Testing class weight integration...")
+def main():
+    parser = argparse.ArgumentParser(description='ABSA Inference')
+    parser.add_argument('--model', required=True, help='Path to model checkpoint')
+    parser.add_argument('--text', required=True, help='Text to analyze')
+    parser.add_argument('--confidence', action='store_true', help='Show confidence scores')
     
-    config = NovelABSAConfig('dev')
-    model = NovelGradientABSAModel(config)
+    args = parser.parse_args()
     
-    # Test class weight method exists
-    if hasattr(model, '_compute_class_weights'):
-        print("✅ _compute_class_weights method added")
-    else:
-        print("❌ _compute_class_weights method missing")
-        return False
+    inferencer = ABSAInference(args.model)
+    result = inferencer.predict(args.text, return_confidence=args.confidence)
     
-    # Test with sample data
-    labels = torch.tensor([0, 0, 0, 0, 1, 0, 0, 2, 0, 0])  # Mostly O-tags
-    weights = model._compute_class_weights(labels)
-    
-    print(f"Class weights: {weights}")
-    if weights[1] > weights[0] and weights[2] > weights[0]:
-        print("✅ B/I tags have higher weights than O tags")
-        return True
-    else:
-        print("❌ Class weights not working correctly")
-        return False
+    print(f"Text: {result['text']}")
+    print(f"Triplets: {result['triplets']}")
 
 if __name__ == "__main__":
-    success = test_integration()
-    print("Ready for training!" if success else "Fix needed before training")
+    main()
