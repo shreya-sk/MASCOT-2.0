@@ -347,6 +347,7 @@ class NovelGradientABSAModel(nn.Module):
         # Aspect loss with class balancing
         if batch['aspect_labels'] is not None:
             aspect_weights = self._compute_class_weights(batch['aspect_labels'].view(-1))
+            print(f"DEBUG: Aspect weights: {aspect_weights}")
             aspect_loss = nn.CrossEntropyLoss(ignore_index=-100, weight=aspect_weights)(
                 outputs['aspect_logits'].view(-1, 3),
                 batch['aspect_labels'].view(-1)
@@ -354,7 +355,7 @@ class NovelGradientABSAModel(nn.Module):
             losses['aspect_loss'] = aspect_loss
             total_loss += aspect_loss
         
-        # Opinion loss with class balancing
+        # Opinion loss with class balancing (no changes)
         if batch['opinion_labels'] is not None:
             opinion_weights = self._compute_class_weights(batch['opinion_labels'].view(-1))
             opinion_loss = nn.CrossEntropyLoss(ignore_index=-100, weight=opinion_weights)(
@@ -364,10 +365,10 @@ class NovelGradientABSAModel(nn.Module):
             losses['opinion_loss'] = opinion_loss
             total_loss += opinion_loss
         
-        # Sentiment loss with class balancing (4 classes)
+        # Sentiment loss with class balancing
         if batch['sentiment_labels'] is not None:
             sentiment_weights = self._compute_class_weights(batch['sentiment_labels'].view(-1))
-            # Extend weights to 4 classes if needed
+            print(f"DEBUG: Sentiment weights: {sentiment_weights}")  # Add debug here too
             if sentiment_weights.size(0) < 4:
                 padding = torch.ones(4 - sentiment_weights.size(0)).to(sentiment_weights.device)
                 sentiment_weights = torch.cat([sentiment_weights, padding])
@@ -394,7 +395,6 @@ class NovelGradientABSAModel(nn.Module):
         
         losses['total_loss'] = total_loss
         return losses
-
 
 class SimplifiedABSADataset(Dataset):
     """Complete ABSA dataset with proper token alignment"""
@@ -867,12 +867,26 @@ class NovelABSATrainer:
                 self.wandb_integration.log_training_step(epoch, batch_idx, batch_losses, alpha=current_alpha)
             
             # Update progress
-            if batch_idx % 10 == 0:
+            # Update progress with quick F1 evaluation every 20 batches
+            if batch_idx % 20 == 0:
+                # Quick evaluation
+                quick_metrics = self.quick_evaluate(num_batches=3)
+                
                 pbar.set_postfix({
                     'loss': f"{total_loss.item():.4f}",
-                    'domain': f"{batch_losses['domain_loss']:.4f}",
+                    'OpF1': f"{quick_metrics['opinion_f1']:.3f}",
+                    'AspF1': f"{quick_metrics['aspect_f1']:.3f}",
+                    'SentF1': f"{quick_metrics['sentiment_f1']:.3f}",
                     'alpha': f"{current_alpha:.3f}"
                 })
+                
+                # Print detailed results
+                if batch_idx % 40 == 0:  # Every 40 batches
+                    print(f"\nBatch {batch_idx}/227 Quick F1 Results:")
+                    print(f"  Opinion F1: {quick_metrics['opinion_f1']:.4f}")
+                    print(f"  Aspect F1: {quick_metrics['aspect_f1']:.4f}")
+                    print(f"  Sentiment F1: {quick_metrics['sentiment_f1']:.4f}")
+                    print(f"  Triplet F1: {quick_metrics['triplet_f1']:.4f}")
         
         # Average losses
         avg_losses = {}
@@ -940,6 +954,65 @@ class NovelABSATrainer:
         metrics = self._compute_metrics(all_predictions, all_targets)
         return metrics
     
+    def quick_evaluate(self, num_batches=5):
+        """Quick evaluation on first few batches for debugging"""
+        self.model.eval()
+        
+        all_predictions = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(self.val_loader):
+                if batch_idx >= num_batches:  # Only evaluate first few batches
+                    break
+                    
+                # Move to device
+                for key in batch:
+                    if isinstance(batch[key], torch.Tensor):
+                        batch[key] = batch[key].to(self.device)
+                
+                # Forward pass
+                outputs = self.model(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch['attention_mask'],
+                    training=False
+                )
+                
+                # Extract predictions and targets (same as your full evaluate method)
+                aspect_preds = torch.argmax(outputs['aspect_logits'], dim=-1).cpu().numpy()
+                opinion_preds = torch.argmax(outputs['opinion_logits'], dim=-1).cpu().numpy()
+                sentiment_preds = torch.argmax(outputs['sentiment_logits'], dim=-1).cpu().numpy()
+                
+                aspect_targets = batch['aspect_labels'].cpu().numpy()
+                opinion_targets = batch['opinion_labels'].cpu().numpy()
+                sentiment_targets = batch['sentiment_labels'].cpu().numpy()
+                attention_mask = batch['attention_mask'].cpu().numpy()
+                
+                # Process batch predictions
+                for i in range(len(aspect_preds)):
+                    valid_mask = (attention_mask[i] == 1) & (aspect_targets[i] != -100)
+                    valid_indices = np.where(valid_mask)[0]
+                    
+                    if len(valid_indices) > 0:
+                        pred = {
+                            'aspect_preds': aspect_preds[i][valid_indices],
+                            'opinion_preds': opinion_preds[i][valid_indices], 
+                            'sentiment_preds': sentiment_preds[i][valid_indices]
+                        }
+                        
+                        target = {
+                            'aspect_labels': aspect_targets[i][valid_indices],
+                            'opinion_labels': opinion_targets[i][valid_indices],
+                            'sentiment_labels': sentiment_targets[i][valid_indices]
+                        }
+                        
+                        all_predictions.append(pred)
+                        all_targets.append(target)
+        
+        # Compute metrics
+        metrics = self._compute_metrics(all_predictions, all_targets)
+        return metrics
+        
     def _extract_spans(self, labels, label_type):
         """Extract spans from BIO labels - corrects invalid span bug"""
         spans = []
