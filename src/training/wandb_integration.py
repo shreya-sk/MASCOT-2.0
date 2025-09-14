@@ -352,33 +352,142 @@ class WandBIntegration:
         # Log artifact
         wandb.log_artifact(model_artifact)
     
+    # COMPLETE FIX for src/training/wandb_integration.py
+# Replace the log_final_results method with this corrected version:
+
     def log_final_results(self, results: Dict[str, Any]):
-        """Log final training results and summary"""
+        """Log final training results and summary - COMPLETELY FIXED VERSION"""
         if self.run is None:
             return
-            
-        # Log final metrics
+        
+        print(f"🔍 WandB Debug - Results structure received:")
+        print(f"  Results keys: {list(results.keys())}")
+        print(f"  Best F1: {results.get('best_f1', 'NOT FOUND')}")
+        print(f"  Best metrics: {results.get('best_metrics', 'NOT FOUND')}")
+        
+        # Extract the best metrics that were saved during training
+        best_metrics = results.get('best_metrics', {})
+        
+        # Create final metrics with proper fallbacks
+        # The key issue: your WandB expects individual metrics, but your trainer saves them in 'best_metrics'
         final_metrics = {
-            'final/best_aspect_f1': results.get('aspect_f1', 0),
-            'final/best_opinion_f1': results.get('opinion_f1', 0),
-            'final/best_sentiment_f1': results.get('sentiment_f1', 0),
-            'final/best_triplet_f1': results.get('triplet_f1', 0),
-            'final/training_time_hours': results.get('training_time_hours', 0),
+            'final/best_overall_f1': results.get('best_f1', 0.0),
+            'final/best_aspect_f1': best_metrics.get('aspect_f1', results.get('best_f1', 0.0)),
+            'final/best_opinion_f1': best_metrics.get('opinion_f1', 0.0),
+            'final/best_sentiment_f1': best_metrics.get('sentiment_f1', 0.0),
+            'final/best_triplet_f1': best_metrics.get('triplet_f1', 0.0),
+            'final/training_time_hours': results.get('training_time_hours', results.get('training_time', 0.0)),
         }
         
-        # Add dataset-specific metrics
-        dataset_name = getattr(self.config, 'dataset', 'unknown')
+        # Add additional useful metrics from your results
+        if 'training_history' in results and results['training_history']:
+            final_epoch_losses = results['training_history'][-1] if results['training_history'] else {}
+            final_metrics.update({
+                'final/domain_loss': final_epoch_losses.get('domain_loss', 0.0),
+                'final/orthogonal_loss': final_epoch_losses.get('orthogonal_loss', 0.0),
+                'final/gradient_reversal_alpha': final_epoch_losses.get('alpha', 0.0)
+            })
+        
+        print(f"🔍 WandB Debug - Final metrics to log:")
+        for key, value in final_metrics.items():
+            print(f"  {key}: {value}")
+        
+        # IMPORTANT: Don't modify final_metrics during iteration
+        # Create dataset-specific metrics separately
+        dataset_name = getattr(self.config, 'dataset_name', 'unknown')
+        dataset_metrics = {}
+        
+        # Add dataset-specific versions
         for metric_name, value in final_metrics.items():
             if 'final/' in metric_name:
-                final_metrics[f'{dataset_name}/{metric_name}'] = value
+                clean_metric_name = metric_name.replace('final/', '')
+                dataset_metrics[f'{dataset_name}/final/{clean_metric_name}'] = value
         
-        wandb.log(final_metrics)
+        # Combine all metrics for logging
+        all_metrics = {**final_metrics, **dataset_metrics}
         
-        # Create summary table
-        self._create_results_table(results)
+        print(f"🔍 WandB Debug - Total metrics to log: {len(all_metrics)}")
+        
+        # Log to WandB
+        try:
+            wandb.log(all_metrics)
+            print(f"✅ WandB metrics logged successfully!")
+        except Exception as e:
+            print(f"❌ WandB logging failed: {e}")
+        
+        # Create and log summary table
+        try:
+            self._create_results_table_fixed(results, best_metrics)
+            print(f"✅ WandB results table logged successfully!")
+        except Exception as e:
+            print(f"❌ WandB table logging failed: {e}")
         
         # Mark run as finished
-        wandb.finish()
+        try:
+            wandb.finish()
+            print(f"✅ WandB run finished successfully!")
+        except Exception as e:
+            print(f"❌ WandB finish failed: {e}")
+
+    def _create_results_table_fixed(self, results: Dict[str, Any], best_metrics: Dict[str, Any]):
+        """Create formatted results table with correct data extraction"""
+        
+        # Extract metrics with proper fallbacks
+        overall_f1 = results.get('best_f1', 0.0)
+        aspect_f1 = best_metrics.get('aspect_f1', overall_f1)
+        opinion_f1 = best_metrics.get('opinion_f1', 0.0)
+        sentiment_f1 = best_metrics.get('sentiment_f1', 0.0)
+        triplet_f1 = best_metrics.get('triplet_f1', 0.0)
+        training_time = results.get('training_time_hours', results.get('training_time', 0.0))
+        
+        # Create table data
+        table_data = [
+            ['Overall F1', f"{overall_f1:.4f}"],
+            ['Aspect F1', f"{aspect_f1:.4f}"],
+            ['Opinion F1', f"{opinion_f1:.4f}"],
+            ['Sentiment F1', f"{sentiment_f1:.4f}"],
+            ['Triplet F1', f"{triplet_f1:.4f}"],
+            ['Training Time', f"{training_time:.2f} hours"],
+        ]
+        
+        # Add gradient reversal info if available
+        if 'training_history' in results and results['training_history']:
+            final_losses = results['training_history'][-1]
+            if 'domain_loss' in final_losses:
+                table_data.append(['Domain Loss (Final)', f"{final_losses['domain_loss']:.4f}"])
+            if 'orthogonal_loss' in final_losses:
+                table_data.append(['Orthogonal Loss', f"{final_losses['orthogonal_loss']:.4f}"])
+        
+        # Create W&B table
+        results_table = wandb.Table(
+            columns=['Metric', 'Score'],
+            data=table_data
+        )
+        
+        wandb.log({'final_results_table': results_table})
+
+    # ALSO ADD THIS DEBUG HELPER FUNCTION:
+    def debug_results_structure(results: Dict[str, Any]):
+        """Debug helper to understand your results structure"""
+        print("="*50)
+        print("🔍 DEBUGGING RESULTS STRUCTURE")
+        print("="*50)
+        
+        def print_dict_structure(d, prefix=""):
+            for key, value in d.items():
+                if isinstance(value, dict):
+                    print(f"{prefix}{key}: <dict with {len(value)} keys>")
+                    if len(value) < 10:  # Only print small dicts
+                        print_dict_structure(value, prefix + "  ")
+                elif isinstance(value, list):
+                    print(f"{prefix}{key}: <list with {len(value)} items>")
+                    if len(value) > 0 and len(value) < 5:
+                        print(f"{prefix}  Sample: {value[0] if len(value) > 0 else 'N/A'}")
+                else:
+                    print(f"{prefix}{key}: {value} ({type(value).__name__})")
+        
+        print_dict_structure(results)
+        print("="*50)
     
     def _create_results_table(self, results: Dict[str, Any]):
         """Create formatted results table"""

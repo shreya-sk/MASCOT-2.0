@@ -996,6 +996,7 @@ class NovelABSATrainer:
                 running_count = 0
             
             # Log to W&B
+            
             if hasattr(self, 'wandb_integration') and self.wandb_integration:
                 self.wandb_integration.log_training_step(epoch, batch_idx, batch_losses, alpha=current_alpha)
         
@@ -1669,6 +1670,11 @@ def main():
         
         print(f"💾 Results saved to: {results_path}")
         # Finish W&B logging
+        print("\n🔍 DEBUG: Results structure before WandB logging:")
+        print(f"Results keys: {list(results.keys())}")
+        print(f"Results: {results}")
+        print(f"Best metrics: {results.get('best_metrics', 'NOT FOUND')}")
+        
         if wandb_integration:
             wandb_integration.log_final_results(results)
         

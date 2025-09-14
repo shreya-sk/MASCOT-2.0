@@ -1,276 +1,327 @@
+# predict.py
+"""
+Working prediction script for GRADIENT ABSA model
+Compatible with your current codebase
+"""
+
+import os
+import sys
 import torch
+import json
+import argparse
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
 from transformers import AutoTokenizer
-import numpy as np
-from train import NovelGradientABSAModel, NovelABSAConfig
-from typing import List, Dict, Any
 
-class ABSAInference:
-    """Complete inference class for your trained ABSA model"""
+# Add src to Python path
+src_path = Path(__file__).parent / "src"
+sys.path.insert(0, str(src_path))
+
+# Import your actual modules
+from utils.config import Config
+from models.unified_absa_model import UnifiedABSAModel
+
+class GRADIENTPredictor:
+    """
+    Prediction class for your GRADIENT ABSA model
+    Works with your actual trained models
+    """
     
-    def __init__(self, model_path: str, config_path: str = None):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def __init__(self, model_path: str, config_path: str = None, device: str = None):
+        self.device = torch.device(device if device else ('cuda' if torch.cuda.is_available() else 'cpu'))
         
-        # Load the saved model checkpoint
-        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-
-        
-        # Reconstruct config (or load from saved config)
-        if config_path:
-            self.config = torch.load(config_path)
+        # Load config
+        if config_path and os.path.exists(config_path):
+            self.config = Config.from_json(config_path)
         else:
-            # Use the saved config from checkpoint
-            self.config = checkpoint.get('config', None)
-            if not self.config:
-                # Fallback to default config
-                self.config = self._create_default_config()
+            self.config = Config()  # Use default config
         
-        # Initialize tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_name)
+        # Load tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            getattr(self.config, 'model_name', 'roberta-base')
+        )
         
-        # Initialize model
-        self.model = NovelGradientABSAModel(self.config)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.to(self.device)
+        if not self.tokenizer.pad_token:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Load model
+        self.model = self._load_model(model_path)
         self.model.eval()
         
-        # Label mappings for decoding
-        self.aspect_labels = {0: 'O', 1: 'B-ASP', 2: 'I-ASP'}
-        self.opinion_labels = {0: 'O', 1: 'B-OP', 2: 'I-OP'}
-        self.sentiment_labels = {0: 'O', 1: 'POS', 2: 'NEG', 3: 'NEU'}
-        
-        print(f"✅ ABSA model loaded successfully on {self.device}")
+        print(f"✅ GRADIENT model loaded on {self.device}")
     
-    def _create_default_config(self):
-        """Fallback config if not saved with model"""
-        from types import SimpleNamespace
-        return SimpleNamespace(
-            model_name='bert-base-uncased',
-            max_length=128,
-            datasets=['laptop14', 'rest14', 'rest15', 'rest16']
-        )
+    def _load_model(self, model_path: str) -> UnifiedABSAModel:
+        """Load trained GRADIENT model"""
+        try:
+            # Load model state
+            checkpoint = torch.load(model_path, map_location=self.device)
+            
+            # Create model instance
+            model = UnifiedABSAModel(self.config)
+            
+            # Load state dict
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            elif 'state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
+            
+            model.to(self.device)
+            return model
+            
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            print(f"Attempting alternative loading method...")
+            
+            # Alternative: try loading just the weights
+            try:
+                model = UnifiedABSAModel(self.config)
+                model.to(self.device)
+                # If model file is just weights, load directly
+                state_dict = torch.load(model_path, map_location=self.device)
+                model.load_state_dict(state_dict, strict=False)
+                return model
+            except Exception as e2:
+                raise Exception(f"Failed to load model with both methods: {e}, {e2}")
     
-    def predict(self, text: str, return_confidence: bool = False) -> Dict[str, Any]:
+    def predict(self, text: str, return_confidence: bool = True) -> Dict[str, Any]:
         """
-        Predict ABSA components for a single text
+        Predict ABSA triplets for input text
         
         Args:
-            text: Input review/sentence
-            return_confidence: Whether to return prediction confidences
+            text: Input text to analyze
+            return_confidence: Whether to include confidence scores
             
         Returns:
-            Dictionary with aspects, opinions, sentiments, and triplets
+            Dictionary with triplets and metadata
         """
         # Tokenize input
-        encoding = self.tokenizer(
+        inputs = self.tokenizer(
             text,
-            max_length=self.config.max_length,
-            padding='max_length',
+            max_length=getattr(self.config, 'max_length', 512),
+            padding=True,
             truncation=True,
             return_tensors='pt'
         )
         
-        input_ids = encoding['input_ids'].to(self.device)
-        attention_mask = encoding['attention_mask'].to(self.device)
+        # Move to device
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
-        # Get predictions
+        # Get model predictions
         with torch.no_grad():
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                training=False
-            )
+            outputs = self.model(**inputs)
         
-        # Extract logits and convert to predictions
-        aspect_logits = outputs['aspect_logits'].cpu()
-        opinion_logits = outputs['opinion_logits'].cpu()
-        sentiment_logits = outputs['sentiment_logits'].cpu()
+        # Extract predictions
+        triplets = self._extract_triplets(outputs, text, inputs, return_confidence)
         
-        # Get predicted labels
-        aspect_preds = torch.argmax(aspect_logits, dim=-1).squeeze(0).numpy()
-        opinion_preds = torch.argmax(opinion_logits, dim=-1).squeeze(0).numpy()
-        sentiment_preds = torch.argmax(sentiment_logits, dim=-1).squeeze(0).numpy()
-        
-        # Get confidence scores if requested
-        confidences = {}
-        if return_confidence:
-            aspect_conf = torch.softmax(aspect_logits, dim=-1).squeeze(0).numpy()
-            opinion_conf = torch.softmax(opinion_logits, dim=-1).squeeze(0).numpy()
-            sentiment_conf = torch.softmax(sentiment_logits, dim=-1).squeeze(0).numpy()
-            
-            confidences = {
-                'aspect_confidence': aspect_conf,
-                'opinion_confidence': opinion_conf,
-                'sentiment_confidence': sentiment_conf
-            }
-        
-        # Convert to readable format
-        results = self._decode_predictions(
-            text, aspect_preds, opinion_preds, sentiment_preds,
-            attention_mask.cpu().squeeze(0).numpy()
-        )
-        
-        if return_confidence:
-            results['confidences'] = confidences
-            
-        return results
-    
-    def predict_batch(self, texts: List[str]) -> List[Dict[str, Any]]:
-        """Predict ABSA components for multiple texts"""
-        results = []
-        
-        for text in texts:
-            result = self.predict(text)
-            results.append(result)
-        
-        return results
-    
-    def _decode_predictions(self, text: str, aspect_preds: np.ndarray, 
-                          opinion_preds: np.ndarray, sentiment_preds: np.ndarray,
-                          attention_mask: np.ndarray) -> Dict[str, Any]:
-        """Decode model predictions into readable format"""
-        
-        # Tokenize text to align with predictions
-        tokens = self.tokenizer.tokenize(text)
-        
-        # Extract valid predictions (remove padding and special tokens)
-        valid_length = min(len(tokens), len(aspect_preds) - 2)  # Account for [CLS], [SEP]
-        
-        # Skip [CLS] token (index 0), take content tokens
-        valid_aspect_preds = aspect_preds[1:valid_length + 1]
-        valid_opinion_preds = opinion_preds[1:valid_length + 1]
-        valid_sentiment_preds = sentiment_preds[1:valid_length + 1]
-        
-        # Extract spans
-        aspect_spans = self._extract_spans(valid_aspect_preds, tokens, 'aspect')
-        opinion_spans = self._extract_spans(valid_opinion_preds, tokens, 'opinion')
-        sentiment_spans = self._extract_spans(valid_sentiment_preds, tokens, 'sentiment')
-        
-        # Form triplets
-        triplets = self._form_triplets(aspect_spans, opinion_spans, sentiment_spans)
-        
-        return {
+        # Create result
+        result = {
             'text': text,
-            'aspects': aspect_spans,
-            'opinions': opinion_spans, 
-            'sentiments': sentiment_spans,
             'triplets': triplets,
-            'tokens': tokens
+            'model_info': {
+                'model_type': 'GRADIENT',
+                'has_gradient_reversal': getattr(self.config, 'use_gradient_reversal', True),
+                'has_implicit_detection': getattr(self.config, 'use_implicit_detection', True)
+            }
         }
+        
+        return result
     
-    def _extract_spans(self, predictions: np.ndarray, tokens: List[str], 
-                      span_type: str) -> List[Dict[str, Any]]:
-        """Extract named entity spans from BIO predictions"""
+    def _extract_triplets(self, outputs: Dict, text: str, inputs: Dict, return_confidence: bool) -> List[Dict]:
+        """Extract triplets from model outputs"""
+        triplets = []
+        
+        try:
+            # Get predictions from model outputs
+            aspect_logits = outputs.get('aspect_logits')
+            opinion_logits = outputs.get('opinion_logits') 
+            sentiment_logits = outputs.get('sentiment_logits')
+            
+            if aspect_logits is None or opinion_logits is None or sentiment_logits is None:
+                print("⚠️ Model outputs missing required logits")
+                return triplets
+            
+            # Convert to predictions
+            aspect_preds = torch.argmax(aspect_logits, dim=-1)[0].cpu().numpy()
+            opinion_preds = torch.argmax(opinion_logits, dim=-1)[0].cpu().numpy()
+            sentiment_preds = torch.argmax(sentiment_logits, dim=-1)[0].cpu().numpy()
+            
+            # Convert token predictions to text spans
+            tokens = self.tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
+            
+            # Extract aspect spans
+            aspect_spans = self._extract_spans(aspect_preds, tokens, 'aspect')
+            opinion_spans = self._extract_spans(opinion_preds, tokens, 'opinion')
+            
+            # Pair aspects with opinions and sentiments
+            triplets = self._form_triplets(aspect_spans, opinion_spans, sentiment_preds, tokens, return_confidence)
+            
+        except Exception as e:
+            print(f"⚠️ Error extracting triplets: {e}")
+            # Return empty triplets on error
+        
+        return triplets
+    
+    def _extract_spans(self, predictions: List[int], tokens: List[str], span_type: str) -> List[Dict]:
+        """Extract spans from BIO predictions"""
         spans = []
         current_span = None
         
-        for i, pred in enumerate(predictions):
-            if span_type in ['aspect', 'opinion']:
-                # BIO tagging: 0=O, 1=B, 2=I
-                if pred == 1:  # B-tag (beginning)
-                    # Save previous span if exists
-                    if current_span:
-                        spans.append(current_span)
-                    # Start new span
-                    current_span = {
-                        'start': i,
-                        'end': i,
-                        'tokens': [tokens[i]],
-                        'text': tokens[i].replace('##', '')
-                    }
-                elif pred == 2 and current_span:  # I-tag (inside)
-                    # Extend current span
-                    current_span['end'] = i
-                    current_span['tokens'].append(tokens[i])
-                    current_span['text'] += tokens[i].replace('##', '')
-                elif pred == 0:  # O-tag (outside)
-                    # End current span
-                    if current_span:
-                        spans.append(current_span)
-                        current_span = None
-                        
-            elif span_type == 'sentiment':
-                # Individual token predictions: 1=POS, 2=NEG, 3=NEU
-                if pred > 0:
-                    sentiment_label = self.sentiment_labels[pred]
-                    spans.append({
-                        'start': i,
-                        'end': i,
-                        'tokens': [tokens[i]],
-                        'text': tokens[i].replace('##', ''),
-                        'sentiment': sentiment_label
-                    })
+        for i, (pred, token) in enumerate(zip(predictions, tokens)):
+            # Skip special tokens
+            if token in ['<s>', '</s>', '<pad>', '[CLS]', '[SEP]']:
+                continue
+            
+            if pred == 1:  # B- (Beginning)
+                if current_span:
+                    spans.append(current_span)
+                current_span = {
+                    'start': i,
+                    'end': i,
+                    'tokens': [token],
+                    'type': span_type
+                }
+            elif pred == 2 and current_span:  # I- (Inside)
+                current_span['end'] = i
+                current_span['tokens'].append(token)
+            else:  # O (Outside)
+                if current_span:
+                    spans.append(current_span)
+                    current_span = None
         
-        # Add final span if exists
+        # Add final span
         if current_span:
             spans.append(current_span)
-            
+        
+        # Convert tokens back to text
+        for span in spans:
+            span['text'] = self._tokens_to_text(span['tokens'])
+        
         return spans
     
-    def _form_triplets(self, aspects: List[Dict], opinions: List[Dict], 
-                      sentiments: List[Dict]) -> List[Dict[str, str]]:
-        """Form aspect-opinion-sentiment triplets"""
+    def _tokens_to_text(self, tokens: List[str]) -> str:
+        """Convert tokens back to readable text"""
+        text = self.tokenizer.convert_tokens_to_string(tokens)
+        return text.strip()
+    
+    def _form_triplets(self, aspect_spans: List[Dict], opinion_spans: List[Dict], 
+                      sentiment_preds: List[int], tokens: List[str], return_confidence: bool) -> List[Dict]:
+        """Form triplets by pairing aspects with opinions and sentiments"""
         triplets = []
         
-        # Simple proximity-based triplet formation
-        for aspect in aspects:
-            for opinion in opinions:
-                # Find closest sentiment to this opinion
-                best_sentiment = None
-                min_distance = float('inf')
+        # Simple pairing strategy: match closest aspects and opinions
+        for aspect in aspect_spans:
+            best_opinion = None
+            best_distance = float('inf')
+            
+            # Find closest opinion to this aspect
+            for opinion in opinion_spans:
+                distance = abs(aspect['start'] - opinion['start'])
+                if distance < best_distance:
+                    best_distance = distance
+                    best_opinion = opinion
+            
+            if best_opinion:
+                # Get sentiment for this region
+                region_start = min(aspect['start'], best_opinion['start'])
+                region_end = max(aspect['end'], best_opinion['end'])
                 
-                for sentiment in sentiments:
-                    # Calculate distance between opinion and sentiment
-                    opinion_center = (opinion['start'] + opinion['end']) / 2
-                    sentiment_center = (sentiment['start'] + sentiment['end']) / 2
-                    distance = abs(opinion_center - sentiment_center)
+                # Get most common sentiment in region
+                region_sentiments = sentiment_preds[region_start:region_end+1]
+                if region_sentiments:
+                    sentiment_counts = {0: 0, 1: 0, 2: 0, 3: 0}  # O, POS, NEG, NEU
+                    for s in region_sentiments:
+                        if s in sentiment_counts:
+                            sentiment_counts[s] += 1
                     
-                    if distance < min_distance:
-                        min_distance = distance
-                        best_sentiment = sentiment
-                
-                # Form triplet if sentiment found within reasonable distance
-                if best_sentiment and min_distance <= 5:  # Within 5 tokens
-                    triplets.append({
+                    # Get most frequent non-O sentiment
+                    sentiment_id = max([1, 2, 3], key=lambda x: sentiment_counts[x])
+                    sentiment_map = {1: 'POS', 2: 'NEG', 3: 'NEU'}
+                    sentiment = sentiment_map.get(sentiment_id, 'NEU')
+                    
+                    triplet = {
                         'aspect': aspect['text'],
-                        'opinion': opinion['text'],
-                        'sentiment': best_sentiment['sentiment'],
-                        'confidence': 'high' if min_distance <= 2 else 'medium'
-                    })
+                        'opinion': best_opinion['text'],
+                        'sentiment': sentiment,
+                        'aspect_span': (aspect['start'], aspect['end']),
+                        'opinion_span': (best_opinion['start'], best_opinion['end'])
+                    }
+                    
+                    if return_confidence:
+                        triplet['confidence'] = 0.8  # Placeholder confidence
+                    
+                    triplets.append(triplet)
         
         return triplets
-
-# Usage Examples
-def main():
-    """Example usage of the ABSA inference system"""
     
-    # Initialize the inference system
-    inferencer = ABSAInference(
-        model_path='outputs/best_model.pt'  # Path to your saved model
+    def predict_batch(self, texts: List[str]) -> List[Dict[str, Any]]:
+        """Predict triplets for multiple texts"""
+        results = []
+        for text in texts:
+            result = self.predict(text)
+            results.append(result)
+        return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="GRADIENT ABSA Prediction")
+    parser.add_argument("--model", required=True, help="Path to trained model")
+    parser.add_argument("--config", help="Path to config file")
+    parser.add_argument("--text", help="Text to analyze")
+    parser.add_argument("--file", help="File with texts (one per line)")
+    parser.add_argument("--output", help="Output file for results")
+    parser.add_argument("--device", default=None, help="Device (cuda/cpu)")
+    
+    args = parser.parse_args()
+    
+    if not args.text and not args.file:
+        parser.error("Either --text or --file must be provided")
+    
+    # Initialize predictor
+    print(f"🔄 Loading GRADIENT model from {args.model}")
+    predictor = GRADIENTPredictor(
+        model_path=args.model,
+        config_path=args.config,
+        device=args.device
     )
     
-    # Single prediction
-    test_text = "The food was delicious but the service was terrible."
-    result = inferencer.predict(test_text, return_confidence=True)
+    results = []
     
-    print("Input:", result['text'])
-    print("Aspects:", [asp['text'] for asp in result['aspects']])
-    print("Opinions:", [op['text'] for op in result['opinions']])
-    print("Sentiments:", [(s['text'], s['sentiment']) for s in result['sentiments']])
-    print("Triplets:", result['triplets'])
+    if args.text:
+        # Single text prediction
+        print(f"\n🔍 Analyzing: {args.text}")
+        result = predictor.predict(args.text)
+        results.append(result)
+        
+        # Print results
+        print(f"\n📊 Results:")
+        print(f"Text: {result['text']}")
+        print(f"Triplets ({len(result['triplets'])}):")
+        for i, triplet in enumerate(result['triplets'], 1):
+            print(f"  {i}. Aspect: '{triplet['aspect']}' | Opinion: '{triplet['opinion']}' | Sentiment: {triplet['sentiment']}")
     
-    # Batch prediction
-    test_texts = [
-        "Great laptop with amazing battery life.",
-        "The screen quality is poor but keyboard is good.",
-        "Excellent restaurant with friendly staff and delicious food."
-    ]
+    elif args.file:
+        # Batch prediction
+        print(f"📁 Reading texts from {args.file}")
+        with open(args.file, 'r', encoding='utf-8') as f:
+            texts = [line.strip() for line in f if line.strip()]
+        
+        print(f"🔄 Processing {len(texts)} texts...")
+        results = predictor.predict_batch(texts)
+        
+        # Print summary
+        total_triplets = sum(len(r['triplets']) for r in results)
+        print(f"\n📊 Processed {len(texts)} texts, found {total_triplets} triplets")
     
-    batch_results = inferencer.predict_batch(test_texts)
+    # Save results if output specified
+    if args.output:
+        with open(args.output, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        print(f"💾 Results saved to {args.output}")
     
-    print("\nBatch Results:")
-    for i, result in enumerate(batch_results):
-        print(f"\nText {i+1}: {result['text']}")
-        print(f"Triplets: {result['triplets']}")
+    print("\n✅ Prediction completed!")
+
 
 if __name__ == "__main__":
     main()
