@@ -1,0 +1,12 @@
+{
+  "aspect_f1": 0.5514679956574932,
+  "opinion_f1": 0.53946210769292,
+  "sentiment_f1": 0.5866745207328518,
+  "triplet_f1": 0.502754861189424,
+  "avg_predictions_per_sample": 1.5714285714285714,
+  "total_predictions": 506,
+  "quality_score": 0.9523809523809524,
+  "num_samples": 322,
+  "precision": 0.8095238095238095,
+  "recall": 0.761904761904762
+}

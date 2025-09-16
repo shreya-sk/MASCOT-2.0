@@ -1,0 +1,7 @@
+Configuration,Component_Description,Rest14_F1,Laptop14_F1,Rest15_F1,Rest16_F1,Avg_CrossDomain_F1
+baseline,"No gradient reversal, no orthogonal constraints",0.8712871287128714,0.0,0.0,0.0,0
+gradient_only,"Only gradient reversal enabled",0.8730964467005077,0.0,0.0,0.0,0
+orthogonal_only,"Only orthogonal constraints enabled",0.8681318681318682,0.0,0.0,0.0,0
+no_implicit,"Full model without implicit detection",0.8729281767955801,0.0,0.0,0.0,0
+no_fusion,"Full model without multi-granularity fusion",0.8817204301075269,0.0,0.0,0.0,0
+full_model,"Complete GRADIENT model",0.8585365853658538,0.47910021526324303,0.502754861189424,0.41344114632175494,.4650

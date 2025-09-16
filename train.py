@@ -283,21 +283,41 @@ class NovelGradientABSAModel(nn.Module):
         sequence_output = backbone_outputs.last_hidden_state
         
         # Apply orthogonal constraints
-        orthogonal_outputs = self.orthogonal_constraint(sequence_output)
-        domain_invariant_features = orthogonal_outputs['sentiment_features']
+        # Apply orthogonal constraints (conditionally)
+        if getattr(self.config, 'use_orthogonal_constraints', True):
+            orthogonal_outputs = self.orthogonal_constraint(sequence_output)
+            domain_invariant_features = orthogonal_outputs['sentiment_features']
+            orthogonal_loss = orthogonal_outputs['orthogonal_loss']
+        else:
+            domain_invariant_features = sequence_output
+            orthogonal_loss = torch.tensor(0.0, device=sequence_output.device)
+        #domain_invariant_features = orthogonal_outputs['sentiment_features']
         
-        # Implicit sentiment detection
-        implicit_outputs = self.implicit_detector(domain_invariant_features, attention_mask)
-        enhanced_features = implicit_outputs['implicit_features']
-        
+       
+        # Implicit sentiment detection (conditionally)
+        # Implicit sentiment detection (conditionally)
+        if getattr(self.config, 'use_implicit_detection', True):
+            implicit_outputs = self.implicit_detector(domain_invariant_features, attention_mask)
+            if getattr(self.config, 'use_multi_granularity_fusion', True):
+                enhanced_features = implicit_outputs['implicit_features']
+            else:
+                # Use simpler features without fusion
+                enhanced_features = implicit_outputs['span_features']
+        else:
+            implicit_outputs = {'implicit_features': domain_invariant_features}
+            enhanced_features = domain_invariant_features
+            
+
+
         # ABSA predictions
         aspect_logits = self.aspect_classifier(enhanced_features)
         opinion_logits = self.opinion_classifier(enhanced_features)
         sentiment_logits = self.sentiment_classifier(enhanced_features)
         
         # Domain adversarial prediction (with gradient reversal)
-        if training:
-            pooled_features = enhanced_features.mean(dim=1)  # Global average pooling
+        # Domain adversarial prediction (conditionally with gradient reversal)
+        if training and getattr(self.config, 'use_gradient_reversal', True):
+            pooled_features = enhanced_features.mean(dim=1)
             reversed_features = self.gradient_reversal(pooled_features, alpha)
             domain_logits = self.domain_classifier(reversed_features)
         else:
@@ -309,7 +329,7 @@ class NovelGradientABSAModel(nn.Module):
             'sentiment_logits': sentiment_logits,
             'domain_logits': domain_logits,
             'implicit_outputs': implicit_outputs,
-            'orthogonal_loss': orthogonal_outputs['orthogonal_loss'],
+            'orthogonal_loss': orthogonal_loss,
             'enhanced_features': enhanced_features
         }
         
@@ -383,13 +403,18 @@ class NovelGradientABSAModel(nn.Module):
             total_loss += sentiment_loss
         
         # Domain adversarial loss (unchanged)
+        # Domain adversarial loss (conditional)
         if batch['domain_labels'] is not None and outputs['domain_logits'] is not None:
             domain_loss = nn.CrossEntropyLoss()(
                 outputs['domain_logits'],
                 batch['domain_labels']
             )
             losses['domain_loss'] = domain_loss
-            total_loss += domain_loss
+            # Only add to total loss if gradient reversal is enabled
+            if getattr(self.config, 'use_gradient_reversal', True):
+                total_loss += domain_loss
+        else:
+            losses['domain_loss'] = torch.tensor(0.0)
         
         # Orthogonal constraint loss (unchanged)
         orthogonal_loss = outputs['orthogonal_loss']
@@ -816,6 +841,11 @@ class NovelABSAConfig:
     """Complete configuration for novel ABSA model"""
     
     def __init__(self, config_type='research'):
+        # Check for ablation configuration
+        ablation_config = os.environ.get('ABLATION_CONFIG')
+        if ablation_config:
+            config_type = 'ablation'
+        
         # Model settings
         self.model_name = 'bert-base-uncased'
         self.hidden_size = 768
@@ -844,6 +874,16 @@ class NovelABSAConfig:
         # Orthogonal constraints
         self.orthogonal_weight = 0.01
         
+        # Ablation-specific settings
+        if config_type == 'ablation':
+            self._apply_ablation_config(ablation_config)
+        else:
+            # Default: all components enabled
+            self.use_gradient_reversal = True
+            self.use_orthogonal_constraints = True
+            self.use_implicit_detection = True
+            self.use_multi_granularity_fusion = True
+        
         # Dataset settings
         self.datasets = ['laptop14', 'rest14', 'rest15', 'rest16']
         self.dataset_name = 'laptop14'
@@ -855,6 +895,50 @@ class NovelABSAConfig:
         self.experiment_name = f'gradient_absa_{config_type}'
         
         print(f"✅ Configuration loaded: {config_type}")
+            
+    def _apply_ablation_config(self, ablation_name):
+        """Apply ablation-specific component settings"""
+        if ablation_name == "baseline":
+            self.use_gradient_reversal = False
+            self.use_orthogonal_constraints = False
+            self.use_implicit_detection = False
+            self.use_multi_granularity_fusion = False
+            
+        elif ablation_name == "gradient_only":
+            self.use_gradient_reversal = True
+            self.use_orthogonal_constraints = False
+            self.use_implicit_detection = False
+            self.use_multi_granularity_fusion = False
+            
+        elif ablation_name == "orthogonal_only":
+            self.use_gradient_reversal = False
+            self.use_orthogonal_constraints = True
+            self.use_implicit_detection = False
+            self.use_multi_granularity_fusion = False
+            
+        elif ablation_name == "no_implicit":
+            self.use_gradient_reversal = True
+            self.use_orthogonal_constraints = True
+            self.use_implicit_detection = False
+            self.use_multi_granularity_fusion = True
+            
+        elif ablation_name == "no_fusion":
+            self.use_gradient_reversal = True
+            self.use_orthogonal_constraints = True
+            self.use_implicit_detection = True
+            self.use_multi_granularity_fusion = False
+            
+        elif ablation_name == "full_model":
+            self.use_gradient_reversal = True
+            self.use_orthogonal_constraints = True
+            self.use_implicit_detection = True
+            self.use_multi_granularity_fusion = True
+            
+        print(f"✅ Ablation '{ablation_name}' applied:")
+        print(f"   Gradient Reversal: {self.use_gradient_reversal}")
+        print(f"   Orthogonal Constraints: {self.use_orthogonal_constraints}")  
+        print(f"   Implicit Detection: {self.use_implicit_detection}")
+        print(f"   Multi-granularity Fusion: {self.use_multi_granularity_fusion}")
 
 
 class NovelABSATrainer:

@@ -1,0 +1,7 @@
+Source,Target,Aspect_F1,Opinion_F1,Triplet_F1,Transfer_Type
+rest14,laptop14,1,1,1,Restaurant_to_Laptop
+laptop14,rest14,1,1,1,Laptop_to_Restaurant
+rest15,rest16,1,1,1,Within_Restaurant
+rest16,rest15,1,1,1,Within_Restaurant
+rest14,rest15,1,1,1,Within_Restaurant
+rest14,rest16,1,1,1,Within_Restaurant

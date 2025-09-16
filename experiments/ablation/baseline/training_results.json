@@ -1,0 +1,25 @@
+{
+  "best_f1": 0.8712871287128714,
+  "config": {
+    "dataset_name": "rest14",
+    "model_name": "bert-base-uncased",
+    "batch_size": 16,
+    "learning_rate": 3e-05,
+    "num_epochs": 15,
+    "seed": 42
+  },
+  "best_metrics": {
+    "aspect_f1": 0.8712871287128714,
+    "aspect_precision": 0.8073394495412844,
+    "aspect_recall": 0.946236559139785,
+    "opinion_f1": 0.8125,
+    "opinion_precision": 0.7090909090909091,
+    "opinion_recall": 0.9512195121951219,
+    "sentiment_f1": 0.900900900900901,
+    "sentiment_precision": 0.8264462809917356,
+    "sentiment_recall": 0.9900990099009901,
+    "triplet_f1": 0.45841584158415843,
+    "overall_accuracy": 0.8782383419689119
+  },
+  "training_complete": true
+}

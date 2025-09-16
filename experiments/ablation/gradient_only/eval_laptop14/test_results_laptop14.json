@@ -1,0 +1,11 @@
+{
+  "aspect_f1": 0.0,
+  "opinion_f1": 0.0,
+  "sentiment_f1": 0.0,
+  "triplet_f1": 0.0,
+  "avg_predictions_per_sample": 0.0,
+  "total_predictions": 0,
+  "precision": 0.0,
+  "recall": 0.0,
+  "quality_score": 0.0
+}
